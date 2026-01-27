@@ -1,0 +1,8 @@
+[
+  {
+    "interfaces": ["java.rmi.Remote", "tlc2.tool.distributed.fp.FPSetRMI"]
+  },
+  {
+    "interfaces": ["java.rmi.Remote", "tlc2.tool.distributed.TLCWorkerRMI"]
+  }
+]

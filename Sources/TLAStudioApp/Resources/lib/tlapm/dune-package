@@ -1,0 +1,39 @@
+(lang dune 3.21)
+(name tlapm)
+(version c706ff1)
+(sections
+ (lib
+  /Users/night/Documents/GitHub/TLAStudio/Sources/TLAStudioApp/Resources/lib/tlapm)
+ (lib_root
+  /Users/night/Documents/GitHub/TLAStudio/Sources/TLAStudioApp/Resources/lib)
+ (bin
+  /Users/night/Documents/GitHub/TLAStudio/Sources/TLAStudioApp/Resources/bin)
+ (doc
+  /Users/night/Documents/GitHub/TLAStudio/Sources/TLAStudioApp/Resources/doc/tlapm))
+(sites (backends lib) (stdlib lib))
+(files
+ (lib
+  (META Makefile.post-install dune-package emacs/tla-mode/tla-mode.el opam))
+ (lib_root
+  ((dir tlapm/backends/Isabelle)
+   tlapm/backends/Isabelle.exec-files
+   tlapm/backends/bin/ls4
+   tlapm/backends/bin/ptl_to_trp
+   tlapm/backends/bin/z3
+   tlapm/backends/bin/zenon
+   tlapm/stdlib/Bags.tla
+   tlapm/stdlib/BagsTheorems.tla
+   tlapm/stdlib/BagsTheorems_proofs.tla
+   tlapm/stdlib/FiniteSetTheorems.tla
+   tlapm/stdlib/FiniteSetTheorems_proofs.tla
+   tlapm/stdlib/FiniteSets.tla
+   tlapm/stdlib/NaturalsInduction.tla
+   tlapm/stdlib/NaturalsInduction_proofs.tla
+   tlapm/stdlib/RealTime.tla
+   tlapm/stdlib/SequenceTheorems.tla
+   tlapm/stdlib/SequenceTheorems_proofs.tla
+   tlapm/stdlib/TLAPS.tla
+   tlapm/stdlib/WellFoundedInduction.tla
+   tlapm/stdlib/WellFoundedInduction_proofs.tla))
+ (bin (tlapm translate))
+ (doc (LICENSE README.md)))

@@ -1,0 +1,47 @@
+[package]
+name = "tla-core"
+version = "0.1.0"
+edition = "2021"
+description = "TLA+ parser and language services for TLA+ Studio"
+license = "MIT"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+name = "tla_core"
+
+[dependencies]
+# Tree-sitter for parsing
+tree-sitter = "0.24"
+tree-sitter-tlaplus = { git = "https://github.com/tlaplus-community/tree-sitter-tlaplus" }
+streaming-iterator = "0.1"
+
+# UniFFI for Swift bindings
+uniffi = { version = "0.28", features = ["cli"] }
+
+# Async runtime (optional, for LSP)
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+
+# LSP support (optional)
+tower-lsp = { version = "0.20", optional = true }
+
+# Better mutex performance
+parking_lot = "0.12"
+
+# Error handling
+thiserror = "1"
+
+[features]
+default = []
+lsp = ["tokio", "tower-lsp"]
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

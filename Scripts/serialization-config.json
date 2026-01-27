@@ -1,0 +1,13 @@
+[
+  {"name": "sun.rmi.server.Activation$ActivationSystemImpl_Stub"},
+  {"name": "sun.rmi.transport.DGCImpl_Stub"},
+  {"name": "java.rmi.dgc.VMID"},
+  {"name": "java.rmi.server.UID"},
+  {"name": "java.rmi.server.RemoteRef"},
+  {"name": "sun.rmi.server.UnicastRef"},
+  {"name": "sun.rmi.server.UnicastRef2"},
+  {"name": "tlc2.tool.distributed.fp.FPSetRMI"},
+  {"name": "tlc2.tool.distributed.TLCWorkerRMI"},
+  {"name": "java.rmi.server.ObjID"},
+  {"name": "java.rmi.dgc.Lease"}
+]

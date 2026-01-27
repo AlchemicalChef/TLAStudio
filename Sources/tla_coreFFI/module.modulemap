@@ -1,0 +1,4 @@
+module tla_coreFFI {
+    header "tla_coreFFI.h"
+    export *
+}
