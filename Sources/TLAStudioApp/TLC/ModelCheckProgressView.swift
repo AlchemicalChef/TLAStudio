@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 
 // MARK: - Model Check Progress View
 
@@ -32,6 +33,11 @@ struct ModelCheckProgressView: View {
             // Progress info
             if let progress = session.progress {
                 ProgressDetailsView(progress: progress)
+            }
+
+            // Progress chart
+            if session.progressHistory.count >= 2 {
+                ProgressChartView(history: session.progressHistory)
             }
 
             // Error display

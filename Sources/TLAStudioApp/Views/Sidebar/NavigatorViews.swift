@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import os
 
 // MARK: - File Navigator
 
@@ -9,6 +10,7 @@ struct FileNavigatorView: View {
     @StateObject private var fileManager = ProjectFileManager()
     @State private var selectedFileURL: URL?
     @State private var expandedFolders: Set<URL> = []
+    private let logger = Log.logger(category: "Navigator")
 
     var body: some View {
         VStack(spacing: 0) {
@@ -47,9 +49,9 @@ struct FileNavigatorView: View {
     }
 
     private func openFile(_ url: URL) {
-        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, error in
+        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { [logger] _, _, error in
             if let error = error {
-                print("Error opening file: \(error)")
+                logger.error("Error opening file: \(error.localizedDescription)")
             }
         }
     }
@@ -325,6 +327,7 @@ class ProjectFileManager: ObservableObject {
     @Published var projectFolder: URL?
     @Published var isLoading = false
 
+    private let logger = Log.logger(category: "Navigator")
     private let supportedExtensions = ["tla", "pcal", "cfg", "json", "md", "txt"]
 
     func loadFiles(around fileURL: URL) {
@@ -376,7 +379,7 @@ class ProjectFileManager: ObservableObject {
                 }
             }
         } catch {
-            print("Error scanning directory: \(error)")
+            logger.error("Error scanning directory: \(error.localizedDescription)")
         }
 
         return results
@@ -389,7 +392,7 @@ class ProjectFileManager: ObservableObject {
 struct EnhancedSymbolOutline: View {
     @ObservedObject var document: TLADocument
     @State private var filterText = ""
-    @State private var groupByKind = false
+    @State private var groupByKind = true
     @State private var showOnlyPublic = false
     @State private var expandedGroups: Set<TLASymbolKind> = Set(TLASymbolKind.allCases)
 
@@ -463,7 +466,7 @@ struct EnhancedSymbolOutline: View {
             .cornerRadius(6)
 
             HStack {
-                Toggle("Group", isOn: $groupByKind)
+                Toggle("Sections", isOn: $groupByKind)
                     .toggleStyle(.checkbox)
                     .controlSize(.small)
 

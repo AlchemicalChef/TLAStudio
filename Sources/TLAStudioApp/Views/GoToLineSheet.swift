@@ -92,8 +92,8 @@ struct GoToLineSheet_Previews: PreviewProvider {
         GoToLineSheet(
             isPresented: .constant(true),
             totalLines: 150
-        ) { lineNumber in
-            print("Navigate to line \(lineNumber)")
+        ) { _ in
+            // Preview navigation handler
         }
     }
 }

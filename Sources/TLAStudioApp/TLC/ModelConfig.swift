@@ -3,7 +3,7 @@ import Foundation
 // MARK: - Model Configuration
 
 /// Configuration for TLC model checking
-struct ModelConfig: Codable, Identifiable {
+struct ModelConfig: Codable, Identifiable, Sendable {
     let id: UUID
     var name: String
 
@@ -99,7 +99,7 @@ struct ModelConfig: Codable, Identifiable {
 // MARK: - Constant Values
 
 /// Represents a constant value in TLA+ model configuration
-enum ConstantValue: Codable, Equatable {
+enum ConstantValue: Codable, Equatable, Sendable {
     case int(Int)
     case string(String)
     case bool(Bool)
@@ -178,7 +178,9 @@ enum ConstantValue: Codable, Equatable {
         case .int(let value):
             return "\(value)"
         case .string(let value):
-            return "\"\(value)\""
+            let escaped = value.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
         case .bool(let value):
             return value ? "TRUE" : "FALSE"
         case .set(let values):
@@ -195,7 +197,7 @@ enum ConstantValue: Codable, Equatable {
 // MARK: - Model Check Progress
 
 /// Progress update during model checking
-struct ModelCheckProgress: Codable {
+struct ModelCheckProgress: Codable, Sendable {
     let sessionId: UUID
     let phase: Phase
     let statesFound: UInt64
@@ -207,7 +209,7 @@ struct ModelCheckProgress: Codable {
     let coverage: [ActionCoverage]
     let memoryUsed: UInt64
 
-    enum Phase: String, Codable {
+    enum Phase: String, Codable, Sendable {
         case parsing
         case computing
         case checkingLiveness
@@ -243,7 +245,7 @@ struct ModelCheckProgress: Codable {
 // MARK: - Action Coverage
 
 /// Coverage statistics for a single action
-struct ActionCoverage: Codable, Identifiable {
+struct ActionCoverage: Codable, Identifiable, Sendable {
     var id: String { actionName }
     let actionName: String
     let count: UInt64
@@ -316,6 +318,31 @@ struct ModelCheckResult {
 // MARK: - Config File Generation
 
 extension ModelConfig {
+
+    // MARK: - Input Sanitization
+
+    /// Validates that a string is a valid TLA+ identifier (used for names in config directives).
+    /// Valid identifiers match `^[A-Za-z_][A-Za-z0-9_]*$`.
+    private static func sanitizeTLCIdentifier(_ name: String) -> String? {
+        let pattern = #"^[A-Za-z_][A-Za-z0-9_]*$"#
+        guard name.range(of: pattern, options: .regularExpression) != nil else {
+            return nil
+        }
+        return name
+    }
+
+    /// Validates that a TLC expression does not contain newlines or TLC directives.
+    /// Rejects strings that could inject additional config directives.
+    private static func sanitizeTLCExpression(_ expr: String) -> String? {
+        // Reject newlines which could inject additional directives.
+        // Note: Swift treats \r\n as a single grapheme cluster, so
+        // .contains("\n") won't match it. Check Unicode scalars instead.
+        guard !expr.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) else {
+            return nil
+        }
+        return expr
+    }
+
     /// Generate a TLC config file from this configuration
     func generateConfigFile() -> String {
         var lines: [String] = []
@@ -325,16 +352,23 @@ extension ModelConfig {
         lines.append("\\* Model: \(name)")
         lines.append("")
 
-        // Init and Next (required)
-        lines.append("INIT \(initPredicate)")
-        lines.append("NEXT \(nextAction)")
+        // Init and Next (required) — must be valid identifiers
+        if let sanitizedInit = Self.sanitizeTLCExpression(initPredicate) {
+            lines.append("INIT \(sanitizedInit)")
+        }
+        if let sanitizedNext = Self.sanitizeTLCExpression(nextAction) {
+            lines.append("NEXT \(sanitizedNext)")
+        }
         lines.append("")
 
         // Constants
         if !constants.isEmpty {
             lines.append("\\* Constants")
             for (name, value) in constants.sorted(by: { $0.key < $1.key }) {
-                lines.append("CONSTANT \(name) = \(value.tlcFormat)")
+                guard let sanitizedName = Self.sanitizeTLCIdentifier(name) else { continue }
+                let formattedValue = value.tlcFormat
+                guard Self.sanitizeTLCExpression(formattedValue) != nil else { continue }
+                lines.append("CONSTANT \(sanitizedName) = \(formattedValue)")
             }
             lines.append("")
         }
@@ -343,7 +377,8 @@ extension ModelConfig {
         if !invariants.isEmpty {
             lines.append("\\* Invariants")
             for inv in invariants where !inv.isEmpty {
-                lines.append("INVARIANT \(inv)")
+                guard let sanitizedInv = Self.sanitizeTLCExpression(inv) else { continue }
+                lines.append("INVARIANT \(sanitizedInv)")
             }
             lines.append("")
         }
@@ -352,29 +387,35 @@ extension ModelConfig {
         if !temporalProperties.isEmpty {
             lines.append("\\* Properties")
             for prop in temporalProperties where !prop.isEmpty {
-                lines.append("PROPERTY \(prop)")
+                guard let sanitizedProp = Self.sanitizeTLCExpression(prop) else { continue }
+                lines.append("PROPERTY \(sanitizedProp)")
             }
             lines.append("")
         }
 
         // Constraints
         if let constraint = stateConstraint, !constraint.isEmpty {
-            lines.append("\\* State constraint")
-            lines.append("CONSTRAINT \(constraint)")
-            lines.append("")
+            if let sanitizedConstraint = Self.sanitizeTLCExpression(constraint) {
+                lines.append("\\* State constraint")
+                lines.append("CONSTRAINT \(sanitizedConstraint)")
+                lines.append("")
+            }
         }
 
         if let constraint = actionConstraint, !constraint.isEmpty {
-            lines.append("\\* Action constraint")
-            lines.append("ACTION_CONSTRAINT \(constraint)")
-            lines.append("")
+            if let sanitizedConstraint = Self.sanitizeTLCExpression(constraint) {
+                lines.append("\\* Action constraint")
+                lines.append("ACTION_CONSTRAINT \(sanitizedConstraint)")
+                lines.append("")
+            }
         }
 
         // Symmetry
         if !symmetrySets.isEmpty {
             lines.append("\\* Symmetry")
             for (setName, _) in symmetrySets.sorted(by: { $0.key < $1.key }) {
-                lines.append("SYMMETRY \(setName)")
+                guard let sanitizedName = Self.sanitizeTLCIdentifier(setName) else { continue }
+                lines.append("SYMMETRY \(sanitizedName)")
             }
             lines.append("")
         }

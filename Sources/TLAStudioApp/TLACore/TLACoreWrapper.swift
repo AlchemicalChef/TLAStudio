@@ -1,10 +1,15 @@
 import Foundation
+import os
 
 // Import the generated UniFFI bindings when available
 // The tla_coreFFI module provides the C FFI layer
 #if canImport(tla_coreFFI)
 import tla_coreFFI
 #endif
+
+// MARK: - Logging
+
+private let logger = Log.logger(category: "TLACore")
 
 // MARK: - TLACore Types
 
@@ -44,6 +49,8 @@ struct TLASymbol: Identifiable, Equatable {
     let range: TLARange
     let selectionRange: TLARange?
     let children: [TLASymbol]
+    /// Parameter names for operator definitions (empty for non-operators)
+    let parameters: [String]
 
     static func == (lhs: TLASymbol, rhs: TLASymbol) -> Bool {
         lhs.name == rhs.name && lhs.kind == rhs.kind && lhs.range == rhs.range
@@ -185,6 +192,7 @@ struct TLAParameterInfo: Equatable {
 }
 
 /// Result of parsing a document
+/// @unchecked Sendable: thread safety ensured by NSLock (for lazy _lines cache)
 final class TLAParseResult: @unchecked Sendable {
     let isValid: Bool
     let diagnostics: [TLADiagnostic]
@@ -345,104 +353,6 @@ private final class ParseResultLRUCache {
     }
 }
 
-// MARK: - Generic LRU Cache for ParseResult
-
-/// Thread-safe generic LRU cache with O(1) get/set/eviction operations
-/// Used by RustTLACore to cache ParseResult objects with proper LRU eviction
-private final class GenericLRUCache<Key: Hashable, Value> {
-    private let capacity: Int
-    private var cache: [Key: GenericLRUNode<Key, Value>] = [:]
-    private let lock = NSLock()
-
-    /// Sentinel node for doubly-linked list (head = most recently used)
-    private var head: GenericLRUNode<Key, Value>?
-    private var tail: GenericLRUNode<Key, Value>?
-
-    init(capacity: Int) {
-        self.capacity = capacity
-    }
-
-    /// Get value for key, marking it as most recently used. O(1)
-    func get(_ key: Key) -> Value? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let node = cache[key] else { return nil }
-        moveToFront(node)
-        return node.value
-    }
-
-    /// Set value for key, evicting LRU entry if at capacity. O(1)
-    func set(_ key: Key, value: Value) {
-        lock.lock()
-        defer { lock.unlock() }
-        if let node = cache[key] {
-            // Update existing
-            node.value = value
-            moveToFront(node)
-        } else {
-            // Evict oldest if at capacity
-            while cache.count >= capacity {
-                removeLRU()
-            }
-
-            // Add new node
-            let node = GenericLRUNode(key: key, value: value)
-            cache[key] = node
-            addToFront(node)
-        }
-    }
-
-    // MARK: - Private List Operations (all O(1), must be called with lock held)
-
-    private func addToFront(_ node: GenericLRUNode<Key, Value>) {
-        node.prev = nil
-        node.next = head
-        head?.prev = node
-        head = node
-        if tail == nil {
-            tail = node
-        }
-    }
-
-    private func removeNode(_ node: GenericLRUNode<Key, Value>) {
-        if node === head {
-            head = node.next
-        }
-        if node === tail {
-            tail = node.prev
-        }
-        node.prev?.next = node.next
-        node.next?.prev = node.prev
-        node.prev = nil
-        node.next = nil
-    }
-
-    private func moveToFront(_ node: GenericLRUNode<Key, Value>) {
-        guard node !== head else { return }
-        removeNode(node)
-        addToFront(node)
-    }
-
-    private func removeLRU() {
-        guard let lru = tail else { return }
-        cache.removeValue(forKey: lru.key)
-        removeNode(lru)
-    }
-}
-
-/// Node for GenericLRUCache
-private final class GenericLRUNode<Key: Hashable, Value> {
-    let key: Key
-    var value: Value
-    var prev: GenericLRUNode?
-    var next: GenericLRUNode?
-
-    init(key: Key, value: Value) {
-        self.key = key
-        self.value = value
-    }
-}
-
 // MARK: - TLACore Wrapper (Main Interface)
 
 /// Thread-safe wrapper for TLA+ language services
@@ -473,6 +383,9 @@ final class TLACoreWrapper: ObservableObject {
             if cached.source == content {
                 return cached
             }
+            // Hash collision detected — different content with same hashValue.
+            // The stale entry will be overwritten by set() below.
+            logger.debug("Parse cache hash collision detected for hash \(contentHash)")
         }
 
         let result = try await core.parse(content)
@@ -683,10 +596,16 @@ final class TLACoreWrapper: ObservableObject {
 
         // Check for user-defined symbol
         if let symbol = findSymbolByName(word, in: symbols) {
+            let signature: String?
+            if !symbol.parameters.isEmpty {
+                signature = "\(symbol.name)(\(symbol.parameters.joined(separator: ", ")))"
+            } else {
+                signature = nil
+            }
             return HoverInfo(
                 title: symbol.name,
                 description: "User-defined \(symbolKindName(symbol.kind))",
-                signature: nil,
+                signature: signature,
                 kind: hoverKind(from: symbol.kind)
             )
         }
@@ -857,7 +776,7 @@ enum TLADocumentation {
 
 /// Fallback TLA+ parser using regex-based highlighting
 /// Used when Rust TLACore is not available
-final class FallbackTLACore: TLACoreProtocol, @unchecked Sendable {
+final class FallbackTLACore: TLACoreProtocol, Sendable {
 
     func parse(_ source: String) async throws -> TLAParseResult {
         // Simple validation - check for module structure
@@ -912,7 +831,8 @@ final class FallbackTLACore: TLACoreProtocol, @unchecked Sendable {
                     kind: .module,
                     range: TLARange(start: TLAPosition(line: 0, column: 0), end: TLAPosition(line: 0, column: UInt32(moduleLine.count))),
                     selectionRange: nil,
-                    children: []
+                    children: [],
+                    parameters: []
                 ))
             }
         }
@@ -933,7 +853,8 @@ final class FallbackTLACore: TLACoreProtocol, @unchecked Sendable {
                                 end: TLAPosition(line: UInt32(lineNum), column: UInt32(line.count))
                             ),
                             selectionRange: nil,
-                            children: []
+                            children: [],
+                            parameters: []
                         ))
                     }
                 }
@@ -952,7 +873,8 @@ final class FallbackTLACore: TLACoreProtocol, @unchecked Sendable {
                     kind: .variable,
                     range: TLARange(start: TLAPosition(line: 0, column: 0), end: TLAPosition(line: 0, column: 0)),
                     selectionRange: nil,
-                    children: []
+                    children: [],
+                    parameters: []
                 ))
             }
         }
@@ -969,7 +891,8 @@ final class FallbackTLACore: TLACoreProtocol, @unchecked Sendable {
                     kind: .constant,
                     range: TLARange(start: TLAPosition(line: 0, column: 0), end: TLAPosition(line: 0, column: 0)),
                     selectionRange: nil,
-                    children: []
+                    children: [],
+                    parameters: []
                 ))
             }
         }
@@ -1227,6 +1150,7 @@ final class FallbackTLACore: TLACoreProtocol, @unchecked Sendable {
 
 /// TLA+ parser using the Rust tree-sitter implementation via UniFFI
 /// This provides accurate, incremental parsing with the tree-sitter-tlaplus grammar
+/// @unchecked Sendable: TlaCore is thread-safe; parseResultCache uses internal NSLock
 final class RustTLACore: TLACoreProtocol, @unchecked Sendable {
     private let core: TlaCore
     /// LRU cache for ParseResults with proper O(1) eviction
@@ -1366,7 +1290,8 @@ final class RustTLACore: TLACoreProtocol, @unchecked Sendable {
             kind: convertSymbolKind(s.kind),
             range: convertRange(s.range),
             selectionRange: s.selectionRange.map { convertRange($0) },
-            children: s.children.map { convertSymbol($0) }
+            children: s.children.map { convertSymbol($0) },
+            parameters: s.parameters
         )
     }
 
@@ -1692,11 +1617,11 @@ enum TLACoreFactory {
         do {
             let rustCore = try RustTLACore()
             isUsingRustCore = true
-            NSLog("[TLACore] Using Rust tree-sitter implementation")
+            logger.info("Using Rust tree-sitter implementation")
             return rustCore
         } catch {
             isUsingRustCore = false
-            NSLog("[TLACore] Rust core unavailable (\(error)), using fallback regex implementation")
+            logger.warning("Rust core unavailable (\(error.localizedDescription)), using fallback regex implementation")
             return FallbackTLACore()
         }
     }

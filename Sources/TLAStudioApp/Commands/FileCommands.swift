@@ -284,34 +284,4 @@ struct HelpCommands: Commands {
 
 // MARK: - Notification Names
 
-extension Notification.Name {
-    // View commands
-    static let goToLine = Notification.Name("TLAGoToLine")
-    static let foldAll = Notification.Name("TLAFoldAll")
-    static let unfoldAll = Notification.Name("TLAUnfoldAll")
-    static let toggleFold = Notification.Name("TLAToggleFold")
-    static let toggleSymbolOutline = Notification.Name("TLAToggleSymbolOutline")
-    static let toggleNavigatorSidebar = Notification.Name("TLAToggleNavigatorSidebar")
-    static let toggleInspectorSidebar = Notification.Name("TLAToggleInspectorSidebar")
-
-    // TLA+ commands
-    static let translatePlusCal = Notification.Name("TLATranslatePlusCal")
-    static let goToDefinition = Notification.Name("TLAGoToDefinition")
-    static let findReferences = Notification.Name("TLAFindReferences")
-
-    // Model checking
-    static let runModelCheck = Notification.Name("TLARunModelCheck")
-    static let stopModelCheck = Notification.Name("TLAStopModelCheck")
-    static let editModelConfig = Notification.Name("TLAEditModelConfig")
-
-    // Proofs
-    static let checkAllProofs = Notification.Name("TLACheckAllProofs")
-    static let checkCurrentStep = Notification.Name("TLACheckCurrentStep")
-    static let stopProofCheck = Notification.Name("TLAStopProofCheck")
-    static let goToNextFailed = Notification.Name("TLAGoToNextFailed")
-
-    // Find/Replace (additional names - main ones in FindReplaceHostingView.swift)
-    static let findNext = Notification.Name("TLAFindNext")
-    static let findPrevious = Notification.Name("TLAFindPrevious")
-    static let useSelectionForFind = Notification.Name("TLAUseSelectionForFind")
-}
+// Notification.Name declarations are centralized in Utilities/NotificationNames.swift

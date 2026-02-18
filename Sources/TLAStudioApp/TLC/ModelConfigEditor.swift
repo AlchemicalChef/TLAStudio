@@ -345,6 +345,39 @@ struct QuickModelConfig: View {
     }
 }
 
+// MARK: - Model Config Editor Sheet
+
+/// Sheet wrapper for ModelConfigEditor with save/cancel buttons
+struct ModelConfigEditorSheet: View {
+    @Binding var config: ModelConfig
+    let symbols: [TLASymbol]
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Model Configuration")
+                    .font(.headline)
+                Spacer()
+                Button("Done") {
+                    isPresented = false
+                }
+                .keyboardShortcut(.return, modifiers: [])
+            }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+
+            Divider()
+
+            // Config editor
+            ModelConfigEditor(config: $config, symbols: symbols)
+                .frame(minWidth: 500, minHeight: 400)
+        }
+        .frame(width: 600, height: 550)
+    }
+}
+
 // MARK: - TLASymbol Extension
 
 extension TLASymbolKind {

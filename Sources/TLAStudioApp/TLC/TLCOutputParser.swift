@@ -37,10 +37,7 @@ private enum TLCRegex {
 /// Parses TLC output in both JSON (-tool mode) and plain text formats.
 /// Thread-safe: Uses internal locking for state accessed from background threads.
 class TLCOutputParser {
-    private var buffer = Data()
-    private var bufferOffset: Int = 0  // Track consumed bytes instead of copying
-    private static let compactionThreshold = 64 * 1024  // Compact when offset exceeds 64KB
-    private static let maxBufferSize = 10 * 1024 * 1024
+    private var lineBuffer = LineBuffer(maxBufferSize: 10 * 1024 * 1024, compactionThreshold: 64 * 1024)
     private var states: UInt64 = 0
     private var distinct: UInt64 = 0
     private var statesLeft: UInt64 = 0
@@ -63,7 +60,7 @@ class TLCOutputParser {
     /// Lock for thread-safe access from readability handlers
     private let lock = NSLock()
 
-    private let logger = Logger(subsystem: "com.tlastudio", category: "TLCOutputParser")
+    private let logger = Log.logger(category: "TLCOutputParser")
 
     /// Threshold for streaming trace states to disk (above this, use lazy loading)
     static let largeTraceThreshold = 1000
@@ -106,25 +103,13 @@ class TLCOutputParser {
         return parseInternal(data)
     }
 
-    /// Internal parse implementation
+    /// Internal parse implementation.
+    /// Processes all complete lines in the chunk and returns the most recent progress update.
     private func parseInternal(_ data: Data) -> ModelCheckProgress? {
-        // CRITICAL: Check buffer size BEFORE appending to prevent unbounded growth
-        // This fixes a potential OOM if TLC produces large output bursts
-        if buffer.count + data.count > Self.maxBufferSize {
-            logger.warning("Parser buffer would exceed \(Self.maxBufferSize) bytes, truncating existing buffer")
-            // Keep last 64KB to avoid losing partial line at end
-            let keepBytes = min(buffer.count, Self.compactionThreshold)
-            buffer = Data(buffer.suffix(keepBytes))
-            bufferOffset = 0
-        }
+        let lines = lineBuffer.append(data)
+        var latestProgress: ModelCheckProgress?
 
-        buffer.append(data)
-
-        // Try to parse complete lines using index tracking (zero-copy until compaction)
-        while let relativeNewlineIndex = buffer[bufferOffset...].firstIndex(of: UInt8(ascii: "\n")) {
-            let lineData = buffer[bufferOffset..<relativeNewlineIndex]
-            bufferOffset = buffer.index(after: relativeNewlineIndex)
-
+        for lineData in lines {
             guard let line = String(data: lineData, encoding: .utf8) else {
                 continue
             }
@@ -132,34 +117,17 @@ class TLCOutputParser {
             // Try JSON parsing first (TLC -tool mode)
             if line.hasPrefix("{") {
                 if let progress = parseJSONLine(line) {
-                    // Compact buffer after loop iteration completes, before returning
-                    compactBufferIfNeeded()
-                    return progress
+                    latestProgress = progress
                 }
             } else {
                 // Fall back to plain text parsing
                 if let progress = parseTextLine(line) {
-                    // Compact buffer after loop iteration completes, before returning
-                    compactBufferIfNeeded()
-                    return progress
+                    latestProgress = progress
                 }
             }
         }
 
-        // Compact buffer after processing all complete lines
-        // This prevents index corruption that would occur if we compacted mid-iteration
-        compactBufferIfNeeded()
-
-        return nil
-    }
-
-    /// Compact buffer when offset exceeds threshold to prevent memory growth.
-    /// Must be called only when no iteration over buffer indices is in progress.
-    private func compactBufferIfNeeded() {
-        if bufferOffset > Self.compactionThreshold {
-            buffer = Data(buffer[bufferOffset...])
-            bufferOffset = 0
-        }
+        return latestProgress
     }
 
     /// Get final result after TLC exits (synchronous version for small traces, thread-safe)
@@ -237,8 +205,7 @@ class TLCOutputParser {
     func reset() {
         lock.lock()
         defer { lock.unlock() }
-        buffer = Data()
-        bufferOffset = 0
+        lineBuffer.reset()
         states = 0
         distinct = 0
         statesLeft = 0

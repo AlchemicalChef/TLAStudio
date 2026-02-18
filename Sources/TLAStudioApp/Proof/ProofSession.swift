@@ -1,5 +1,8 @@
 import Foundation
+import os
 import SwiftUI
+
+private let logger = Log.logger(category: "ProofSession")
 
 // MARK: - Proof Session
 
@@ -94,19 +97,17 @@ final class ProofSession: ObservableObject {
 
     /// Check a single proof step at the given location
     func checkStep(line: Int, column: Int, backend: ProverBackend? = nil) {
-        NSLog("[ProofSession] checkStep called: line=%d, column=%d, isRunning=%d", line, column, isRunning ? 1 : 0)
+        logger.info("checkStep called: line=\(line), column=\(column), isRunning=\(self.isRunning)")
         guard !isRunning else {
-            NSLog("[ProofSession] checkStep: BLOCKED - isRunning is true")
+            logger.debug("checkStep: BLOCKED - isRunning is true")
             return
         }
 
         isRunning = true
         error = nil
-        NSLog("[ProofSession] checkStep: Set isRunning=true, starting task")
 
         task = Task {
             do {
-                NSLog("[ProofSession] checkStep: Calling TLAPMProcessManager.checkSingleStep...")
                 let obligation = try await TLAPMProcessManager.shared.checkSingleStep(
                     spec: specURL,
                     line: line,
@@ -119,17 +120,16 @@ final class ProofSession: ObservableObject {
                 // Check for cancellation before updating state
                 guard !Task.isCancelled else { return }
 
-                NSLog("[ProofSession] checkStep: Got obligation result: %@", String(describing: obligation.status))
+                logger.info("checkStep: Got obligation result: \(String(describing: obligation.status))")
 
                 // Update or add the obligation
                 self.updateObligation(obligation)
                 self.isRunning = false
-                NSLog("[ProofSession] checkStep: Complete, isRunning=false")
             } catch {
                 // Check for cancellation before updating state
                 guard !Task.isCancelled else { return }
 
-                NSLog("[ProofSession] checkStep: ERROR - %@", String(describing: error))
+                logger.error("checkStep: \(String(describing: error))")
                 self.error = error
                 self.isRunning = false
             }

@@ -3,9 +3,7 @@ import SourceEditor
 
 // MARK: - Notifications
 
-extension Notification.Name {
-    static let editorColorSchemeDidChange = Notification.Name("editorColorSchemeDidChange")
-}
+// Notification.Name declarations are centralized in Utilities/NotificationNames.swift
 
 // MARK: - Color Scheme Definition
 
@@ -231,30 +229,30 @@ struct EditorSettingsView: View {
 
     // MARK: - Font & Text Settings
 
-    @AppStorage("editorFontName") private var fontName: String = MonospaceFont.sfMono.rawValue
-    @AppStorage("editorFontSize") private var fontSize: Double = 13
-    @AppStorage("editorLineHeight") private var lineHeight: Double = 1.4
+    @AppStorage(UserSettings.Keys.fontName) private var fontName: String = MonospaceFont.sfMono.rawValue
+    @AppStorage(UserSettings.Keys.fontSize) private var fontSize: Double = 13
+    @AppStorage(UserSettings.Keys.lineHeight) private var lineHeight: Double = 1.4
 
     // MARK: - Display Settings
 
-    @AppStorage("showLineNumbers") private var showLineNumbers: Bool = true
-    @AppStorage("showMinimap") private var showMinimap: Bool = false
-    @AppStorage("highlightCurrentLine") private var highlightCurrentLine: Bool = true
-    @AppStorage("wordWrap") private var wordWrap: Bool = true
+    @AppStorage(UserSettings.Keys.showLineNumbers) private var showLineNumbers: Bool = true
+    @AppStorage(UserSettings.Keys.showMinimap) private var showMinimap: Bool = false
+    @AppStorage(UserSettings.Keys.highlightCurrentLine) private var highlightCurrentLine: Bool = true
+    @AppStorage(UserSettings.Keys.wordWrap) private var wordWrap: Bool = true
 
     // MARK: - Indentation Settings
 
-    @AppStorage("tabWidth") private var tabWidth: Int = 4
-    @AppStorage("insertSpacesForTabs") private var insertSpacesForTabs: Bool = true
+    @AppStorage(UserSettings.Keys.tabWidth) private var tabWidth: Int = 4
+    @AppStorage(UserSettings.Keys.insertSpacesForTabs) private var insertSpacesForTabs: Bool = true
 
     // MARK: - Appearance Settings
 
-    @AppStorage("settings.editor.appearance") private var appearance: String = "system"
-    @AppStorage("settings.editor.matchBrackets") private var matchBrackets: Bool = true
+    @AppStorage(UserSettings.Keys.appearance) private var appearance: String = "system"
+    @AppStorage(UserSettings.Keys.matchBrackets) private var matchBrackets: Bool = true
 
     // MARK: - Color Scheme Settings
 
-    @AppStorage("editorColorScheme") private var colorSchemeName: String = EditorColorScheme.default.rawValue
+    @AppStorage(UserSettings.Keys.colorScheme) private var colorSchemeName: String = EditorColorScheme.default.rawValue
 
     // MARK: - Computed Properties
 

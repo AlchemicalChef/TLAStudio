@@ -147,7 +147,12 @@ public final class TLASyntaxHighlighter {
     /// Track content hash of the last highlighted range to detect text changes
     private var lastHighlightedContentHash: Int = 0
 
-    // Highlight token to color mapping
+    /// Optional closure that provides tree-sitter highlight tokens.
+    /// Called with the source text, returns array of (NSRange, captureName) tuples.
+    /// When set, tree-sitter highlighting is preferred over regex.
+    public var treeSitterHighlightProvider: ((String) -> [(NSRange, String)])?
+
+    // Highlight token to color mapping (covers both regex and tree-sitter capture names)
     private let tokenColorMap: [String: KeyPath<SyntaxTheme, NSColor>] = [
         "keyword": \.keyword,
         "keyword.control": \.keyword,
@@ -160,12 +165,19 @@ public final class TLASyntaxHighlighter {
         "comment.block": \.comment,
         "number": \.number,
         "constant.numeric": \.number,
+        "constant": \.number,
         "type": \.type,
         "type.builtin": \.type,
+        "module": \.type,
         "variable": \.identifier,
         "variable.parameter": \.identifier,
+        "variable.builtin": \.keyword,
+        "variable.reference": \.identifier,
+        "attribute": \.identifier,
+        "tag": \.string,
         "function": \.identifier,
         "function.method": \.identifier,
+        "function.builtin": \.operator_,
         "punctuation": \.identifier,
         "punctuation.bracket": \.identifier,
         "punctuation.delimiter": \.identifier,
@@ -307,8 +319,8 @@ public final class TLASyntaxHighlighter {
         lastHighlightedVisibleRange = highlightRange
         lastHighlightedContentHash = contentHash
 
-        // Get highlights for this range
-        var highlights = highlightWithRegex(rangeText)
+        // Get highlights for this range (prefer tree-sitter, fallback to regex)
+        var highlights = highlightWithTreeSitter(rangeText) ?? highlightWithRegex(rangeText)
 
         // Adjust ranges to absolute positions
         highlights = highlights.map { highlight in
@@ -341,7 +353,7 @@ public final class TLASyntaxHighlighter {
 
     /// Highlight the entire document (for small files)
     private func performFullHighlighting(textView: NSTextView, textStorage: NSTextStorage, currentText: String) {
-        let highlights = highlightWithRegex(currentText)
+        let highlights = highlightWithTreeSitter(currentText) ?? highlightWithRegex(currentText)
         let fullRange = NSRange(location: 0, length: textStorage.length)
 
         textStorage.beginEditing()
@@ -359,6 +371,27 @@ public final class TLASyntaxHighlighter {
         }
 
         textStorage.endEditing()
+    }
+
+    // MARK: - Tree-Sitter Highlighting
+
+    /// Attempt to highlight using tree-sitter tokens from the provider.
+    /// Returns nil if no provider is set or it returns empty results.
+    private func highlightWithTreeSitter(_ text: String) -> [HighlightRange]? {
+        guard let provider = treeSitterHighlightProvider else { return nil }
+        let tokens = provider(text)
+        guard !tokens.isEmpty else { return nil }
+
+        var highlights: [HighlightRange] = []
+        for (range, captureName) in tokens {
+            // Look up the capture name in our token color map
+            if let colorKeyPath = tokenColorMap[captureName] {
+                let color = theme[keyPath: colorKeyPath]
+                let style: HighlightRange.Style = captureName.hasPrefix("keyword") ? .bold : .plain
+                highlights.append(HighlightRange(range: range, color: color, style: style))
+            }
+        }
+        return highlights.isEmpty ? nil : highlights
     }
 
     // MARK: - Regex-Based Highlighting

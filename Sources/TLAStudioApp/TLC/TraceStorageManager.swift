@@ -8,7 +8,7 @@ import os
 actor TraceStorageManager {
     static let shared = TraceStorageManager()
 
-    private let logger = Logger(subsystem: "com.tlastudio", category: "TraceStorage")
+    private let logger = Log.logger(category: "TraceStorage")
 
     /// Threshold for streaming to disk (states count)
     private let streamingThreshold = 1000
@@ -198,6 +198,7 @@ actor TraceStorageManager {
 // MARK: - Trace Writer
 
 /// Writer for appending states to a trace
+/// @unchecked Sendable: accessed only via actor-isolated TraceStorageManager
 final class TraceWriter: @unchecked Sendable {
     let sessionId: UUID
     private weak var manager: TraceStorageManager?
@@ -222,6 +223,7 @@ final class TraceWriter: @unchecked Sendable {
 // MARK: - Lazy Error Trace
 
 /// An error trace that loads states lazily from disk
+/// @unchecked Sendable: immutable after init; manager access is actor-isolated
 final class LazyErrorTrace: @unchecked Sendable {
     let sessionId: UUID
     let type: ErrorTrace.ErrorType

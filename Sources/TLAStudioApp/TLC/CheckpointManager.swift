@@ -1,10 +1,13 @@
 import Foundation
+import os
 
 // MARK: - Checkpoint Manager
 
 /// Actor that manages TLC checkpoint discovery and cleanup
 actor CheckpointManager {
     static let shared = CheckpointManager()
+
+    private let logger = Log.logger(category: "Checkpoint")
 
     // MARK: - Discovery
 
@@ -102,7 +105,7 @@ actor CheckpointManager {
                 try FileManager.default.removeItem(at: checkpoint.directoryURL)
                 removedCount += 1
             } catch {
-                print("Failed to remove checkpoint \(checkpoint.id): \(error)")
+                logger.error("Failed to remove checkpoint \(checkpoint.id): \(error.localizedDescription)")
             }
         }
 

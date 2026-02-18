@@ -1,6 +1,9 @@
 import SwiftUI
+import os
 
 // MARK: - Proof Obligations Panel
+
+private let logger = Log.logger(category: "ProofPanel")
 
 /// Main panel for displaying TLAPM proof obligations in a hierarchical tree.
 ///
@@ -251,13 +254,13 @@ struct ProofObligationsPanel: View {
     // MARK: - Actions
 
     private func checkSelected() {
-        NSLog("[ProofPanel] checkSelected: Called, selectedObligationId=%@", String(describing: selectedObligationId))
+        logger.debug("checkSelected: Called, selectedObligationId=\(String(describing: selectedObligationId))")
         guard let selectedId = selectedObligationId,
               let obligation = session.findObligation(by: selectedId) else {
-            NSLog("[ProofPanel] checkSelected: GUARD FAILED - no selection or obligation not found")
+            logger.debug("checkSelected: GUARD FAILED - no selection or obligation not found")
             return
         }
-        NSLog("[ProofPanel] checkSelected: Calling session.checkStep at line %d", obligation.location.startLine)
+        logger.debug("checkSelected: Calling session.checkStep at line \(obligation.location.startLine)")
         session.checkStep(
             line: obligation.location.startLine,
             column: obligation.location.startColumn

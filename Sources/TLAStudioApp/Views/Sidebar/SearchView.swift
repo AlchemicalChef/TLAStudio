@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 // MARK: - Search Panel
 
@@ -306,6 +307,7 @@ class DocumentSearchManager: ObservableObject {
     @Published var useRegex = false
     @Published var results: [SearchResult] = []
 
+    private let logger = Log.logger(category: "Search")
     private let contextLength = 30
 
     func search(in content: String) async -> [SearchResult] {
@@ -380,7 +382,9 @@ class DocumentSearchManager: ObservableObject {
                 }
             } catch {
                 // Invalid regex - return empty results
-                print("Search regex error: \(error)")
+                await MainActor.run {
+                    self.logger.warning("Search regex error: \(error.localizedDescription)")
+                }
             }
 
             return searchResults

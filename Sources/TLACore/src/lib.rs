@@ -63,6 +63,8 @@ pub struct Symbol {
     pub range: Range,
     pub selection_range: Option<Range>,
     pub children: Vec<Symbol>,
+    /// Parameter names for operator definitions (empty for non-operators)
+    pub parameters: Vec<String>,
 }
 
 /// Diagnostic severity
@@ -764,6 +766,170 @@ static TLA_OPERATORS: LazyLock<Vec<DetailedCompletionItem>> = LazyLock::new(|| {
         .collect()
 });
 
+/// PlusCal keyword completions
+static PLUSCAL_KEYWORDS: LazyLock<Vec<DetailedCompletionItem>> = LazyLock::new(|| {
+    let keywords = [
+        ("algorithm", "Begin PlusCal algorithm block", 1),
+        ("variables", "Declare PlusCal variables", 2),
+        ("variable", "Declare a PlusCal variable", 2),
+        ("begin", "Begin algorithm body", 3),
+        ("end", "End a block", 3),
+        ("process", "Define a process", 4),
+        ("fair process", "Define a fair process", 4),
+        ("fair+", "Define a strongly fair process", 4),
+        ("procedure", "Define a procedure", 5),
+        ("macro", "Define a macro", 5),
+        ("call", "Call a procedure", 6),
+        ("return", "Return from procedure", 6),
+        ("if", "PlusCal conditional", 10),
+        ("then", "PlusCal then branch", 100),
+        ("elsif", "PlusCal else-if branch", 10),
+        ("else", "PlusCal else branch", 100),
+        ("while", "PlusCal while loop", 10),
+        ("do", "PlusCal loop body", 100),
+        ("either", "Nondeterministic choice", 10),
+        ("or", "Alternative in either block", 100),
+        ("with", "Local variable binding", 10),
+        ("await", "Wait for condition", 10),
+        ("when", "Guard (alias for await)", 10),
+        ("assert", "PlusCal assertion", 10),
+        ("print", "PlusCal print statement", 10),
+        ("skip", "No-op statement", 10),
+        ("goto", "Jump to label", 10),
+        ("define", "Define operators in PlusCal", 5),
+    ];
+
+    keywords
+        .iter()
+        .map(|(name, doc, priority)| DetailedCompletionItem {
+            label: name.to_string(),
+            kind: CompletionKind::Keyword,
+            detail: Some("PlusCal".to_string()),
+            documentation: Some(doc.to_string()),
+            insert_text: None,
+            filter_text: None,
+            sort_priority: *priority,
+            signature: None,
+        })
+        .collect()
+});
+
+/// Snippet completions for common TLA+ patterns
+static SNIPPET_COMPLETIONS: LazyLock<Vec<DetailedCompletionItem>> = LazyLock::new(|| {
+    vec![
+        DetailedCompletionItem {
+            label: "Init ==".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Init predicate".to_string()),
+            documentation: Some("Initial state predicate template".to_string()),
+            insert_text: Some("Init ==\n    /\\ $0".to_string()),
+            filter_text: Some("Init".to_string()),
+            sort_priority: 25,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "Next ==".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Next-state relation".to_string()),
+            documentation: Some("Next-state relation template".to_string()),
+            insert_text: Some("Next ==\n    \\/ $0".to_string()),
+            filter_text: Some("Next".to_string()),
+            sort_priority: 25,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "Spec == Init /\\ [][Next]_vars".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Specification formula".to_string()),
+            documentation: Some("Standard specification combining Init, Next, and vars".to_string()),
+            insert_text: Some("Spec == Init /\\ [][Next]_vars".to_string()),
+            filter_text: Some("Spec".to_string()),
+            sort_priority: 25,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "TypeInvariant ==".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Type invariant".to_string()),
+            documentation: Some("Type invariant template".to_string()),
+            insert_text: Some("TypeInvariant ==\n    /\\ $0".to_string()),
+            filter_text: Some("TypeInvariant".to_string()),
+            sort_priority: 25,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "IF ... THEN ... ELSE".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Conditional expression".to_string()),
+            documentation: Some("IF-THEN-ELSE expression".to_string()),
+            insert_text: Some("IF $0 THEN\n    TRUE\nELSE\n    FALSE".to_string()),
+            filter_text: Some("IF".to_string()),
+            sort_priority: 26,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "CHOOSE x \\in S : P(x)".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Choice operator".to_string()),
+            documentation: Some("Pick an arbitrary element satisfying a predicate".to_string()),
+            insert_text: Some("CHOOSE x \\in $0 : ".to_string()),
+            filter_text: Some("CHOOSE".to_string()),
+            sort_priority: 26,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "\\A x \\in S : P(x)".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Universal quantifier".to_string()),
+            documentation: Some("For all elements in a set".to_string()),
+            insert_text: Some("\\A x \\in $0 : ".to_string()),
+            filter_text: Some("\\A".to_string()),
+            sort_priority: 26,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "\\E x \\in S : P(x)".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Existential quantifier".to_string()),
+            documentation: Some("There exists an element in a set".to_string()),
+            insert_text: Some("\\E x \\in $0 : ".to_string()),
+            filter_text: Some("\\E".to_string()),
+            sort_priority: 26,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "[f EXCEPT ![a] = b]".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Function update".to_string()),
+            documentation: Some("Update a function/record at a key".to_string()),
+            insert_text: Some("[${1:f} EXCEPT ![${2:key}] = $0]".to_string()),
+            filter_text: Some("EXCEPT".to_string()),
+            sort_priority: 26,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "{x \\in S : P(x)}".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Set filter".to_string()),
+            documentation: Some("Filter elements from a set by predicate".to_string()),
+            insert_text: Some("{x \\in $0 : }".to_string()),
+            filter_text: Some("{".to_string()),
+            sort_priority: 26,
+            signature: None,
+        },
+        DetailedCompletionItem {
+            label: "[x \\in S |-> e]".to_string(),
+            kind: CompletionKind::Snippet,
+            detail: Some("Function constructor".to_string()),
+            documentation: Some("Create a function mapping elements of S to expressions".to_string()),
+            insert_text: Some("[x \\in $0 |-> ]".to_string()),
+            filter_text: Some("[".to_string()),
+            sort_priority: 26,
+            signature: None,
+        },
+    ]
+});
+
 /// Main TLA+ language services interface
 #[derive(uniffi::Object)]
 pub struct TLACore {
@@ -994,6 +1160,11 @@ impl TLACore {
         let context = self.analyze_context(result, position);
         let symbols = self.get_symbols(result);
         let extended_modules = self.get_extended_modules(result);
+        let source = &result.source;
+        let point = tree_sitter::Point {
+            row: position.line as usize,
+            column: position.column as usize,
+        };
 
         let mut completions = Vec::new();
 
@@ -1006,7 +1177,8 @@ impl TLACore {
             CompletionContext::InProof => {
                 // Suggest proof tactics, plus regular completions
                 completions.extend(PROOF_TACTICS.clone());
-                completions.extend(self.get_expression_completions(&symbols, &extended_modules));
+                completions.extend(self.get_expression_completions_with_context(
+                    &symbols, &extended_modules, Some(source), Some(point)));
             }
 
             CompletionContext::TopLevel => {
@@ -1023,22 +1195,31 @@ impl TLACore {
                     .cloned());
                 // Also add user-defined symbols for top-level references
                 completions.extend(self.symbols_to_completions(&symbols, 20));
+                // Add top-level snippets
+                completions.extend(SNIPPET_COMPLETIONS.iter()
+                    .filter(|s| {
+                        let filter = s.filter_text.as_deref().unwrap_or(&s.label);
+                        matches!(filter, "Init" | "Next" | "Spec" | "TypeInvariant")
+                    })
+                    .cloned());
             }
 
             CompletionContext::InExpression | CompletionContext::InLetDef | CompletionContext::Unknown => {
                 // Suggest everything relevant for expressions
-                completions.extend(self.get_expression_completions(&symbols, &extended_modules));
+                completions.extend(self.get_expression_completions_with_context(
+                    &symbols, &extended_modules, Some(source), Some(point)));
             }
 
             CompletionContext::AfterSetOperator => {
                 // Prioritize set-related completions
-                completions.extend(self.get_expression_completions(&symbols, &extended_modules));
-                // Boost set-related items (already sorted by sort_priority)
+                completions.extend(self.get_expression_completions_with_context(
+                    &symbols, &extended_modules, Some(source), Some(point)));
             }
 
             CompletionContext::AfterWith => {
                 // Suggest parameter names from the target module (not implemented yet)
-                completions.extend(self.get_expression_completions(&symbols, &extended_modules));
+                completions.extend(self.get_expression_completions_with_context(
+                    &symbols, &extended_modules, Some(source), Some(point)));
             }
         }
 
@@ -1072,8 +1253,11 @@ impl TLACore {
         // Find the function call from source text
         let (operator_name, active_param) = self.find_enclosing_call_from_source(source, point)?;
 
-        // Look up the signature
-        let signature = self.find_signature(&operator_name)?;
+        // Get user-defined symbols for signature lookup
+        let user_symbols = self.get_symbols(result);
+
+        // Look up the signature (checks stdlib then user-defined)
+        let signature = self.find_signature(&operator_name, &user_symbols)?;
 
         Some(SignatureHelp {
             signatures: vec![signature],
@@ -1142,18 +1326,48 @@ impl TLACore {
                             range: self.node_range(&child),
                             selection_range: Some(self.node_range(&name_node)),
                             children: self.extract_symbols(child, source),
+                            parameters: vec![],
                         });
                     }
                 }
                 "operator_definition" => {
                     if let Some(name_node) = child.child_by_field_name("name") {
                         let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                        // Extract parameters from operator definition
+                        let mut parameters = Vec::new();
+                        let mut param_cursor = child.walk();
+                        for param_node in child.children_by_field_name("parameter", &mut param_cursor) {
+                            if !param_node.is_named() {
+                                continue;
+                            }
+                            match param_node.kind() {
+                                "identifier" => {
+                                    if let Ok(text) = param_node.utf8_text(source.as_bytes()) {
+                                        parameters.push(text.to_string());
+                                    }
+                                }
+                                "operator_declaration" => {
+                                    // Higher-order params like f(_,_)
+                                    if let Some(op_name) = param_node.child_by_field_name("name") {
+                                        if let Ok(text) = op_name.utf8_text(source.as_bytes()) {
+                                            parameters.push(text.to_string());
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if let Ok(text) = param_node.utf8_text(source.as_bytes()) {
+                                        parameters.push(text.to_string());
+                                    }
+                                }
+                            }
+                        }
                         symbols.push(Symbol {
                             name,
                             kind: SymbolKind::Operator,
                             range: self.node_range(&child),
                             selection_range: Some(self.node_range(&name_node)),
                             children: vec![],
+                            parameters,
                         });
                     }
                 }
@@ -1166,6 +1380,7 @@ impl TLACore {
                             range: self.node_range(&var),
                             selection_range: None,
                             children: vec![],
+                            parameters: vec![],
                         });
                     }
                 }
@@ -1178,6 +1393,7 @@ impl TLACore {
                             range: self.node_range(&constant),
                             selection_range: None,
                             children: vec![],
+                            parameters: vec![],
                         });
                     }
                 }
@@ -1190,6 +1406,7 @@ impl TLACore {
                             range: self.node_range(&child),
                             selection_range: Some(self.node_range(&name_node)),
                             children: vec![],
+                            parameters: vec![],
                         });
                     }
                 }
@@ -1374,11 +1591,32 @@ impl TLACore {
         modules
     }
 
+    /// Check if cursor position is inside a PlusCal algorithm block
+    fn is_in_pluscal(&self, source: &str, point: tree_sitter::Point) -> bool {
+        let mut in_algo = false;
+        for (i, line) in source.lines().enumerate() {
+            if i > point.row {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.contains("--algorithm") || trimmed.contains("--fair algorithm") {
+                in_algo = true;
+            }
+            // Use starts_with to avoid false matches inside comments/strings
+            if in_algo && trimmed.starts_with("end algorithm") {
+                in_algo = false;
+            }
+        }
+        in_algo
+    }
+
     /// Get completions suitable for expression context
-    fn get_expression_completions(
+    fn get_expression_completions_with_context(
         &self,
         symbols: &[Symbol],
         extended_modules: &[String],
+        source: Option<&str>,
+        point: Option<tree_sitter::Point>,
     ) -> Vec<DetailedCompletionItem> {
         let mut completions = Vec::new();
 
@@ -1425,6 +1663,16 @@ impl TLACore {
         // Add user-defined symbols
         completions.extend(self.symbols_to_completions(symbols, 15));
 
+        // Add snippet completions
+        completions.extend(SNIPPET_COMPLETIONS.clone());
+
+        // Add PlusCal keywords if inside algorithm block
+        if let (Some(src), Some(pt)) = (source, point) {
+            if self.is_in_pluscal(src, pt) {
+                completions.extend(PLUSCAL_KEYWORDS.clone());
+            }
+        }
+
         completions
     }
 
@@ -1444,6 +1692,13 @@ impl TLACore {
                 SymbolKind::Assumption => (CompletionKind::Constant, 8),
             };
 
+            let signature = if !symbol.parameters.is_empty() {
+                let param_list = symbol.parameters.join(", ");
+                Some(format!("{}({})", symbol.name, param_list))
+            } else {
+                None
+            };
+
             completions.push(DetailedCompletionItem {
                 label: symbol.name.clone(),
                 kind,
@@ -1452,7 +1707,7 @@ impl TLACore {
                 insert_text: None,
                 filter_text: None,
                 sort_priority: base_priority + priority_offset,
-                signature: None,
+                signature,
             });
 
             // Recurse into children
@@ -1521,8 +1776,8 @@ impl TLACore {
     }
 
     /// Find signature information for an operator/function
-    fn find_signature(&self, name: &str) -> Option<SignatureInfo> {
-        // Check standard library
+    fn find_signature(&self, name: &str, user_symbols: &[Symbol]) -> Option<SignatureInfo> {
+        // Check standard library first
         for module in STANDARD_MODULES.iter() {
             for sym in &module.symbols {
                 if sym.name == name && !sym.parameters.is_empty() {
@@ -1546,6 +1801,32 @@ impl TLACore {
             }
         }
 
+        // Check user-defined symbols
+        self.find_user_signature(name, user_symbols)
+    }
+
+    /// Search user-defined symbols for signature info
+    fn find_user_signature(&self, name: &str, symbols: &[Symbol]) -> Option<SignatureInfo> {
+        for symbol in symbols {
+            if symbol.name == name && !symbol.parameters.is_empty() {
+                let param_list = symbol.parameters.join(", ");
+                let label = format!("{}({})", name, param_list);
+                return Some(SignatureInfo {
+                    label,
+                    documentation: Some("User-defined operator".to_string()),
+                    parameters: symbol.parameters.iter()
+                        .map(|p| ParameterInfo {
+                            label: p.clone(),
+                            documentation: None,
+                        })
+                        .collect(),
+                });
+            }
+            // Recurse into children
+            if let Some(found) = self.find_user_signature(name, &symbol.children) {
+                return Some(found);
+            }
+        }
         None
     }
 }

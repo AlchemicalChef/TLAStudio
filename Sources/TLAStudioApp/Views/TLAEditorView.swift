@@ -122,6 +122,21 @@ public struct TLAEditorView: NSViewRepresentable {
 
         // Create highlighter for this text view
         context.coordinator.highlighter = TLASyntaxHighlighter(textView: textView, theme: configuration.theme)
+
+        // Wire tree-sitter highlight provider
+        let coordinator = context.coordinator
+        coordinator.highlighter?.treeSitterHighlightProvider = { [weak coordinator] text in
+            guard let coordinator = coordinator else { return [] }
+            // Return cached tokens if text matches
+            if text == coordinator.cachedHighlightText {
+                return coordinator.cachedHighlightTokens
+            }
+            return []
+        }
+
+        // Kick off initial tree-sitter parse
+        context.coordinator.updateTreeSitterHighlights(for: text)
+
         context.coordinator.highlighter?.highlightImmediately()
 
         // Set up folding if enabled
@@ -224,6 +239,13 @@ public struct TLAEditorView: NSViewRepresentable {
         var lastKnownSelection: NSRange = NSRange(location: 0, length: 0)
         private var notificationObservers: [NSObjectProtocol] = []
 
+        /// Cached tree-sitter highlight tokens as (NSRange, captureName) tuples
+        var cachedHighlightTokens: [(NSRange, String)] = []
+        /// Text that was used to compute the cached tokens
+        var cachedHighlightText: String = ""
+        /// Task for async highlight computation
+        private var highlightTask: Task<Void, Never>?
+
         init(_ parent: TLAEditorView) {
             self.parent = parent
             super.init()
@@ -324,12 +346,129 @@ public struct TLAEditorView: NSViewRepresentable {
             parent.onTextChange?(newText)
             isUpdating = false
 
-            // Schedule highlighting
-            highlighter?.scheduleHighlighting()
+            // Update tree-sitter highlights asynchronously.
+            // The completion callback in updateTreeSitterHighlights will schedule highlighting.
+            // If tree-sitter tokens are already cached for this text, schedule immediately.
+            updateTreeSitterHighlights(for: newText)
+
+            // Only schedule immediate regex highlighting if no tree-sitter parse is in-flight
+            // (i.e., we already have cached tokens for this exact text, or tree-sitter is unavailable).
+            // Otherwise, wait for the async parse to complete to avoid double-highlight flicker.
+            if cachedHighlightText == newText {
+                highlighter?.scheduleHighlighting()
+            }
 
             // Update folding ranges
             Task { @MainActor in
                 self.foldingManager?.updateFoldingRanges(from: newText)
+            }
+        }
+
+        /// Asynchronously compute tree-sitter highlights and cache them
+        func updateTreeSitterHighlights(for text: String) {
+            highlightTask?.cancel()
+            highlightTask = Task { @MainActor [weak self] in
+                guard let self = self, !Task.isCancelled else { return }
+
+                do {
+                    let parseResult = try await TLACoreWrapper.shared.parse(text)
+                    guard !Task.isCancelled else { return }
+
+                    let tokens = await TLACoreWrapper.shared.getAllHighlights(from: parseResult)
+                    guard !Task.isCancelled else { return }
+
+                    // Build line offset indices for both UTF-8 (for tree-sitter) and UTF-16 (for NSString/NSRange).
+                    // Tree-sitter columns are byte offsets within the line (UTF-8), but NSRange uses UTF-16 code units.
+                    let utf8 = text.utf8
+                    let nsText = text as NSString
+
+                    // lineStartsUTF8[i] = byte offset of the start of line i in the UTF-8 view
+                    // lineStartsUTF16[i] = UTF-16 offset of the start of line i in the NSString
+                    var lineStartsUTF8: [Int] = [0]
+                    var lineStartsUTF16: [Int] = [0]
+                    var utf16Offset = 0
+                    for (byteIdx, byte) in utf8.enumerated() {
+                        if byte == 0x0A {  // newline
+                            utf16Offset += 1
+                            lineStartsUTF8.append(byteIdx + 1)
+                            lineStartsUTF16.append(utf16Offset)
+                        } else {
+                            // Count UTF-16 code units for this byte:
+                            // In UTF-8: leading bytes (0xxxxxxx, 110xxxxx, 1110xxxx, 11110xxx) start a character;
+                            // continuation bytes (10xxxxxx) do not.
+                            if byte & 0xC0 != 0x80 {
+                                // This is a leading byte - determine UTF-16 size
+                                if byte < 0x80 {
+                                    utf16Offset += 1 // ASCII: 1 UTF-16 code unit
+                                } else if byte < 0xE0 {
+                                    utf16Offset += 1 // 2-byte UTF-8: 1 UTF-16 code unit
+                                } else if byte < 0xF0 {
+                                    utf16Offset += 1 // 3-byte UTF-8: 1 UTF-16 code unit
+                                } else {
+                                    utf16Offset += 2 // 4-byte UTF-8: 2 UTF-16 code units (surrogate pair)
+                                }
+                            }
+                            // continuation bytes don't add to UTF-16 offset
+                        }
+                    }
+
+                    /// Convert a tree-sitter Point (line + byte column) to a UTF-16 offset
+                    func tsPointToUTF16(line: Int, byteCol: Int) -> Int? {
+                        guard line < lineStartsUTF8.count, line < lineStartsUTF16.count else { return nil }
+                        let lineByteStart = lineStartsUTF8[line]
+                        let lineUTF16Start = lineStartsUTF16[line]
+
+                        // Walk from line start, counting UTF-16 code units until we've consumed byteCol bytes
+                        var bytesConsumed = 0
+                        var utf16Count = 0
+                        let startIdx = utf8.index(utf8.startIndex, offsetBy: lineByteStart, limitedBy: utf8.endIndex) ?? utf8.endIndex
+
+                        var idx = startIdx
+                        while bytesConsumed < byteCol && idx < utf8.endIndex {
+                            let byte = utf8[idx]
+                            if byte == 0x0A { break } // Don't cross line boundary
+                            let charByteLen: Int
+                            let charUTF16Len: Int
+                            if byte < 0x80 {
+                                charByteLen = 1; charUTF16Len = 1
+                            } else if byte < 0xE0 {
+                                charByteLen = 2; charUTF16Len = 1
+                            } else if byte < 0xF0 {
+                                charByteLen = 3; charUTF16Len = 1
+                            } else {
+                                charByteLen = 4; charUTF16Len = 2
+                            }
+                            bytesConsumed += charByteLen
+                            utf16Count += charUTF16Len
+                            idx = utf8.index(idx, offsetBy: charByteLen, limitedBy: utf8.endIndex) ?? utf8.endIndex
+                        }
+                        return lineUTF16Start + utf16Count
+                    }
+
+                    // Convert TLAHighlightTokens (line/col as byte offsets) to (NSRange, String)
+                    var converted: [(NSRange, String)] = []
+                    converted.reserveCapacity(tokens.count)
+                    for token in tokens {
+                        let startLine = Int(token.range.start.line)
+                        let startCol = Int(token.range.start.column)
+                        let endLine = Int(token.range.end.line)
+                        let endCol = Int(token.range.end.column)
+
+                        guard let startUTF16 = tsPointToUTF16(line: startLine, byteCol: startCol),
+                              let endUTF16 = tsPointToUTF16(line: endLine, byteCol: endCol) else { continue }
+                        guard startUTF16 <= nsText.length, endUTF16 <= nsText.length, endUTF16 > startUTF16 else { continue }
+
+                        converted.append((NSRange(location: startUTF16, length: endUTF16 - startUTF16), token.tokenType))
+                    }
+
+                    self.cachedHighlightTokens = converted
+                    self.cachedHighlightText = text
+
+                    // Re-trigger highlighting now that tree-sitter tokens are available
+                    self.highlighter?.scheduleHighlighting()
+                } catch {
+                    // Parse failed; regex highlighting will be used as fallback
+                }
             }
         }
 
@@ -783,8 +922,12 @@ class GoToDefinitionTextView: NSTextView {
                 // Delay before showing hover
                 hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
                     guard let self = self else { return }
-                    let screenPoint = self.window?.convertPoint(toScreen: event.locationInWindow) ?? .zero
-                    self.onHover?(characterIndex, screenPoint)
+                    // Compute scroll-view-visible-relative point for overlay positioning
+                    let localPoint = self.convert(event.locationInWindow, from: nil)
+                    let scrollOffset = self.enclosingScrollView?.documentVisibleRect.origin ?? .zero
+                    let visiblePoint = NSPoint(x: localPoint.x - scrollOffset.x,
+                                               y: localPoint.y - scrollOffset.y)
+                    self.onHover?(characterIndex, visiblePoint)
                 }
             }
         }

@@ -1828,15 +1828,23 @@ public struct Symbol {
     public var range: Range
     public var selectionRange: Range?
     public var children: [Symbol]
+    /**
+     * Parameter names for operator definitions (empty for non-operators)
+     */
+    public var parameters: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, kind: SymbolKind, range: Range, selectionRange: Range?, children: [Symbol]) {
+    public init(name: String, kind: SymbolKind, range: Range, selectionRange: Range?, children: [Symbol], 
+        /**
+         * Parameter names for operator definitions (empty for non-operators)
+         */parameters: [String]) {
         self.name = name
         self.kind = kind
         self.range = range
         self.selectionRange = selectionRange
         self.children = children
+        self.parameters = parameters
     }
 }
 
@@ -1859,6 +1867,9 @@ extension Symbol: Equatable, Hashable {
         if lhs.children != rhs.children {
             return false
         }
+        if lhs.parameters != rhs.parameters {
+            return false
+        }
         return true
     }
 
@@ -1868,6 +1879,7 @@ extension Symbol: Equatable, Hashable {
         hasher.combine(range)
         hasher.combine(selectionRange)
         hasher.combine(children)
+        hasher.combine(parameters)
     }
 }
 
@@ -1883,7 +1895,8 @@ public struct FfiConverterTypeSymbol: FfiConverterRustBuffer {
                 kind: FfiConverterTypeSymbolKind.read(from: &buf), 
                 range: FfiConverterTypeRange.read(from: &buf), 
                 selectionRange: FfiConverterOptionTypeRange.read(from: &buf), 
-                children: FfiConverterSequenceTypeSymbol.read(from: &buf)
+                children: FfiConverterSequenceTypeSymbol.read(from: &buf), 
+                parameters: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -1893,6 +1906,7 @@ public struct FfiConverterTypeSymbol: FfiConverterRustBuffer {
         FfiConverterTypeRange.write(value.range, into: &buf)
         FfiConverterOptionTypeRange.write(value.selectionRange, into: &buf)
         FfiConverterSequenceTypeSymbol.write(value.children, into: &buf)
+        FfiConverterSequenceString.write(value.parameters, into: &buf)
     }
 }
 

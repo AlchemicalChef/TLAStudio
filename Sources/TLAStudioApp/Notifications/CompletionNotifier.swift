@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import UserNotifications
+import os
 
 // MARK: - Completion Notifier
 
@@ -13,6 +14,7 @@ final class CompletionNotifier {
 
     // MARK: - Properties
 
+    private let logger = Log.logger(category: "CompletionNotifier")
     private var isAuthorized = false
 
     // MARK: - Initialization
@@ -27,7 +29,7 @@ final class CompletionNotifier {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
             self?.isAuthorized = granted
             if let error = error {
-                print("Notification authorization error: \(error)")
+                self?.logger.error("Notification authorization error: \(error.localizedDescription)")
             }
         }
     }
@@ -96,9 +98,9 @@ final class CompletionNotifier {
             trigger: nil // Deliver immediately
         )
 
-        UNUserNotificationCenter.current().add(request) { error in
+        UNUserNotificationCenter.current().add(request) { [weak self] error in
             if let error = error {
-                print("Failed to schedule notification: \(error)")
+                self?.logger.error("Failed to schedule notification: \(error.localizedDescription)")
             }
         }
     }

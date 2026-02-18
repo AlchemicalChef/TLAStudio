@@ -23,7 +23,7 @@ final class UserSettings: ObservableObject {
 
     // MARK: - Storage Keys
 
-    private enum Keys {
+    enum Keys {
         // General
         static let autosaveEnabled = "settings.general.autosaveEnabled"
         static let autosaveInterval = "settings.general.autosaveInterval"

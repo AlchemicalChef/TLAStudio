@@ -297,7 +297,27 @@ class CompletionController {
         guard let textView = textView else { return }
 
         // Determine what to insert
-        let insertText = item.insertText ?? item.label
+        var insertText = item.insertText ?? item.label
+
+        // Process snippet markers: strip ${N:placeholder} patterns first, then find $0 cursor position
+        var cursorOffset: Int? = nil
+
+        // First: Strip ${N:placeholder} patterns -> replace with just the placeholder text
+        while let openRange = insertText.range(of: "${") {
+            // Find matching }
+            guard let colonRange = insertText.range(of: ":", range: openRange.upperBound..<insertText.endIndex),
+                  let closeRange = insertText.range(of: "}", range: colonRange.upperBound..<insertText.endIndex) else {
+                break
+            }
+            let placeholder = String(insertText[colonRange.upperBound..<closeRange.lowerBound])
+            insertText.replaceSubrange(openRange.lowerBound..<closeRange.upperBound, with: placeholder)
+        }
+
+        // Then: Handle $0 cursor marker (after placeholder stripping so offset is correct)
+        if let markerRange = insertText.range(of: "$0") {
+            cursorOffset = insertText.distance(from: insertText.startIndex, to: markerRange.lowerBound)
+            insertText.removeSubrange(markerRange)
+        }
 
         // Calculate the range to replace (the typed prefix)
         let cursorPosition = textView.selectedRange().location
@@ -325,6 +345,12 @@ class CompletionController {
         if textView.shouldChangeText(in: replaceRange, replacementString: insertText) {
             textView.replaceCharacters(in: replaceRange, with: insertText)
             textView.didChangeText()
+
+            // Position cursor at $0 marker location if present
+            if let offset = cursorOffset {
+                let newCursorPosition = replaceRange.location + offset
+                textView.setSelectedRange(NSRange(location: newCursorPosition, length: 0))
+            }
 
             // Notify callback
             onInsertCompletion?(item, replaceRange)

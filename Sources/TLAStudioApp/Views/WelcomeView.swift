@@ -5,7 +5,7 @@ import SwiftUI
 /// Welcome screen shown on first launch
 struct WelcomeView: View {
     @Environment(\.dismiss) private var dismiss
-    @AppStorage("showWelcomeOnLaunch") private var showWelcomeOnLaunch = true
+    @AppStorage(UserSettings.Keys.showWelcomeOnLaunch) private var showWelcomeOnLaunch = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -242,10 +242,10 @@ final class WelcomeWindowController: NSWindowController {
     }
 
     func showIfNeeded() {
-        let showWelcome = UserDefaults.standard.bool(forKey: "showWelcomeOnLaunch")
+        let showWelcome = UserDefaults.standard.bool(forKey: UserSettings.Keys.showWelcomeOnLaunch)
         // Default to true if not set
         if !UserDefaults.standard.bool(forKey: "welcomeShownBefore") {
-            UserDefaults.standard.set(true, forKey: "showWelcomeOnLaunch")
+            UserDefaults.standard.set(true, forKey: UserSettings.Keys.showWelcomeOnLaunch)
             UserDefaults.standard.set(true, forKey: "welcomeShownBefore")
             show()
         } else if showWelcome {

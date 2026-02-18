@@ -193,7 +193,7 @@ struct MinimapContainer: View {
     let diagnostics: [TLADiagnostic]
     let onNavigate: (Int) -> Void
 
-    @AppStorage("showMinimap") private var showMinimap = false
+    @AppStorage(UserSettings.Keys.showMinimap) private var showMinimap = false
 
     var body: some View {
         if showMinimap {

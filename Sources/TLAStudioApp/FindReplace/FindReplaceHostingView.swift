@@ -175,46 +175,4 @@ extension TLASourceEditor {
     }
 }
 
-// MARK: - Notification Names
-
-extension Notification.Name {
-
-    // MARK: Panel Visibility
-
-    /// Posted when the find/replace panel should be shown.
-    ///
-    /// The `object` of this notification is the `TLASourceEditor` instance
-    /// requesting the panel.
-    static let showFindReplace = Notification.Name("TLAShowFindReplace")
-
-    /// Posted when the find/replace panel should be hidden.
-    ///
-    /// The `object` of this notification is the `TLASourceEditor` instance
-    /// requesting the panel be hidden.
-    static let hideFindReplace = Notification.Name("TLAHideFindReplace")
-
-    /// Posted when the find/replace panel visibility should be toggled.
-    ///
-    /// The `object` of this notification is the `TLASourceEditor` instance
-    /// requesting the toggle.
-    static let toggleFindReplace = Notification.Name("TLAToggleFindReplace")
-
-    // MARK: Panel Internal
-
-    /// Posted when the find/replace panel height changes.
-    ///
-    /// The `object` of this notification is the `FindReplaceManager` instance.
-    /// This notification is used internally to update the hosting view's
-    /// intrinsic content size.
-    static let findReplacePanelHeightChanged = Notification.Name("TLAFindReplacePanelHeightChanged")
-
-    /// Posted to request focus on the search field.
-    ///
-    /// The `object` of this notification is the `FindReplaceHostingView` instance.
-    static let findReplaceFocusSearchField = Notification.Name("TLAFindReplaceFocusSearchField")
-
-    /// Posted to request focus on the replace field.
-    ///
-    /// The `object` of this notification is the `FindReplaceHostingView` instance.
-    static let findReplaceFocusReplaceField = Notification.Name("TLAFindReplaceFocusReplaceField")
-}
+// Notification.Name declarations are centralized in Utilities/NotificationNames.swift

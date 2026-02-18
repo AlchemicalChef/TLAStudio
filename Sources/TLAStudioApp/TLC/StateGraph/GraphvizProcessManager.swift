@@ -8,22 +8,17 @@ actor GraphvizProcessManager {
 
     // MARK: - Graphviz Detection
 
-    /// Common paths where Graphviz dot binary might be installed
-    private static let dotPaths = [
-        "/usr/local/bin/dot",
-        "/opt/homebrew/bin/dot",
-        "/usr/bin/dot",
-        "/opt/local/bin/dot"
-    ]
-
     /// Find the path to the dot executable
     private var dotPath: URL? {
-        for path in Self.dotPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                return URL(fileURLWithPath: path)
-            }
-        }
-        return nil
+        BinaryDiscovery.find(
+            named: "dot",
+            options: .systemOnly(paths: [
+                "/usr/local/bin",
+                "/opt/homebrew/bin",
+                "/usr/bin",
+                "/opt/local/bin"
+            ])
+        )
     }
 
     /// Check if Graphviz is available
@@ -88,35 +83,59 @@ actor GraphvizProcessManager {
             throw GraphvizError.encodingError
         }
 
-        // Write input and close pipe
+        // Collect stdout/stderr concurrently to prevent deadlock.
+        // If the pipe buffer fills (~64KB) and nobody is reading, the process blocks forever.
+        let outputHandle = outputPipe.fileHandleForReading
+        let errorHandle = errorPipe.fileHandleForReading
+        let accumulator = GraphvizOutputAccumulator()
+
+        outputHandle.readabilityHandler = { [weak accumulator] handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                accumulator?.appendOutput(data)
+            }
+        }
+        errorHandle.readabilityHandler = { [weak accumulator] handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                accumulator?.appendError(data)
+            }
+        }
+
+        // Write input and close pipe to signal EOF to graphviz
         let inputHandle = inputPipe.fileHandleForWriting
         inputHandle.write(inputData)
         try inputHandle.close()
 
         // Wait for process to complete with timeout
-        // Use generous timeout (10 min) - large traces with thousands of states can take time
-        // User can cancel via UI if needed; this is just a safety net for hung processes
         let timeoutSeconds: Double = 600.0
         let startTime = Date()
         while process.isRunning {
             if Date().timeIntervalSince(startTime) > timeoutSeconds {
+                outputHandle.readabilityHandler = nil
+                errorHandle.readabilityHandler = nil
                 process.terminate()
                 throw GraphvizError.renderingFailed("Process timed out after \(Int(timeoutSeconds / 60)) minutes")
             }
             try await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
+        // Drain remaining buffered data after process exits
+        let lastOutput = outputHandle.availableData
+        let lastError = errorHandle.availableData
+        if !lastOutput.isEmpty { accumulator.appendOutput(lastOutput) }
+        if !lastError.isEmpty { accumulator.appendError(lastError) }
+
+        outputHandle.readabilityHandler = nil
+        errorHandle.readabilityHandler = nil
+
         // Check exit status
         if process.terminationStatus != 0 {
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+            let errorMessage = String(data: accumulator.getError(), encoding: .utf8) ?? "Unknown error"
             throw GraphvizError.renderingFailed(errorMessage)
         }
 
-        // Read output - use readDataToEndOfFile for simplicity
-        // Note: For extremely large traces (10,000+ states), consider streaming or pagination
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-
+        let outputData = accumulator.getOutput()
         if outputData.isEmpty {
             throw GraphvizError.emptyOutput
         }
@@ -229,5 +248,39 @@ extension GraphvizProcessManager {
 
         After installation, restart TLA+ Studio.
         """
+    }
+}
+
+// MARK: - Output Accumulator
+
+/// Thread-safe accumulator for Graphviz process output.
+/// @unchecked Sendable: thread safety ensured by NSLock.
+private final class GraphvizOutputAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _output = Data()
+    private var _error = Data()
+
+    func appendOutput(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        _output.append(data)
+    }
+
+    func appendError(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        _error.append(data)
+    }
+
+    func getOutput() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return _output
+    }
+
+    func getError() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return _error
     }
 }

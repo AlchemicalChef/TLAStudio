@@ -194,7 +194,8 @@ struct BreadcrumbBar_Previews: PreviewProvider {
                         end: TLAPosition(line: 15, column: 0)
                     ),
                     selectionRange: nil,
-                    children: []
+                    children: [],
+                    parameters: []
                 ),
                 symbols: [],
                 onNavigateToModule: {},

@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-private let logger = Logger(subsystem: "com.tlastudio", category: "TLC")
+private let logger = Log.logger(category: "TLC")
 
 // MARK: - TLC Process Manager
 
@@ -14,9 +14,7 @@ actor TLCProcessManager {
     private var activeProcesses: [UUID: Process] = [:]
     private var parsers: [UUID: TLCOutputParser] = [:]
     private var progressTasks: [UUID: Task<Void, Never>] = [:]
-    private var streamContinuations: [UUID: AsyncStream<ModelCheckProgress>.Continuation] = [:]
-    // Note: Stream finish tracking is handled by StreamState.isFinished
-    // No actor-level finishedStreams set needed (was causing memory leak)
+    private var streamStates: [UUID: StreamState<ModelCheckProgress>] = [:]
 
     /// Cached Java path to avoid blocking `which java` calls (Issue #12)
     private var cachedJavaPath: URL?
@@ -34,65 +32,10 @@ actor TLCProcessManager {
     /// Above this, we use SerialGC to avoid OOM with Epsilon GC
     private let autoSelectThreshold = 500_000
 
+
     /// Find a TLC binary by name
     private func findBinary(named name: String) -> URL? {
-        // Check SPM resource bundle
-        if let binary = Bundle.module.url(forResource: name, withExtension: nil) {
-            logger.debug("Found \(name) in module bundle: \(binary.path)")
-            return binary
-        }
-
-        // Check main bundle
-        if let binary = Bundle.main.url(forResource: name, withExtension: nil) {
-            logger.debug("Found \(name) in main bundle: \(binary.path)")
-            return binary
-        }
-
-        // Check app bundle Resources directory (for .app bundles)
-        if let resourcePath = Bundle.main.resourcePath {
-            // Check directly in Resources
-            let directPath = URL(fileURLWithPath: resourcePath)
-                .appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: directPath.path) {
-                logger.debug("Found \(name) in app Resources directly: \(directPath.path)")
-                return directPath
-            }
-
-            // Check in nested bundle
-            let bundlePath = URL(fileURLWithPath: resourcePath)
-                .appendingPathComponent("TLAStudio_TLAStudioApp.bundle")
-                .appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: bundlePath.path) {
-                logger.debug("Found \(name) in app Resources bundle: \(bundlePath.path)")
-                return bundlePath
-            }
-        }
-
-        // Check SPM debug bundle path (next to executable)
-        if let debugBundlePath = Bundle.main.executableURL?.deletingLastPathComponent()
-            .appendingPathComponent("TLAStudio_TLAStudioApp.bundle")
-            .appendingPathComponent(name) {
-            if FileManager.default.fileExists(atPath: debugBundlePath.path) {
-                logger.debug("Found \(name) in debug bundle: \(debugBundlePath.path)")
-                return debugBundlePath
-            }
-        }
-
-        // Check common paths
-        let commonPaths = [
-            "/usr/local/bin/\(name)",
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".tla/\(name)").path
-        ]
-
-        for path in commonPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                logger.debug("Found \(name) at common path: \(path)")
-                return URL(fileURLWithPath: path)
-            }
-        }
-
-        logger.warning("TLC binary '\(name)' not found in any location")
-        return nil
+        BinaryDiscovery.find(named: name)
     }
 
     /// Path to fast TLC binary (Epsilon GC - best for small/medium specs)
@@ -112,45 +55,14 @@ actor TLCProcessManager {
 
     /// Path to tla2tools.jar for JVM fallback
     private var tla2toolsJarPath: URL? {
-        // Check module bundle first
-        if let jar = Bundle.module.url(forResource: "tla2tools", withExtension: "jar") {
-            logger.debug("Found tla2tools.jar in module bundle: \(jar.path)")
-            return jar
-        }
-
-        // Check main bundle
-        if let jar = Bundle.main.url(forResource: "tla2tools", withExtension: "jar") {
-            logger.debug("Found tla2tools.jar in main bundle: \(jar.path)")
-            return jar
-        }
-
-        // Check Scripts directory (development)
-        let scriptsPath = URL(fileURLWithPath: #file)
-            .deletingLastPathComponent()  // TLC
-            .deletingLastPathComponent()  // TLAStudioApp
-            .deletingLastPathComponent()  // Sources
-            .deletingLastPathComponent()  // TLAStudio
-            .appendingPathComponent("Scripts")
-            .appendingPathComponent("tla2tools.jar")
-        if FileManager.default.fileExists(atPath: scriptsPath.path) {
-            logger.debug("Found tla2tools.jar in Scripts: \(scriptsPath.path)")
-            return scriptsPath
-        }
-
-        // Check common paths
-        let commonPaths = [
-            "/usr/local/lib/tla2tools.jar",
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".tla/tla2tools.jar").path
-        ]
-        for path in commonPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                logger.debug("Found tla2tools.jar at: \(path)")
-                return URL(fileURLWithPath: path)
-            }
-        }
-
-        logger.warning("tla2tools.jar not found")
-        return nil
+        BinaryDiscovery.find(
+            named: "tla2tools",
+            extension: "jar",
+            options: .init(
+                systemPaths: ["/usr/local/lib", "/usr/local/bin"],
+                homeRelativePaths: [".tla"]
+            )
+        )
     }
 
     /// Path to Java executable (cached to avoid blocking actor with `which java`)
@@ -469,6 +381,9 @@ actor TLCProcessManager {
         process.arguments = arguments
         process.currentDirectoryURL = specURL.deletingLastPathComponent()
 
+        // Set minimal environment — don't inherit full parent environment
+        process.environment = ProcessEnvironment.minimal()
+
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
@@ -492,7 +407,7 @@ actor TLCProcessManager {
 
         // Create async stream for progress updates with proper termination
         // Use a thread-safe wrapper to prevent yielding after finish
-        let streamState = StreamState()
+        let streamState = StreamState<ModelCheckProgress>(throttle: .fps30)
 
         let progressStream = AsyncStream<ModelCheckProgress> { continuation in
             // Store continuation reference for the handlers
@@ -544,7 +459,7 @@ actor TLCProcessManager {
             }
         }
 
-        streamContinuations[sessionId] = streamState.continuation
+        streamStates[sessionId] = streamState
 
         do {
             try process.run()
@@ -553,8 +468,7 @@ actor TLCProcessManager {
         } catch {
             activeProcesses.removeValue(forKey: sessionId)
             parsers.removeValue(forKey: sessionId)
-            // StreamState.finish() handles marking stream as finished
-            streamContinuations.removeValue(forKey: sessionId)
+            streamStates.removeValue(forKey: sessionId)
             streamState.finish()
             throw TLCError.failedToStart(error)
         }
@@ -574,15 +488,38 @@ actor TLCProcessManager {
             }
         }
 
-        // Clean up handles first to ensure all data is flushed
+        // Drain any remaining buffered data before clearing handlers.
+        // readabilityHandler may not fire for data already in the pipe buffer
+        // after process exit, so we must read it synchronously.
+        let lastStdout = stdoutHandle.availableData
+        if !lastStdout.isEmpty {
+            if let str = String(data: lastStdout, encoding: .utf8) {
+                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
+                    OutputManager.shared.logTLC(line)
+                }
+            }
+            if let update = parser.parseThreadSafe(lastStdout) {
+                streamState.yield(update)
+            }
+        }
+        let lastStderr = stderrHandle.availableData
+        if !lastStderr.isEmpty {
+            if let str = String(data: lastStderr, encoding: .utf8) {
+                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
+                    parser.parseStderr(line)
+                    OutputManager.shared.logTLC(line, isError: true)
+                }
+            }
+        }
+
+        // Now safe to clear handlers and close
         stdoutHandle.readabilityHandler = nil
         stderrHandle.readabilityHandler = nil
         try? stdoutHandle.close()
         try? stderrHandle.close()
 
-        // Mark stream as finished and remove continuation
-        // StreamState.finish() was already called via streamState.finish() elsewhere
-        streamContinuations.removeValue(forKey: sessionId)?.finish()
+        // Mark stream as finished and clean up
+        streamStates.removeValue(forKey: sessionId)?.finish()
 
         progressTasks.removeValue(forKey: sessionId)?.cancel()
 
@@ -614,7 +551,7 @@ actor TLCProcessManager {
     /// Stop a running model check
     func stop(sessionId: UUID) {
         progressTasks.removeValue(forKey: sessionId)?.cancel()
-        streamContinuations.removeValue(forKey: sessionId)?.finish()
+        streamStates.removeValue(forKey: sessionId)?.finish()
         ProcessRegistry.shared.terminate(sessionId)
         activeProcesses.removeValue(forKey: sessionId)
         parsers.removeValue(forKey: sessionId)
@@ -638,11 +575,11 @@ actor TLCProcessManager {
         }
         progressTasks.removeAll()
 
-        // Finish all streams - StreamState.finish() handles marking stream as finished internally
-        for (_, continuation) in streamContinuations {
-            continuation.finish()
+        // Finish all streams
+        for (_, state) in streamStates {
+            state.finish()
         }
-        streamContinuations.removeAll()
+        streamStates.removeAll()
 
         for (sessionId, _) in activeProcesses {
             ProcessRegistry.shared.terminate(sessionId)
@@ -745,102 +682,6 @@ actor TLCProcessManager {
     }
 }
 
-// MARK: - Stream State
-
-/// Thread-safe wrapper for AsyncStream continuation to prevent race conditions.
-/// Guards against yielding after the stream has been finished.
-/// Includes throttling to ~30fps to reduce UI update overhead during intensive model checking.
-private final class StreamState: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _continuation: AsyncStream<ModelCheckProgress>.Continuation?
-    private var _isFinished = false
-
-    // Throttling state for ~30fps updates
-    private let throttleInterval: CFAbsoluteTime = 0.033  // ~30fps
-    private var lastYieldTime: CFAbsoluteTime = 0
-    private var pendingUpdate: ModelCheckProgress?
-
-    var continuation: AsyncStream<ModelCheckProgress>.Continuation? {
-        lock.lock()
-        defer { lock.unlock() }
-        return _continuation
-    }
-
-    var isFinished: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _isFinished
-    }
-
-    func setContinuation(_ continuation: AsyncStream<ModelCheckProgress>.Continuation) {
-        lock.lock()
-        defer { lock.unlock() }
-        _continuation = continuation
-    }
-
-    /// Yield with throttling to ~30fps. High-frequency updates are coalesced.
-    func yield(_ value: ModelCheckProgress) {
-        // Extract continuation under lock, yield outside to prevent deadlock
-        let (shouldYield, continuation): (Bool, AsyncStream<ModelCheckProgress>.Continuation?) = {
-            lock.lock()
-            defer { lock.unlock() }
-            guard !_isFinished, let c = _continuation else { return (false, nil) }
-
-            let now = CFAbsoluteTimeGetCurrent()
-            if now - lastYieldTime >= throttleInterval {
-                lastYieldTime = now
-                pendingUpdate = nil
-                return (true, c)
-            } else {
-                // Store for flush on next interval or finish()
-                pendingUpdate = value
-                return (false, nil)
-            }
-        }()
-
-        if shouldYield, let continuation = continuation {
-            continuation.yield(value)
-        }
-    }
-
-    /// Yield immediately without throttling (for critical updates like errors)
-    func yieldImmediate(_ value: ModelCheckProgress) {
-        // Extract continuation under lock, yield outside to prevent deadlock
-        let continuation: AsyncStream<ModelCheckProgress>.Continuation? = {
-            lock.lock()
-            defer { lock.unlock() }
-            guard !_isFinished, let c = _continuation else { return nil }
-            lastYieldTime = CFAbsoluteTimeGetCurrent()
-            pendingUpdate = nil
-            return c
-        }()
-
-        continuation?.yield(value)
-    }
-
-    func finish() {
-        // Extract state under lock, then call continuation methods outside lock
-        // to prevent deadlock (continuation methods may synchronize with consumers)
-        let (pending, continuation): (ModelCheckProgress?, AsyncStream<ModelCheckProgress>.Continuation?) = {
-            lock.lock()
-            defer { lock.unlock() }
-            guard !_isFinished else { return (nil, nil) }
-            _isFinished = true
-            let p = pendingUpdate
-            let c = _continuation
-            pendingUpdate = nil
-            _continuation = nil
-            return (p, c)
-        }()
-
-        // Call continuation methods outside the lock
-        if let pending = pending, let continuation = continuation {
-            continuation.yield(pending)
-        }
-        continuation?.finish()
-    }
-}
-
 // MARK: - TLC Errors
 
 enum TLCError: Error, LocalizedError {
@@ -885,6 +726,18 @@ enum TLCError: Error, LocalizedError {
     }
 }
 
+// MARK: - Progress Data Point
+
+/// A single data point for the progress chart, sampled at ~1Hz
+struct ProgressDataPoint: Identifiable {
+    let id = UUID()
+    let timestamp: TimeInterval  // seconds since start
+    let statesFound: UInt64
+    let distinctStates: UInt64
+    let statesPerSecond: Double
+    let memoryUsed: UInt64
+}
+
 // MARK: - TLC Session
 
 /// Observable object for tracking a TLC session in the UI
@@ -899,12 +752,18 @@ class TLCSession: ObservableObject {
     @Published var result: ModelCheckResult?
     @Published var error: Error?
     @Published var checkpointStatus: CheckpointStatus = .none
+    @Published var progressHistory: [ProgressDataPoint] = []
 
     /// The binary mode to use for this session
     var binaryMode: TLCProcessManager.TLCBinaryMode = .auto
 
     private var task: Task<Void, Never>?
     private var recoveringFrom: CheckpointInfo?
+
+    /// Tracks when we last appended a chart data point (for ~1Hz downsampling)
+    private var lastChartUpdateTime: TimeInterval = 0
+    /// Start time of the current model check run
+    private var runStartTime: Date?
 
     init(specURL: URL, config: ModelConfig, binaryMode: TLCProcessManager.TLCBinaryMode = .auto) {
         self.id = UUID()
@@ -918,6 +777,9 @@ class TLCSession: ObservableObject {
         isRunning = true
         error = nil
         result = nil
+        progressHistory = []
+        lastChartUpdateTime = 0
+        runStartTime = Date()
 
         // Capture values to avoid retain cycle - weak self in Task closure
         // means we shouldn't access self properties after await points
@@ -926,6 +788,7 @@ class TLCSession: ObservableObject {
         let capturedSessionId = id
         let capturedBinaryMode = binaryMode
         let capturedRecoveringFrom = recoveringFrom
+        let capturedStartTime = runStartTime!
 
         task = Task { @MainActor [weak self] in
             do {
@@ -937,7 +800,22 @@ class TLCSession: ObservableObject {
                     recoverFrom: capturedRecoveringFrom
                 ) { [weak self] progressUpdate in
                     Task { @MainActor in
-                        self?.progress = progressUpdate
+                        guard let self else { return }
+                        self.progress = progressUpdate
+
+                        // Downsample chart data to ~1 point/sec
+                        let elapsed = Date().timeIntervalSince(capturedStartTime)
+                        let isFinalUpdate = progressUpdate.phase == .done || progressUpdate.phase == .error
+                        if isFinalUpdate || elapsed - self.lastChartUpdateTime >= 1.0 {
+                            self.lastChartUpdateTime = elapsed
+                            self.progressHistory.append(ProgressDataPoint(
+                                timestamp: elapsed,
+                                statesFound: progressUpdate.statesFound,
+                                distinctStates: progressUpdate.distinctStates,
+                                statesPerSecond: progressUpdate.statesPerSecond,
+                                memoryUsed: progressUpdate.memoryUsed
+                            ))
+                        }
                     }
                 }
 

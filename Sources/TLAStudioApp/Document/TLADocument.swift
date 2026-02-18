@@ -1,12 +1,17 @@
 import AppKit
 import UniformTypeIdentifiers
 import Combine
+import os
 
 // MARK: - TLADocument
 
 /// Primary document class for TLA+ specification files.
 /// See Docs/architecture/01-document-management.md for full specification.
 final class TLADocument: NSDocument, ObservableObject {
+
+    // MARK: - Logging
+
+    private let logger = Log.logger(category: "TLADocument")
 
     // MARK: - Document State
 
@@ -538,7 +543,7 @@ final class TLADocument: NSDocument, ObservableObject {
         // Get selection directly from the first responder text view
         guard let window = NSApp.keyWindow,
               let textView = window.firstResponder as? NSTextView else {
-            NSLog("[TLADocument] checkSelectionProofStep: No text view found")
+            logger.debug("checkSelectionProofStep: No text view found")
             return
         }
 
@@ -546,12 +551,12 @@ final class TLADocument: NSDocument, ObservableObject {
         let location = selection.location
 
         guard location != NSNotFound else {
-            NSLog("[TLADocument] checkSelectionProofStep: No selection")
+            logger.debug("checkSelectionProofStep: No selection")
             return
         }
 
         let (line, column) = lineAndColumn(for: location)
-        NSLog("[TLADocument] checkSelectionProofStep: selection at line=%d, column=%d", line + 1, column + 1)
+        logger.debug("checkSelectionProofStep: selection at line=\(line + 1), column=\(column + 1)")
 
         // Create or reuse session
         let session = proofSession ?? ProofSession(specURL: fileURL)
@@ -771,6 +776,4 @@ extension TLADocumentDelegate {
     func documentDidNavigate(_ document: TLADocument, to range: TLARange) {}
 }
 
-extension Notification.Name {
-    static let documentWillClose = Notification.Name("TLADocumentWillClose")
-}
+// Notification.Name declarations are centralized in Utilities/NotificationNames.swift

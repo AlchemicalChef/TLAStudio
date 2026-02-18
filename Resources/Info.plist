@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Identity -->
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleName</key>
+    <string>TLA+ Studio</string>
+    <key>CFBundleDisplayName</key>
+    <string>TLA+ Studio</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    
+    <!-- Minimum macOS Version -->
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    
+    <!-- App Category -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    
+    <!-- App Icon -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+
+    <!-- High Resolution -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    
+    <!-- Principal Class -->
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    
+    <!-- Document Types -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <!-- TLA+ Specification -->
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>TLA+ Specification</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.tlaplus.specification</string>
+            </array>
+            <key>NSDocumentClass</key>
+            <string>$(PRODUCT_MODULE_NAME).TLADocument</string>
+        </dict>
+        <!-- TLA+ Configuration -->
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>TLA+ Configuration</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.tlaplus.configuration</string>
+            </array>
+            <key>NSDocumentClass</key>
+            <string>$(PRODUCT_MODULE_NAME).TLAConfigDocument</string>
+        </dict>
+    </array>
+    
+    <!-- UTI Declarations -->
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <!-- TLA+ Specification UTI -->
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.tlaplus.specification</string>
+            <key>UTTypeDescription</key>
+            <string>TLA+ Specification</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.plain-text</string>
+                <string>public.source-code</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>tla</string>
+                </array>
+                <key>public.mime-type</key>
+                <string>text/x-tlaplus</string>
+            </dict>
+        </dict>
+        <!-- TLA+ Configuration UTI -->
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.tlaplus.configuration</string>
+            <key>UTTypeDescription</key>
+            <string>TLA+ Configuration</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.plain-text</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>cfg</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
+    
+    <!-- App Transport Security (for Sparkle updates) -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <false/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    
+    <!-- Usage Descriptions -->
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2025. All rights reserved.</string>
+    
+    <!-- Sparkle Updates (optional) -->
+    <key>SUFeedURL</key>
+    <string>https://example.com/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>YOUR_PUBLIC_KEY_HERE</string>
+</dict>
+</plist>

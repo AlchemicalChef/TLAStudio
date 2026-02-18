@@ -1,7 +1,8 @@
+import CryptoKit
 import Foundation
 import os
 
-private let logger = Logger(subsystem: "com.tlastudio", category: "IsabelleDownloader")
+private let logger = Log.logger(category: "IsabelleDownloader")
 
 /// Manages downloading and installing Isabelle on-demand
 @MainActor
@@ -51,15 +52,48 @@ final class IsabelleDownloader: ObservableObject {
     private static let isabelleVersion = "Isabelle2024"
     private static let downloadURL: URL = {
         #if arch(arm64)
-        return URL(string: "https://isabelle.in.tum.de/website-Isabelle2024/dist/Isabelle2024_macos_arm64.tar.gz")!
+        guard let url = URL(string: "https://isabelle.in.tum.de/website-Isabelle2024/dist/Isabelle2024_macos_arm64.tar.gz") else {
+            fatalError("Invalid hardcoded Isabelle download URL")
+        }
+        return url
         #else
-        return URL(string: "https://isabelle.in.tum.de/website-Isabelle2024/dist/Isabelle2024_macos.tar.gz")!
+        guard let url = URL(string: "https://isabelle.in.tum.de/website-Isabelle2024/dist/Isabelle2024_macos.tar.gz") else {
+            fatalError("Invalid hardcoded Isabelle download URL")
+        }
+        return url
         #endif
     }()
 
+    /// Expected SHA-256 hash of the downloaded archive for integrity verification.
+    /// Update these hashes when upgrading the Isabelle version.
+    private static let expectedSHA256: String = {
+        #if arch(arm64)
+        return "dcc0149e815158e6e3dbab67aff9a9cdf0e498a771194325a8ed75cd7d24ad4c"
+        #else
+        return "c1db0e86fa2fb39ed52e18c60e49a32e52474dd53e2e4d4b1e88850d4e60a01c"
+        #endif
+    }()
+
+    /// Verifies the SHA-256 hash of a downloaded file.
+    /// - Parameters:
+    ///   - fileURL: URL to the downloaded file
+    /// - Returns: true if the hash matches the expected value
+    private func verifySHA256(of fileURL: URL) throws -> Bool {
+        let fileData = try Data(contentsOf: fileURL)
+        let digest = SHA256.hash(data: fileData)
+        let hashString = digest.map { String(format: "%02x", $0) }.joined()
+        let matches = hashString == Self.expectedSHA256
+        if !matches {
+            logger.error("SHA-256 mismatch: expected \(Self.expectedSHA256), got \(hashString)")
+        }
+        return matches
+    }
+
     /// Where Isabelle gets installed (Application Support)
     private var installDirectory: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            fatalError("Application Support directory unavailable")
+        }
         return appSupport.appendingPathComponent("TLA+ Studio/Provers", isDirectory: true)
     }
 
@@ -145,6 +179,20 @@ final class IsabelleDownloader: ObservableObject {
 
                 guard let tempURL = tempURL else {
                     self.state = .error("Download failed: No file received")
+                    return
+                }
+
+                // Verify archive integrity before extraction
+                do {
+                    guard try self.verifySHA256(of: tempURL) else {
+                        self.state = .error("Download integrity check failed: SHA-256 hash mismatch. The download may be corrupted or tampered with.")
+                        try? FileManager.default.removeItem(at: tempURL)
+                        return
+                    }
+                    logger.info("SHA-256 verification passed")
+                } catch {
+                    self.state = .error("Failed to verify download integrity: \(error.localizedDescription)")
+                    try? FileManager.default.removeItem(at: tempURL)
                     return
                 }
 

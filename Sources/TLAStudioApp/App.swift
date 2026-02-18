@@ -1,5 +1,8 @@
-import SwiftUI
+import os
 import SourceEditor
+import SwiftUI
+
+private let logger = Log.logger(category: "App")
 
 // MARK: - App Entry Point
 
@@ -8,49 +11,6 @@ struct TLAStudioApp: App {
 
     // Register custom document controller before any documents open
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
-    init() {
-        // Setup menu after a brief delay to ensure app is ready
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            Self.setupModelMenu()
-        }
-    }
-
-    static func setupModelMenu() {
-        guard let mainMenu = NSApp.mainMenu else {
-            NSLog("[TLAStudioApp] No main menu yet, retrying...")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                setupModelMenu()
-            }
-            return
-        }
-
-        // Check if already added
-        if mainMenu.item(withTitle: "Model") != nil {
-            return
-        }
-
-        NSLog("[TLAStudioApp] Adding Model menu")
-
-        let modelMenu = NSMenu(title: "Model")
-
-        let runTLCItem = NSMenuItem(title: "Run TLC", action: #selector(AppDelegate.runTLC(_:)), keyEquivalent: "r")
-        runTLCItem.keyEquivalentModifierMask = .command
-        modelMenu.addItem(runTLCItem)
-
-        let stopTLCItem = NSMenuItem(title: "Stop TLC", action: #selector(AppDelegate.stopTLC(_:)), keyEquivalent: ".")
-        stopTLCItem.keyEquivalentModifierMask = .command
-        modelMenu.addItem(stopTLCItem)
-
-        let modelMenuItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
-        modelMenuItem.submenu = modelMenu
-
-        // Insert before Window menu
-        let insertIndex = max(mainMenu.items.count - 2, 0)
-        mainMenu.insertItem(modelMenuItem, at: insertIndex)
-
-        NSLog("[TLAStudioApp] Model menu added at index \(insertIndex)")
-    }
 
     var body: some Scene {
         // Settings window only - documents are managed by NSDocumentController
@@ -73,16 +33,8 @@ struct TLAStudioApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
 
-    override init() {
-        super.init()
-        // Delay menu setup until after app is fully initialized
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.setupModelMenu()
-        }
-    }
-
     func applicationWillFinishLaunching(_ notification: Notification) {
-        NSLog("[AppDelegate] applicationWillFinishLaunching")
+        logger.info("applicationWillFinishLaunching")
         // Ensure app is a regular foreground app that can receive keyboard input
         NSApp.setActivationPolicy(.regular)
 
@@ -91,7 +43,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSLog("[AppDelegate] applicationDidFinishLaunching")
+        logger.info("applicationDidFinishLaunching")
         // Setup custom menus (also try here in case init timing was wrong)
         setupModelMenu()
 
@@ -104,7 +56,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Show welcome screen or create new document if none are open
         DispatchQueue.main.async {
             if NSDocumentController.shared.documents.isEmpty {
-                let showWelcome = UserDefaults.standard.object(forKey: "showWelcomeOnLaunch") as? Bool ?? true
+                let showWelcome = UserDefaults.standard.object(forKey: UserSettings.Keys.showWelcomeOnLaunch) as? Bool ?? true
                 if showWelcome {
                     WelcomeWindowController.shared.show()
                 } else {
@@ -127,7 +79,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyAppearanceSetting() {
-        let appearance = UserDefaults.standard.string(forKey: "settings.editor.appearance") ?? "system"
+        let appearance = UserDefaults.standard.string(forKey: UserSettings.Keys.appearance) ?? "system"
         let nsAppearance: NSAppearance?
 
         switch appearance {
@@ -155,6 +107,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupModelMenu() {
         guard let mainMenu = NSApp.mainMenu else {
+            return
+        }
+
+        // Avoid adding duplicate menu
+        if mainMenu.item(withTitle: "Model") != nil {
             return
         }
 
@@ -240,6 +197,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 await TraceStorageManager.shared.cleanupAllActiveTraces()
                 await TraceStorageManager.shared.cleanupStaleTraces()
 
+                // Final synchronous cleanup - terminateAll now properly kills process trees
+                ProcessRegistry.shared.terminateAll()
+
                 // Now terminate
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
@@ -252,12 +212,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await TraceStorageManager.shared.cleanupStaleTraces()
         }
 
+        // Synchronous process cleanup even when no sessions appear to be running
+        // (catches edge cases where session state is out of sync with actual processes)
+        ProcessRegistry.shared.terminateAll()
+
         return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Final synchronous cleanup - ensure all processes are terminated
+        // Final synchronous cleanup - ensure all processes and their children are terminated
         // This catches any processes that might have been missed by async cleanup
+        // The terminateAll() method now properly kills process trees with SIGKILL fallback
         ProcessRegistry.shared.terminateAll()
     }
 }

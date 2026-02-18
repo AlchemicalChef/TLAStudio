@@ -58,15 +58,15 @@ struct GeneralSettingsView: View {
 
     // MARK: - Document Handling Settings
 
-    @AppStorage("autosaveEnabled") private var autosaveEnabled = true
-    @AppStorage("autosaveInterval") private var autosaveInterval = 30
-    @AppStorage("reopenLastDocument") private var reopenLastDocument = true
-    @AppStorage("defaultTextEncoding") private var defaultTextEncoding = TextEncoding.utf8.rawValue
+    @AppStorage(UserSettings.Keys.autosaveEnabled) private var autosaveEnabled = true
+    @AppStorage(UserSettings.Keys.autosaveInterval) private var autosaveInterval = 30
+    @AppStorage(UserSettings.Keys.reopenLastDocument) private var reopenLastDocument = true
+    @AppStorage(UserSettings.Keys.defaultEncoding) private var defaultTextEncoding = TextEncoding.utf8.rawValue
 
     // MARK: - Application Settings
 
-    @AppStorage("checkForUpdates") private var checkForUpdates = true
-    @AppStorage("showWelcomeOnLaunch") private var showWelcomeOnLaunch = true
+    @AppStorage(UserSettings.Keys.checkForUpdates) private var checkForUpdates = true
+    @AppStorage(UserSettings.Keys.showWelcomeOnLaunch) private var showWelcomeOnLaunch = true
 
     // MARK: - Alert State
 

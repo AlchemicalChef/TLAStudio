@@ -6,6 +6,9 @@
 // maintains an index for fast lookups.
 
 import Foundation
+import os
+
+private let logger = Log.logger(category: "ProofCache")
 
 // MARK: - CacheEntry
 
@@ -421,7 +424,7 @@ public actor ProofCache {
             try await writeEntry(entry)
         } catch {
             // Log error but don't throw - caching failures shouldn't break the app
-            print("ProofCache: Failed to cache result for \(fingerprint): \(error)")
+            logger.error("Failed to cache result for \(fingerprint): \(error)")
         }
     }
 
@@ -554,7 +557,7 @@ public actor ProofCache {
                 await validateIndex()
             } catch {
                 // Index is corrupted, rebuild it
-                print("ProofCache: Rebuilding corrupted index: \(error)")
+                logger.warning("Rebuilding corrupted index: \(error)")
                 await rebuildIndex()
             }
         } else {
@@ -656,7 +659,7 @@ public actor ProofCache {
             let data = try encoder.encode(index)
             try data.write(to: indexURL, options: .atomic)
         } catch {
-            print("ProofCache: Failed to save index: \(error)")
+            logger.error("Failed to save index: \(error)")
         }
     }
 
@@ -730,7 +733,7 @@ public actor ProofCache {
                     )
                 } catch {
                     // Skip corrupted files
-                    print("ProofCache: Skipping corrupted cache file: \(entryFile.path)")
+                    logger.warning("Skipping corrupted cache file: \(entryFile.path)")
                 }
             }
         }

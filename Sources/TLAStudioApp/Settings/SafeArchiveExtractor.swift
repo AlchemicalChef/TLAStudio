@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-private let logger = Logger(subsystem: "com.tlastudio", category: "SafeArchiveExtractor")
+private let logger = Log.logger(category: "SafeArchiveExtractor")
 
 // MARK: - Safe Archive Extractor
 
@@ -40,6 +40,9 @@ enum SafeArchiveExtractor {
     // MARK: - Public API
 
     /// Safely extracts a tar archive to a target directory.
+    ///
+    /// Eliminates TOCTOU race by extracting to a temporary staging directory first,
+    /// validating all contents there, then moving atomically to the target.
     /// - Parameters:
     ///   - archiveURL: URL to the archive file (.tar, .tar.gz, .tgz)
     ///   - targetDirectory: Directory to extract into
@@ -50,14 +53,33 @@ enum SafeArchiveExtractor {
         to targetDirectory: URL,
         stripComponents: Int = 0
     ) throws {
-        // Step 1: List archive contents and validate paths
-        let paths = try listArchiveContents(archiveURL)
-        try validatePaths(paths)
-
-        logger.info("Validated \(paths.count) paths in archive")
-
-        // Step 2: Create target directory if needed
         let fileManager = FileManager.default
+
+        // Step 1: Create a secure staging directory for extraction
+        let stagingDir = fileManager.temporaryDirectory
+            .appendingPathComponent("SafeArchiveExtractor-\(UUID().uuidString)")
+        do {
+            try fileManager.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        } catch {
+            throw Error.targetDirectoryCreationFailed(error)
+        }
+
+        // Ensure staging directory is cleaned up on all exit paths
+        defer {
+            try? fileManager.removeItem(at: stagingDir)
+        }
+
+        // Step 2: Extract to staging directory
+        try performExtraction(from: archiveURL, to: stagingDir, stripComponents: stripComponents)
+
+        // Step 3: Validate extracted contents in staging directory
+        // Now there is no TOCTOU window — we validate the actual extracted files
+        try validateNoEscapingSymlinks(in: stagingDir)
+        try validateExtractedPaths(in: stagingDir)
+
+        logger.info("Validated extracted contents in staging directory")
+
+        // Step 4: Create target directory if needed
         if !fileManager.fileExists(atPath: targetDirectory.path) {
             do {
                 try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
@@ -66,11 +88,17 @@ enum SafeArchiveExtractor {
             }
         }
 
-        // Step 3: Extract with safe options
-        try performExtraction(from: archiveURL, to: targetDirectory, stripComponents: stripComponents)
-
-        // Step 4: Post-extraction validation - check for symlinks that escape target
-        try validateNoEscapingSymlinks(in: targetDirectory)
+        // Step 5: Move validated contents from staging to target
+        let contents = try fileManager.contentsOfDirectory(at: stagingDir,
+                                                            includingPropertiesForKeys: nil)
+        for item in contents {
+            let destination = targetDirectory.appendingPathComponent(item.lastPathComponent)
+            // Remove existing item at destination if present
+            if fileManager.fileExists(atPath: destination.path) {
+                try fileManager.removeItem(at: destination)
+            }
+            try fileManager.moveItem(at: item, to: destination)
+        }
 
         logger.info("Successfully extracted archive to \(targetDirectory.path)")
     }
@@ -179,10 +207,44 @@ enum SafeArchiveExtractor {
         }
     }
 
+    /// Validates extracted file paths don't contain traversal components.
+    /// This runs on the actual extracted files in the staging directory.
+    private static func validateExtractedPaths(in directory: URL) throws {
+        let fileManager = FileManager.default
+        guard let resolvedDirCStr = realpath(directory.path, nil) else {
+            throw Error.pathTraversalDetected("Cannot resolve staging directory: \(directory.path)")
+        }
+        let resolvedDirPath = String(cString: resolvedDirCStr)
+        free(resolvedDirCStr)
+
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else { return }
+
+        for case let fileURL as URL in enumerator {
+            // Resolve the actual path and verify it's within the staging directory
+            let resolvedPath = fileURL.resolvingSymlinksInPath().path
+            if !resolvedPath.hasPrefix(resolvedDirPath + "/") &&
+               resolvedPath != resolvedDirPath {
+                throw Error.pathTraversalDetected(fileURL.path)
+            }
+        }
+    }
+
     /// Validates that no symlinks in the extracted content point outside the target.
+    /// Uses realpath() for canonical path resolution to prevent TOCTOU and path traversal via `..`.
     private static func validateNoEscapingSymlinks(in directory: URL) throws {
         let fileManager = FileManager.default
-        let targetPath = directory.path
+
+        // Canonicalize the target directory itself using realpath()
+        guard let resolvedTargetCStr = realpath(directory.path, nil) else {
+            // If target directory can't be resolved, it's unsafe to proceed
+            throw Error.symlinkEscapeDetected("Cannot resolve target directory: \(directory.path)")
+        }
+        let resolvedTargetPath = String(cString: resolvedTargetCStr)
+        free(resolvedTargetCStr)
 
         guard let enumerator = fileManager.enumerator(
             at: directory,
@@ -196,24 +258,13 @@ enum SafeArchiveExtractor {
             do {
                 let resourceValues = try fileURL.resourceValues(forKeys: [.isSymbolicLinkKey])
                 if resourceValues.isSymbolicLink == true {
-                    // Resolve the symlink destination
-                    let destination = try fileManager.destinationOfSymbolicLink(atPath: fileURL.path)
+                    // Use resolvingSymlinksInPath which calls realpath() for canonical resolution.
+                    // This properly handles ".." components and nested symlinks.
+                    let resolvedDestination = fileURL.resolvingSymlinksInPath().path
 
-                    // Compute absolute path of destination
-                    let absoluteDestination: String
-                    if destination.hasPrefix("/") {
-                        absoluteDestination = destination
-                    } else {
-                        // Relative symlink - resolve from symlink's parent directory
-                        let parentDir = fileURL.deletingLastPathComponent().path
-                        absoluteDestination = (parentDir as NSString).appendingPathComponent(destination)
-                    }
-
-                    // Normalize the path
-                    let normalizedDestination = (absoluteDestination as NSString).standardizingPath
-
-                    // Check if destination is within target directory
-                    if !normalizedDestination.hasPrefix(targetPath) {
+                    // Check if resolved destination is within the resolved target directory
+                    if !resolvedDestination.hasPrefix(resolvedTargetPath + "/") &&
+                       resolvedDestination != resolvedTargetPath {
                         throw Error.symlinkEscapeDetected(fileURL.path)
                     }
                 }

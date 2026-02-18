@@ -1,4 +1,7 @@
 import Foundation
+import os
+
+private let logger = Log.logger(category: "TLAPMParser")
 
 // MARK: - TLAPM Output Parser
 
@@ -18,12 +21,13 @@ import Foundation
 /// @!!duration:0.234
 /// @!!END
 /// ```
+/// @unchecked Sendable: thread safety ensured by NSLock
 final class TLAPMOutputParser: @unchecked Sendable {
 
     // MARK: - State
 
     private let lock = NSLock()
-    private var buffer = Data()
+    private var lineBuffer = LineBuffer(maxBufferSize: 5 * 1024 * 1024, compactionThreshold: 32 * 1024)
     private var currentBlock: [String: String] = [:]
     private var isInBlock = false
     private var obligations: [ParsedObligation] = []
@@ -79,15 +83,10 @@ final class TLAPMOutputParser: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        buffer.append(data)
-
+        let lines = lineBuffer.append(data)
         var latestProgress: ProofCheckProgress?
 
-        // Process complete lines
-        while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-            let lineData = buffer[..<newlineIndex]
-            buffer = Data(buffer[buffer.index(after: newlineIndex)...])
-
+        for lineData in lines {
             guard let line = String(data: lineData, encoding: .utf8)?
                 .trimmingCharacters(in: .carriageReturns) else {
                 continue
@@ -138,7 +137,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        buffer = Data()
+        lineBuffer.reset()
         currentBlock = [:]
         isInBlock = false
         obligations = []
@@ -168,7 +167,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
                 isInBlock = false
                 let result = processBlock()
                 if result != nil {
-                    NSLog("[PARSER] Block processed, obligations: %d", obligations.count)
+                    logger.debug("Block processed, obligations: \(self.obligations.count)")
                 }
                 return result
             }
@@ -219,7 +218,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
             return nil
         }
 
-        print("[PARSER] Found OBLIGATION \(id) in non-toolbox format")
+        logger.debug("Found OBLIGATION \(id) in non-toolbox format")
 
         // Parse location if present: @from line:col:line:col@
         var location: ProofSourceLocation? = nil
@@ -253,7 +252,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
             backend = parseProverBackend(proverName)
         }
 
-        print("[PARSER] Obligation \(id): status=\(status), backend=\(backend?.displayName ?? "none")")
+        logger.debug("Obligation \(id): status=\(String(describing: status)), backend=\(backend?.displayName ?? "none")")
 
         // Update or add obligation
         let existingIndex = obligations.firstIndex(where: { $0.id == id })
@@ -329,16 +328,14 @@ final class TLAPMOutputParser: @unchecked Sendable {
     }
 
     private func processObligationBlock() -> ProofCheckProgress? {
-        NSLog("[PARSER] processObligationBlock: currentBlock = %@", currentBlock.description)
+        logger.debug("processObligationBlock: currentBlock = \(self.currentBlock.description)")
         guard let idString = currentBlock["id"],
               let id = Int(idString) else {
-            NSLog("[PARSER] processObligationBlock: No id found in block")
+            logger.debug("processObligationBlock: No id found in block")
             return nil
         }
 
-        NSLog("[PARSER] processObligationBlock: id=%d, loc='%@'", id, currentBlock["loc"] ?? "nil")
         let location = parseLocation(currentBlock["loc"])
-        NSLog("[PARSER] processObligationBlock: parsed location = %@", location.map { "line \($0.startLine)" } ?? "nil")
         let status = parseObligationStatus(currentBlock["status"])
         let backend = parseProverBackend(currentBlock["prover"])
         let duration = currentBlock["duration"].flatMap { Double($0) }

@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-private let logger = Logger(subsystem: "com.tlastudio", category: "TLAPM")
+private let logger = Log.logger(category: "TLAPM")
 
 // MARK: - TLAPM Process Manager
 
@@ -19,98 +19,21 @@ actor TLAPMProcessManager {
     private var activeProcesses: [UUID: Process] = [:]
     private var parsers: [UUID: TLAPMOutputParser] = [:]
     private var progressTasks: [UUID: Task<Void, Never>] = [:]
-    private var streamStates: [UUID: ProofStreamState] = [:]
-    // Note: Stream finish tracking is handled by ProofStreamState.isFinished
-    // No actor-level finishedStreams set needed (was causing memory leak)
+    private var streamStates: [UUID: StreamState<ProofCheckProgress>] = [:]
+
 
     // MARK: - Binary Discovery
 
     /// Path to TLAPM binary
     private var tlapmPath: URL? {
-        print("[TLAPM] Searching for tlapm binary...")
-        print("[TLAPM] Bundle.main.resourcePath: \(Bundle.main.resourcePath ?? "nil")")
-        print("[TLAPM] Bundle.module.resourcePath: \(Bundle.module.resourcePath ?? "nil")")
-
-        // Check SPM resource bundle with subdirectory (swift build)
-        if let bundled = Bundle.module.url(forResource: "tlapm", withExtension: nil, subdirectory: "bin") {
-            print("[TLAPM] Found in Bundle.module/bin: \(bundled.path)")
-            logger.debug("Found TLAPM in Bundle.module/bin: \(bundled.path)")
-            return bundled
-        }
-
-        // Check SPM resource bundle at root
-        if let bundled = Bundle.module.url(forResource: "tlapm", withExtension: nil) {
-            logger.debug("Found TLAPM in Bundle.module: \(bundled.path)")
-            return bundled
-        }
-
-        // Check main bundle with subdirectory (Xcode builds)
-        if let bundled = Bundle.main.url(forResource: "tlapm", withExtension: nil, subdirectory: "bin") {
-            logger.debug("Found TLAPM in Bundle.main/bin: \(bundled.path)")
-            return bundled
-        }
-
-        // Check main bundle at root
-        if let bundled = Bundle.main.url(forResource: "tlapm", withExtension: nil) {
-            logger.debug("Found TLAPM in Bundle.main: \(bundled.path)")
-            return bundled
-        }
-
-        // Check app bundle Resources directly
-        if let bundlePath = Bundle.main.resourcePath {
-            print("[TLAPM] Checking Bundle.main.resourcePath: \(bundlePath)")
-            logger.debug("Checking Bundle.main.resourcePath: \(bundlePath)")
-
-            // Check Resources/bin/tlapm (dune install location)
-            let binPath = URL(fileURLWithPath: bundlePath).appendingPathComponent("bin/tlapm")
-            let binExists = FileManager.default.fileExists(atPath: binPath.path)
-            print("[TLAPM] Checking \(binPath.path): \(binExists ? "EXISTS" : "NOT FOUND")")
-            if binExists {
-                print("[TLAPM] SUCCESS: Found TLAPM at: \(binPath.path)")
-                logger.debug("Found TLAPM at: \(binPath.path)")
-                return binPath
-            }
-            // Check Resources/tlapm
-            let tlapmPath = URL(fileURLWithPath: bundlePath).appendingPathComponent("tlapm")
-            let tlapmExists = FileManager.default.fileExists(atPath: tlapmPath.path)
-            print("[TLAPM] Checking \(tlapmPath.path): \(tlapmExists ? "EXISTS" : "NOT FOUND")")
-            if tlapmExists {
-                print("[TLAPM] SUCCESS: Found TLAPM at: \(tlapmPath.path)")
-                logger.debug("Found TLAPM at: \(tlapmPath.path)")
-                return tlapmPath
-            }
-        }
-
-        // Check Bundle.module.resourcePath directly
-        if let modulePath = Bundle.module.resourcePath {
-            logger.debug("Checking Bundle.module.resourcePath: \(modulePath)")
-
-            let binPath = URL(fileURLWithPath: modulePath).appendingPathComponent("bin/tlapm")
-            if FileManager.default.fileExists(atPath: binPath.path) {
-                logger.debug("Found TLAPM at: \(binPath.path)")
-                return binPath
-            }
-        }
-
-        // Check common installation paths
-        let commonPaths = [
-            "/usr/local/bin/tlapm",
-            "/opt/homebrew/bin/tlapm",
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".tla/tlapm").path
-        ]
-
-        for path in commonPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                logger.debug("Found TLAPM at system path: \(path)")
-                return URL(fileURLWithPath: path)
-            }
-        }
-
-        logger.error("TLAPM binary not found in any location")
-        logger.error("Bundle.main.resourcePath: \(Bundle.main.resourcePath ?? "nil")")
-        logger.error("Bundle.module.resourcePath: \(Bundle.module.resourcePath ?? "nil")")
-        return nil
+        BinaryDiscovery.find(
+            named: "tlapm",
+            options: .init(
+                bundleSubdirectories: ["bin"],
+                systemPaths: ["/usr/local/bin", "/opt/homebrew/bin"],
+                homeRelativePaths: [".tla"]
+            )
+        )
     }
 
     /// Check if TLAPM is available
@@ -171,36 +94,14 @@ actor TLAPMProcessManager {
     }
 
     private func findProverBinary(named name: String) -> URL? {
-        // Check bundle resources
-        if let bundlePath = Bundle.main.resourcePath {
-            let proverPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("Provers")
-                .appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: proverPath.path) {
-                return proverPath
-            }
-        }
-
-        // Check SPM resource bundle
-        if let bundled = Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "Provers") {
-            return bundled
-        }
-
-        // Check common paths
-        let commonPaths = [
-            "/usr/local/bin/\(name)",
-            "/opt/homebrew/bin/\(name)",
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".tla/provers/\(name)").path
-        ]
-
-        for path in commonPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                return URL(fileURLWithPath: path)
-            }
-        }
-
-        return nil
+        BinaryDiscovery.find(
+            named: name,
+            options: .init(
+                bundleSubdirectories: ["Provers"],
+                systemPaths: ["/usr/local/bin", "/opt/homebrew/bin"],
+                homeRelativePaths: [".tla/provers"]
+            )
+        )
     }
 
     /// Get available provers
@@ -236,19 +137,15 @@ actor TLAPMProcessManager {
     ) async throws -> ProofCheckResult {
 
         guard let tlapmPath = tlapmPath else {
-            print("[TLAPM] ERROR: TLAPM binary not found!")
             logger.error("TLAPM binary not found")
             throw TLAPMError.tlapmNotFound
         }
 
-        print("[TLAPM] Using TLAPM at: \(tlapmPath.path)")
-        print("[TLAPM] Spec URL: \(specURL.path)")
         logger.info("Using TLAPM at: \(tlapmPath.path)")
+        logger.info("Spec URL: \(specURL.path)")
         if let stdlib = stdlibPath {
-            print("[TLAPM] Using stdlib at: \(stdlib.path)")
             logger.info("Using stdlib at: \(stdlib.path)")
         } else {
-            print("[TLAPM] WARNING: TLAPS stdlib not found")
             logger.warning("TLAPS stdlib not found")
         }
 
@@ -260,7 +157,6 @@ actor TLAPMProcessManager {
 
         // Build arguments
         let arguments = buildArguments(for: options, specPath: specURL.path)
-        print("[TLAPM] Arguments: \(arguments.joined(separator: " "))")
         logger.info("TLAPM arguments: \(arguments.joined(separator: " "))")
 
         // Create and configure process
@@ -269,49 +165,8 @@ actor TLAPMProcessManager {
         process.arguments = arguments
         process.currentDirectoryURL = specURL.deletingLastPathComponent()
 
-        // Set up environment with prover paths
-        var environment = ProcessInfo.processInfo.environment
-        if proverPaths.isEmpty {
-            discoverProvers()
-        }
-        for (prover, path) in proverPaths {
-            let envVar = "\(prover.rawValue.uppercased())_PATH"
-            environment[envVar] = path.deletingLastPathComponent().path
-        }
-
-        // Add backend prover paths to PATH for TLAPM discovery
-        var pathComponents: [String] = []
-
-        // Add lib/tlapm/backends/bin (where dune-site TLAPM expects provers)
-        if let bundlePath = Bundle.main.resourcePath {
-            let backendsPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("lib/tlapm/backends/bin").path
-            if FileManager.default.fileExists(atPath: backendsPath) {
-                pathComponents.append(backendsPath)
-            }
-
-            // Also add Provers directory
-            let proversPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("Provers").path
-            if FileManager.default.fileExists(atPath: proversPath) {
-                pathComponents.append(proversPath)
-            }
-
-            // Add bin directory (for translate tool)
-            let binPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("bin").path
-            if FileManager.default.fileExists(atPath: binPath) {
-                pathComponents.append(binPath)
-            }
-        }
-
-        // Prepend our paths to existing PATH
-        if !pathComponents.isEmpty {
-            let existingPath = environment["PATH"] ?? "/usr/bin:/bin"
-            pathComponents.append(existingPath)
-            environment["PATH"] = pathComponents.joined(separator: ":")
-        }
-
+        // Set up minimal environment with prover paths
+        let environment = buildTLAPMEnvironment()
         logger.debug("TLAPM environment PATH: \(environment["PATH"] ?? "nil")")
         process.environment = environment
 
@@ -340,7 +195,7 @@ actor TLAPMProcessManager {
         let startTime = Date()
 
         // Create thread-safe stream state to prevent race conditions
-        let streamState = ProofStreamState()
+        let streamState = StreamState<ProofCheckProgress>(throttle: .none)
 
         // Store state immediately (before AsyncStream to avoid race)
         streamStates[sessionId] = streamState
@@ -364,7 +219,6 @@ actor TLAPMProcessManager {
                 // Log raw output to OutputManager
                 if let str = String(data: data, encoding: .utf8) {
                     for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                        print("[TLAPM OUTPUT] \(line)")
                         DispatchQueue.main.async {
                             OutputManager.shared.logTLAPM(line)
                         }
@@ -372,7 +226,6 @@ actor TLAPMProcessManager {
                 }
 
                 if let update = parser.parse(data) {
-                    print("[TLAPM PARSED] Obligations: \(update.obligations.count), proved: \(update.provedCount), failed: \(update.failedCount)")
                     state.yield(update)
                 }
             }
@@ -415,7 +268,6 @@ actor TLAPMProcessManager {
         } catch {
             activeProcesses.removeValue(forKey: sessionId)
             parsers.removeValue(forKey: sessionId)
-            // ProofStreamState.finish() handles marking stream as finished
             streamStates.removeValue(forKey: sessionId)?.finish()
             throw TLAPMError.failedToStart(error)
         }
@@ -447,14 +299,43 @@ actor TLAPMProcessManager {
             }
         }
 
-        // Clean up handles first to ensure all data is flushed
+        // Drain any remaining buffered data before clearing handlers.
+        // readabilityHandler may not fire for data already in the pipe buffer
+        // after process exit, so we must read it synchronously.
+        let lastStdout = stdoutHandle.availableData
+        if !lastStdout.isEmpty {
+            if let str = String(data: lastStdout, encoding: .utf8) {
+                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
+                    DispatchQueue.main.async {
+                        OutputManager.shared.logTLAPM(line)
+                    }
+                }
+            }
+            if let update = parser.parse(lastStdout) {
+                streamState.yield(update)
+            }
+        }
+        let lastStderr = stderrHandle.availableData
+        if !lastStderr.isEmpty {
+            if let str = String(data: lastStderr, encoding: .utf8) {
+                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
+                    DispatchQueue.main.async {
+                        OutputManager.shared.logTLAPM(line, isError: false)
+                    }
+                }
+            }
+            if let update = parser.parse(lastStderr) {
+                streamState.yield(update)
+            }
+        }
+
+        // Now safe to clear handlers and close
         stdoutHandle.readabilityHandler = nil
         stderrHandle.readabilityHandler = nil
         try? stdoutHandle.close()
         try? stderrHandle.close()
 
-        // Mark stream as finished to prevent any pending yields, then finish
-        // ProofStreamState.finish() handles marking stream as finished internally
+        // Mark stream as finished and clean up
         streamStates.removeValue(forKey: sessionId)?.finish()
 
         // Cancel progress task
@@ -502,15 +383,13 @@ actor TLAPMProcessManager {
         sessionId: UUID = UUID()
     ) async throws -> ProofObligation {
 
-        NSLog("[TLAPM] checkSingleStep: ENTERED - line=%d, column=%d, sessionId=%@", line, column, sessionId.uuidString)
+        logger.info("checkSingleStep: line=\(line), column=\(column), sessionId=\(sessionId.uuidString)")
 
         guard let tlapmPath = tlapmPath else {
-            NSLog("[TLAPM] checkSingleStep: ERROR - TLAPM binary not found")
             logger.error("TLAPM binary not found for single step check")
             throw TLAPMError.tlapmNotFound
         }
 
-        NSLog("[TLAPM] checkSingleStep: Found TLAPM at %@", tlapmPath.path)
         logger.info("Checking single step at line \(line), column \(column)")
 
         // Create parser
@@ -561,34 +440,8 @@ actor TLAPMProcessManager {
         process.arguments = arguments
         process.currentDirectoryURL = specURL.deletingLastPathComponent()
 
-        // Set up environment with prover paths
-        var environment = ProcessInfo.processInfo.environment
-
-        // Add backend prover paths to PATH
-        var pathComponents: [String] = []
-        if let bundlePath = Bundle.main.resourcePath {
-            let backendsPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("lib/tlapm/backends/bin").path
-            if FileManager.default.fileExists(atPath: backendsPath) {
-                pathComponents.append(backendsPath)
-            }
-            let proversPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("Provers").path
-            if FileManager.default.fileExists(atPath: proversPath) {
-                pathComponents.append(proversPath)
-            }
-            let binPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("bin").path
-            if FileManager.default.fileExists(atPath: binPath) {
-                pathComponents.append(binPath)
-            }
-        }
-        if !pathComponents.isEmpty {
-            let existingPath = environment["PATH"] ?? "/usr/bin:/bin"
-            pathComponents.append(existingPath)
-            environment["PATH"] = pathComponents.joined(separator: ":")
-        }
-        process.environment = environment
+        // Set up minimal environment with prover paths
+        process.environment = buildTLAPMEnvironment()
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -641,7 +494,6 @@ actor TLAPMProcessManager {
         do {
             try process.run()
             ProcessRegistry.shared.register(process, for: sessionId)
-            NSLog("[TLAPM] checkSingleStep: Process started with PID %d", process.processIdentifier)
             logger.info("checkSingleStep: Process started with PID \(process.processIdentifier)")
         } catch {
             stdoutHandle.readabilityHandler = nil
@@ -652,16 +504,23 @@ actor TLAPMProcessManager {
         }
 
         // Wait for process to complete using async termination handler
-        NSLog("[TLAPM] checkSingleStep: Waiting for process to complete...")
         let exitStatus = await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
             process.terminationHandler = { terminatedProcess in
-                NSLog("[TLAPM] checkSingleStep: terminationHandler called, status=%d", terminatedProcess.terminationStatus)
                 continuation.resume(returning: terminatedProcess.terminationStatus)
             }
         }
 
-        NSLog("[TLAPM] checkSingleStep: Process exited with status %d", exitStatus)
         logger.info("checkSingleStep: Process exited with status \(exitStatus)")
+
+        // Drain any remaining buffered pipe data before clearing handlers
+        let lastStdout = stdoutHandle.availableData
+        if !lastStdout.isEmpty {
+            outputAccumulator.appendStdout(lastStdout)
+        }
+        let lastStderr = stderrHandle.availableData
+        if !lastStderr.isEmpty {
+            outputAccumulator.appendStderr(lastStderr)
+        }
 
         // Clean up handlers
         stdoutHandle.readabilityHandler = nil
@@ -724,7 +583,6 @@ actor TLAPMProcessManager {
         progressTasks.removeValue(forKey: sessionId)?.cancel()
 
         // Mark stream as finished and clean up
-        // ProofStreamState.finish() handles marking stream as finished internally
         streamStates.removeValue(forKey: sessionId)?.finish()
 
         // Terminate the process using the registry (synchronous)
@@ -742,7 +600,6 @@ actor TLAPMProcessManager {
         progressTasks.removeAll()
 
         // Finish all streams
-        // ProofStreamState.finish() handles marking stream as finished internally
         for (_, state) in streamStates {
             state.finish()
         }
@@ -764,6 +621,50 @@ actor TLAPMProcessManager {
     /// Get the number of active sessions
     var activeSessionCount: Int {
         activeProcesses.count
+    }
+
+    // MARK: - Environment Building
+
+    /// Build a minimal environment with prover paths prepended to PATH.
+    /// Used by both `startProofCheck` and `checkSingleStep`.
+    private func buildTLAPMEnvironment() -> [String: String] {
+        var environment = ProcessEnvironment.minimal()
+
+        // Add discovered prover env vars
+        if proverPaths.isEmpty {
+            discoverProvers()
+        }
+        for (prover, path) in proverPaths {
+            let envVar = "\(prover.rawValue.uppercased())_PATH"
+            environment[envVar] = path.deletingLastPathComponent().path
+        }
+
+        // Add backend prover paths to PATH for TLAPM discovery
+        var pathComponents: [String] = []
+        if let bundlePath = Bundle.main.resourcePath {
+            let backendsPath = URL(fileURLWithPath: bundlePath)
+                .appendingPathComponent("lib/tlapm/backends/bin").path
+            if FileManager.default.fileExists(atPath: backendsPath) {
+                pathComponents.append(backendsPath)
+            }
+            let proversPath = URL(fileURLWithPath: bundlePath)
+                .appendingPathComponent("Provers").path
+            if FileManager.default.fileExists(atPath: proversPath) {
+                pathComponents.append(proversPath)
+            }
+            let binPath = URL(fileURLWithPath: bundlePath)
+                .appendingPathComponent("bin").path
+            if FileManager.default.fileExists(atPath: binPath) {
+                pathComponents.append(binPath)
+            }
+        }
+        if !pathComponents.isEmpty {
+            let existingPath = environment["PATH"] ?? "/usr/bin:/bin"
+            pathComponents.append(existingPath)
+            environment["PATH"] = pathComponents.joined(separator: ":")
+        }
+
+        return environment
     }
 
     // MARK: - Argument Building
@@ -832,6 +733,7 @@ actor TLAPMProcessManager {
 /// Thread-safe accumulator for process output data.
 /// Used to collect stdout/stderr while process runs to prevent pipe deadlock.
 /// Limits buffer size to prevent unbounded memory growth.
+/// @unchecked Sendable: thread safety ensured by NSLock
 private final class OutputAccumulator: @unchecked Sendable {
     private let lock = NSLock()
     private var _stdout = Data()
@@ -880,62 +782,6 @@ private final class OutputAccumulator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _stderr
-    }
-}
-
-// MARK: - Proof Stream State
-
-/// Thread-safe wrapper for AsyncStream continuation to prevent race conditions.
-/// Guards against yielding after the stream has been finished.
-private final class ProofStreamState: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _continuation: AsyncStream<ProofCheckProgress>.Continuation?
-    private var _isFinished = false
-
-    var continuation: AsyncStream<ProofCheckProgress>.Continuation? {
-        lock.lock()
-        defer { lock.unlock() }
-        return _continuation
-    }
-
-    var isFinished: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _isFinished
-    }
-
-    func setContinuation(_ continuation: AsyncStream<ProofCheckProgress>.Continuation) {
-        lock.lock()
-        defer { lock.unlock() }
-        _continuation = continuation
-    }
-
-    func yield(_ value: ProofCheckProgress) {
-        // Extract continuation under lock, yield outside to prevent deadlock
-        let continuation: AsyncStream<ProofCheckProgress>.Continuation? = {
-            lock.lock()
-            defer { lock.unlock() }
-            guard !_isFinished, let c = _continuation else { return nil }
-            return c
-        }()
-
-        continuation?.yield(value)
-    }
-
-    func finish() {
-        // Extract state under lock, then call continuation methods outside lock
-        // to prevent deadlock (continuation methods may synchronize with consumers)
-        let continuation: AsyncStream<ProofCheckProgress>.Continuation? = {
-            lock.lock()
-            defer { lock.unlock() }
-            guard !_isFinished else { return nil }
-            _isFinished = true
-            let c = _continuation
-            _continuation = nil
-            return c
-        }()
-
-        continuation?.finish()
     }
 }
 

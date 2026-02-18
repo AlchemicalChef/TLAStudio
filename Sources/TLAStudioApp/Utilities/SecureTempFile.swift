@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-private let logger = Logger(subsystem: "com.tlastudio", category: "SecureTempFile")
+private let logger = Log.logger(category: "SecureTempFile")
 
 // MARK: - Secure Temp File
 
