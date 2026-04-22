@@ -31,6 +31,7 @@ final class UserSettings: ObservableObject {
         static let reopenLastDocument = "settings.general.reopenLastDocument"
         static let checkForUpdates = "settings.general.checkForUpdates"
         static let showWelcomeOnLaunch = "settings.general.showWelcomeOnLaunch"
+        static let moduleLibraryFolders = "settings.general.moduleLibraryFolders"
 
         // Editor
         static let fontName = "settings.editor.fontName"
@@ -52,10 +53,37 @@ final class UserSettings: ObservableObject {
         static let z3Path = "settings.prover.z3Path"
         static let zenonPath = "settings.prover.zenonPath"
         static let isabellePath = "settings.prover.isabellePath"
+        static let cvc5Path = "settings.prover.cvc5Path"
+        static let spassPath = "settings.prover.spassPath"
         static let defaultProverBackend = "settings.prover.defaultProverBackend"
         static let defaultProverTimeout = "settings.prover.defaultProverTimeout"
         static let tlcWorkers = "settings.prover.tlcWorkers"
+        static let tlcCheckpointEnabled = "settings.prover.tlcCheckpointEnabled"
         static let tlcCheckpointInterval = "settings.prover.tlcCheckpointInterval"
+    }
+
+    /// Legacy keys that older builds used. Migrated once on first launch of this build and then removed.
+    /// Never read these directly; all reads go through the canonical `Keys` via `@AppStorage`.
+    private enum LegacyKeys {
+        static let cvc5Path = "prover.cvc5.path"
+        static let spassPath = "prover.spass.path"
+        static let tlcCheckpointEnabled = "prover.tlc.checkpointEnabled"
+        static let migrationMarker = "settings.internal.migrated.v1"
+
+        static let prover: [(String, String)] = [
+            ("prover.tlc.path", Keys.tlcPath),
+            ("prover.tlapm.path", Keys.tlapmPath),
+            ("prover.z3.path", Keys.z3Path),
+            ("prover.zenon.path", Keys.zenonPath),
+            ("prover.isabelle.path", Keys.isabellePath),
+            (cvc5Path, Keys.cvc5Path),
+            (spassPath, Keys.spassPath),
+            ("prover.tlc.workerThreads", Keys.tlcWorkers),
+            (tlcCheckpointEnabled, Keys.tlcCheckpointEnabled),
+            ("prover.tlc.checkpointInterval", Keys.tlcCheckpointInterval),
+            ("prover.defaultBackend", Keys.defaultProverBackend),
+            ("prover.defaultTimeout", Keys.defaultProverTimeout)
+        ]
     }
 
     // MARK: - General Settings
@@ -83,6 +111,29 @@ final class UserSettings: ObservableObject {
     /// Whether to show the welcome screen when launching the application.
     @AppStorage(Keys.showWelcomeOnLaunch)
     var showWelcomeOnLaunch: Bool = true
+
+    /// User-configured library folders searched for EXTENDS'd modules.
+    var moduleLibraryFolders: [String] {
+        get {
+            Self.normalizedModuleLibraryFolders(
+                UserDefaults.standard.stringArray(forKey: Keys.moduleLibraryFolders) ?? []
+            )
+        }
+        set {
+            let normalized = Self.normalizedModuleLibraryFolders(newValue)
+            objectWillChange.send()
+            if normalized.isEmpty {
+                UserDefaults.standard.removeObject(forKey: Keys.moduleLibraryFolders)
+            } else {
+                UserDefaults.standard.set(normalized, forKey: Keys.moduleLibraryFolders)
+            }
+        }
+    }
+
+    /// Existing library folders that should be passed to TLC/TLAPM and module lookup.
+    var resolvedModuleLibraryFolders: [String] {
+        Self.existingModuleLibraryFolders(from: moduleLibraryFolders)
+    }
 
     // MARK: - Editor Settings
 
@@ -156,6 +207,14 @@ final class UserSettings: ObservableObject {
     @AppStorage(Keys.isabellePath)
     var isabellePath: String = ""
 
+    /// Custom path to the CVC5 SMT solver. Empty string uses the bundled version.
+    @AppStorage(Keys.cvc5Path)
+    var cvc5Path: String = ""
+
+    /// Custom path to the SPASS automated theorem prover. Empty string uses the bundled version.
+    @AppStorage(Keys.spassPath)
+    var spassPath: String = ""
+
     /// The default backend to use for proof obligations ("auto", "zenon", "z3", "isabelle", "smt").
     @AppStorage(Keys.defaultProverBackend)
     var defaultProverBackend: String = "auto"
@@ -169,6 +228,10 @@ final class UserSettings: ObservableObject {
     @AppStorage(Keys.tlcWorkers)
     var tlcWorkers: Int = ProcessInfo.processInfo.activeProcessorCount
 
+    /// Whether TLC checkpointing is enabled by default for new models.
+    @AppStorage(Keys.tlcCheckpointEnabled)
+    var tlcCheckpointEnabled: Bool = true
+
     /// The interval in minutes between TLC checkpoint saves during model checking.
     @AppStorage(Keys.tlcCheckpointInterval)
     var tlcCheckpointInterval: Int = 30
@@ -178,7 +241,7 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the TLC executable, using the bundled version if no custom path is set.
     var resolvedTLCPath: String {
         if tlcPath.isEmpty {
-            return bundledToolPath(named: "tla2tools.jar")
+            return bundledToolPath(named: "tlc-native") ?? bundledToolPath(named: "tlc-native-fast") ?? ""
         }
         return tlcPath
     }
@@ -186,7 +249,7 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the TLAPM executable, using the bundled version if no custom path is set.
     var resolvedTLAPMPath: String {
         if tlapmPath.isEmpty {
-            return bundledToolPath(named: "tlapm")
+            return bundledToolPath(named: "tlapm", subdirectories: ["bin", "Provers"]) ?? ""
         }
         return tlapmPath
     }
@@ -194,7 +257,7 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the Z3 executable, using the bundled version if no custom path is set.
     var resolvedZ3Path: String {
         if z3Path.isEmpty {
-            return bundledToolPath(named: "z3")
+            return bundledToolPath(named: "z3", subdirectories: ["Provers", "lib/tlapm/backends/bin"]) ?? ""
         }
         return z3Path
     }
@@ -202,9 +265,25 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the Zenon executable, using the bundled version if no custom path is set.
     var resolvedZenonPath: String {
         if zenonPath.isEmpty {
-            return bundledToolPath(named: "zenon")
+            return bundledToolPath(named: "zenon", subdirectories: ["Provers", "lib/tlapm/backends/bin"]) ?? ""
         }
         return zenonPath
+    }
+
+    /// Returns the path to the CVC5 executable, using the bundled version if no custom path is set.
+    var resolvedCvc5Path: String {
+        if cvc5Path.isEmpty {
+            return bundledToolPath(named: "cvc5", subdirectories: ["Provers"]) ?? ""
+        }
+        return cvc5Path
+    }
+
+    /// Returns the path to the SPASS executable, using the bundled version if no custom path is set.
+    var resolvedSpassPath: String {
+        if spassPath.isEmpty {
+            return bundledToolPath(named: "SPASS", subdirectories: ["Provers"]) ?? ""
+        }
+        return spassPath
     }
 
     /// The list of available syntax highlighting color schemes.
@@ -302,7 +381,56 @@ final class UserSettings: ObservableObject {
     // MARK: - Initialization
 
     private init() {
-        // Private initializer enforces singleton pattern
+        migrateLegacyKeysIfNeeded()
+    }
+
+    /// One-shot migration: copy any values stored under legacy key names into the canonical
+    /// `Keys.*` identifiers, then remove the legacy entries. Idempotent — the marker key
+    /// keeps it from running on every launch.
+    private func migrateLegacyKeysIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: LegacyKeys.migrationMarker) else { return }
+
+        for (legacy, canonical) in LegacyKeys.prover {
+            guard let legacyValue = defaults.object(forKey: legacy) else { continue }
+            if defaults.object(forKey: canonical) == nil {
+                defaults.set(legacyValue, forKey: canonical)
+            }
+            defaults.removeObject(forKey: legacy)
+        }
+
+        defaults.set(true, forKey: LegacyKeys.migrationMarker)
+    }
+
+    static func normalizedModuleLibraryFolders(_ folders: [String]) -> [String] {
+        var normalized: [String] = []
+        var seen = Set<String>()
+
+        for folder in folders {
+            let trimmed = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            let expanded = (trimmed as NSString).expandingTildeInPath
+            let path = URL(fileURLWithPath: expanded).standardizedFileURL.path
+            guard !seen.contains(path) else { continue }
+
+            seen.insert(path)
+            normalized.append(path)
+        }
+
+        return normalized
+    }
+
+    static func existingModuleLibraryFolders(from folders: [String]) -> [String] {
+        let fileManager = FileManager.default
+
+        return normalizedModuleLibraryFolders(folders).compactMap { path in
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                return nil
+            }
+            return path
+        }
     }
 
     // MARK: - Helper Methods
@@ -310,22 +438,15 @@ final class UserSettings: ObservableObject {
     /// Returns the path to a bundled tool within the application bundle.
     /// - Parameter named: The name of the tool file.
     /// - Returns: The full path to the bundled tool, or an empty string if not found.
-    private func bundledToolPath(named name: String) -> String {
-        if let path = Bundle.main.path(forResource: name, ofType: nil) {
-            return path
-        }
-        // Check in a Tools subdirectory
-        if let path = Bundle.main.path(forResource: name, ofType: nil, inDirectory: "Tools") {
-            return path
-        }
-        // Check in Resources/Tools
-        if let resourcePath = Bundle.main.resourcePath {
-            let toolsPath = (resourcePath as NSString).appendingPathComponent("Tools/\(name)")
-            if FileManager.default.fileExists(atPath: toolsPath) {
-                return toolsPath
-            }
-        }
-        return ""
+    private func bundledToolPath(named name: String, subdirectories: [String] = []) -> String? {
+        BinaryDiscovery.find(
+            named: name,
+            options: .init(
+                bundleSubdirectories: subdirectories,
+                systemPaths: ["/usr/local/bin", "/opt/homebrew/bin"],
+                homeRelativePaths: [".tla", ".tla/provers"]
+            )
+        )?.path
     }
 
     /// Returns the resolved font to use in the editor.
@@ -358,6 +479,7 @@ final class UserSettings: ObservableObject {
         reopenLastDocument = true
         checkForUpdates = true
         showWelcomeOnLaunch = true
+        moduleLibraryFolders = []
     }
 
     /// Resets all editor settings to their default values.
@@ -383,9 +505,12 @@ final class UserSettings: ObservableObject {
         z3Path = ""
         zenonPath = ""
         isabellePath = ""
+        cvc5Path = ""
+        spassPath = ""
         defaultProverBackend = "auto"
         defaultProverTimeout = 30
         tlcWorkers = ProcessInfo.processInfo.activeProcessorCount
+        tlcCheckpointEnabled = true
         tlcCheckpointInterval = 30
     }
 

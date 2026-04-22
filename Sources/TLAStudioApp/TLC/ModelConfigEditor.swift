@@ -6,14 +6,115 @@ import SwiftUI
 struct ModelConfigEditor: View {
     @Binding var config: ModelConfig
     let symbols: [TLASymbol]
+    @ObservedObject var configStore: ModelConfigStore
+    var onActivateModel: ((ModelConfig) -> Void)?
 
     @State private var newConstantName = ""
     @State private var newConstantValue = ""
     @State private var newInvariant = ""
     @State private var newProperty = ""
+    @State private var selectedConfigID: UUID?
 
     var body: some View {
         Form {
+            Section("Saved Models") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Picker("Current Model", selection: $selectedConfigID) {
+                        Text("Unsaved Draft").tag(Optional<UUID>.none)
+                        ForEach(configStore.configs) { namedConfig in
+                            Text(namedConfig.name).tag(Optional(namedConfig.id))
+                        }
+                    }
+                    .onChange(of: selectedConfigID) { _, newID in
+                        guard let newID else {
+                            detachCurrentConfigToDraft()
+                            return
+                        }
+                        loadSavedModel(id: newID)
+                    }
+
+                    HStack(spacing: 8) {
+                        if hasUnsavedChanges || selectedModel == nil {
+                            Button {
+                                saveCurrentModel()
+                            } label: {
+                                Label(saveButtonTitle, systemImage: "square.and.arrow.down")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .help("Save the current model and make it the active model")
+                        } else {
+                            Button {
+                                saveCurrentModel()
+                            } label: {
+                                Label(saveButtonTitle, systemImage: "square.and.arrow.down")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("Save the current model and make it the active model")
+                        }
+
+                        Button {
+                            duplicateCurrentModel()
+                        } label: {
+                            Label("Duplicate", systemImage: "plus.square.on.square")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Clone the current model as a new named model")
+
+                        Button {
+                            createUnsavedModel()
+                        } label: {
+                            Label("New Draft", systemImage: "plus")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Start a new unsaved model draft")
+
+                        if selectedConfigID != nil {
+                            Button(role: .destructive) {
+                                deleteSelectedModel()
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("Delete the selected model")
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        ModelStatusBadge(
+                            title: selectedModel == nil ? "Draft" : "Saved",
+                            color: selectedModel == nil ? .secondary : .accentColor
+                        )
+
+                        if hasUnsavedChanges {
+                            ModelStatusBadge(title: "Unsaved Changes", color: .orange)
+                        }
+
+                        Text("\(configStore.configs.count) saved")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if let selectedModel {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Run TLC uses the selected model.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            if !selectedModel.comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text(selectedModel.comment)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                    } else {
+                        Text("Drafts run directly, but they are only persisted after you save them as a named model.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+
             // Basic Settings
             Section("Model") {
                 TextField("Name", text: $config.name)
@@ -23,6 +124,40 @@ struct ModelConfigEditor: View {
                     Text(config.specFile.lastPathComponent)
                         .foregroundColor(.secondary)
                 }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Comment")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+
+                    ZStack(alignment: .topLeading) {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color(NSColor.textBackgroundColor))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.secondary.opacity(0.15))
+                            )
+
+                        if config.comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text("Notes about what this model checks, assumptions, or how to reproduce a trace.")
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 12)
+                        }
+
+                        TextEditor(text: $config.comment)
+                            .font(.system(.body, design: .monospaced))
+                            .scrollContentBackground(.hidden)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 4)
+                    }
+                    .frame(minHeight: 84)
+                }
+            }
+
+            Section("Quick Setup") {
+                QuickModelConfig(config: $config, symbols: symbols)
             }
 
             // Constants
@@ -183,29 +318,92 @@ struct ModelConfigEditor: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            syncSelectionFromCurrentConfig()
+        }
+    }
+
+    private var selectedModel: NamedModelConfig? {
+        guard let selectedConfigID else { return nil }
+        return configStore.config(id: selectedConfigID)
+    }
+
+    private var hasUnsavedChanges: Bool {
+        guard let selectedModel else { return true }
+        return selectedModel.config != config
+    }
+
+    private var saveButtonTitle: String {
+        if selectedModel == nil {
+            return "Save Model"
+        }
+        return hasUnsavedChanges ? "Save Changes" : "Save"
     }
 
     private func addConstant() {
         guard !newConstantName.isEmpty, !newConstantValue.isEmpty else { return }
 
-        // Parse the value
-        let value: ConstantValue
-        if let intVal = Int(newConstantValue) {
-            value = .int(intVal)
-        } else if newConstantValue == "TRUE" {
-            value = .bool(true)
-        } else if newConstantValue == "FALSE" {
-            value = .bool(false)
-        } else if newConstantValue.hasPrefix("{") && newConstantValue.hasSuffix("}") {
-            // Model value set
-            value = .modelValue(newConstantValue)
-        } else {
-            value = .string(newConstantValue)
-        }
-
-        config.constants[newConstantName] = value
+        config.constants[newConstantName] = ModelConfig.parseConstantValue(newConstantValue)
         newConstantName = ""
         newConstantValue = ""
+    }
+
+    private func syncSelectionFromCurrentConfig() {
+        if let matchingModel = configStore.configs.first(where: { $0.id == config.id }) {
+            selectedConfigID = matchingModel.id
+            config = matchingModel.config
+            return
+        }
+        selectedConfigID = nil
+    }
+
+    private func loadSavedModel(id: UUID) {
+        guard let namedConfig = configStore.config(id: id) else { return }
+        configStore.selectConfig(id: id)
+        config = namedConfig.config
+        onActivateModel?(namedConfig.config)
+    }
+
+    private func saveCurrentModel() {
+        let saved = configStore.save(config: config, selecting: true)
+        config = saved.config
+        selectedConfigID = saved.id
+        onActivateModel?(saved.config)
+    }
+
+    private func duplicateCurrentModel() {
+        let duplicated = configStore.duplicate(config: config, selecting: true)
+        config = duplicated.config
+        selectedConfigID = duplicated.id
+        onActivateModel?(duplicated.config)
+    }
+
+    private func createUnsavedModel() {
+        detachCurrentConfigToDraft(resetName: true)
+        config.comment = ""
+        onActivateModel?(config)
+    }
+
+    private func detachCurrentConfigToDraft(resetName: Bool = false) {
+        config.id = UUID()
+        if resetName {
+            config.name = configStore.configNames.contains("Default") ? "Model \(configStore.configs.count + 1)" : "Default"
+        }
+        configStore.selectConfig(id: nil)
+        selectedConfigID = nil
+    }
+
+    private func deleteSelectedModel() {
+        guard let selectedConfigID else { return }
+        configStore.delete(id: selectedConfigID)
+
+        if let fallback = configStore.selectedConfig {
+            config = fallback.config
+            self.selectedConfigID = fallback.id
+            onActivateModel?(fallback.config)
+        } else {
+            createUnsavedModel()
+        }
     }
 }
 
@@ -294,9 +492,6 @@ struct QuickModelConfig: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Quick Setup")
-                .font(.headline)
-
             if let typeOK = typeOKSymbol {
                 Button("Add TypeOK as Invariant") {
                     if !config.invariants.contains(typeOK.name) {
@@ -339,9 +534,6 @@ struct QuickModelConfig: View {
                 Button("Auto") { config.workers = ProcessInfo.processInfo.activeProcessorCount }
             }
         }
-        .padding()
-        .background(Color(NSColor.controlBackgroundColor))
-        .cornerRadius(8)
     }
 }
 
@@ -351,16 +543,26 @@ struct QuickModelConfig: View {
 struct ModelConfigEditorSheet: View {
     @Binding var config: ModelConfig
     let symbols: [TLASymbol]
+    @ObservedObject var configStore: ModelConfigStore
+    var onSave: ((ModelConfig) -> Void)?
     @Binding var isPresented: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text("Model Configuration")
-                    .font(.headline)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Model Configuration")
+                        .font(.headline)
+                    Text(config.name)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 Spacer()
                 Button("Done") {
+                    let saved = configStore.save(config: config, selecting: true)
+                    config = saved.config
+                    onSave?(saved.config)
                     isPresented = false
                 }
                 .keyboardShortcut(.return, modifiers: [])
@@ -371,7 +573,14 @@ struct ModelConfigEditorSheet: View {
             Divider()
 
             // Config editor
-            ModelConfigEditor(config: $config, symbols: symbols)
+            ModelConfigEditor(
+                config: $config,
+                symbols: symbols,
+                configStore: configStore,
+                onActivateModel: { config in
+                    onSave?(config)
+                }
+            )
                 .frame(minWidth: 500, minHeight: 400)
         }
         .frame(width: 600, height: 550)
@@ -400,5 +609,20 @@ extension TLASymbolKind {
         case .instance:
             return "Instance"
         }
+    }
+}
+
+private struct ModelStatusBadge: View {
+    let title: String
+    let color: Color
+
+    var body: some View {
+        Text(title)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .foregroundColor(color)
+            .background(color.opacity(0.12))
+            .clipShape(Capsule())
     }
 }

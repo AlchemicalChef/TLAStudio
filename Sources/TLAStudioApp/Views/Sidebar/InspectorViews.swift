@@ -133,7 +133,7 @@ struct DocumentInfoView: View {
     @ObservedObject var document: TLADocument
 
     private var lineCount: Int {
-        document.content.components(separatedBy: "\n").count
+        document.totalLineCount
     }
 
     private var characterCount: Int {

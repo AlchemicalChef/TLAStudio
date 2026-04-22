@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - Text Encoding
@@ -68,6 +69,10 @@ struct GeneralSettingsView: View {
     @AppStorage(UserSettings.Keys.checkForUpdates) private var checkForUpdates = true
     @AppStorage(UserSettings.Keys.showWelcomeOnLaunch) private var showWelcomeOnLaunch = true
 
+    // MARK: - Module Library Settings
+
+    @State private var moduleLibraryFolders = UserSettings.shared.moduleLibraryFolders
+
     // MARK: - Alert State
 
     @State private var showClearRecentsAlert = false
@@ -78,6 +83,7 @@ struct GeneralSettingsView: View {
     var body: some View {
         Form {
             documentHandlingSection
+            moduleLibrariesSection
             applicationSection
             dataManagementSection
         }
@@ -110,6 +116,54 @@ struct GeneralSettingsView: View {
     }
 
     // MARK: - Application Section
+
+    private var moduleLibrariesSection: some View {
+        Section("Module Libraries") {
+            if moduleLibraryFolders.isEmpty {
+                Text("No extra library folders configured.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(moduleLibraryFolders, id: \.self) { folder in
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text((folder as NSString).lastPathComponent)
+                            Text(folder)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+
+                        Spacer()
+
+                        Button(role: .destructive) {
+                            removeModuleLibraryFolder(folder)
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Remove folder")
+                    }
+                }
+            }
+
+            HStack {
+                Button("Add Folder...") {
+                    addModuleLibraryFolder()
+                }
+
+                if !moduleLibraryFolders.isEmpty {
+                    Button("Clear All", role: .destructive) {
+                        moduleLibraryFolders = []
+                        persistModuleLibraryFolders()
+                    }
+                }
+            }
+
+            Text("Folders are searched in order after the current spec directory and before bundled or system modules.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
 
     private var applicationSection: some View {
         Section("Application") {
@@ -197,10 +251,37 @@ struct GeneralSettingsView: View {
         autosaveInterval = 30
         reopenLastDocument = true
         defaultTextEncoding = TextEncoding.utf8.rawValue
+        moduleLibraryFolders = []
+        persistModuleLibraryFolders()
 
         // Application
         checkForUpdates = true
         showWelcomeOnLaunch = true
+    }
+
+    private func persistModuleLibraryFolders() {
+        moduleLibraryFolders = UserSettings.normalizedModuleLibraryFolders(moduleLibraryFolders)
+        UserSettings.shared.moduleLibraryFolders = moduleLibraryFolders
+    }
+
+    private func addModuleLibraryFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Module Library Folder"
+        panel.prompt = "Add Folder"
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK else { return }
+
+        moduleLibraryFolders.append(contentsOf: panel.urls.map(\.path))
+        persistModuleLibraryFolders()
+    }
+
+    private func removeModuleLibraryFolder(_ folder: String) {
+        moduleLibraryFolders.removeAll { $0 == folder }
+        persistModuleLibraryFolders()
     }
 }
 

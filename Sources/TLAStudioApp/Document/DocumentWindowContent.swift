@@ -7,8 +7,11 @@ struct DocumentWindowContent: View {
     @ObservedObject var document: TLADocument
     @State private var showNavigator = true
     @State private var showInspector = false
-    @State private var showConfigEditor = false
-    @State private var modelConfig: ModelConfig?
+    /// Seed config for the edit sheet. Presence of a value drives the sheet; using
+    /// `.sheet(item:)` instead of `(isPresented: + Binding($optional))` avoids a
+    /// SwiftUI race where the sheet content was evaluated before the @State that
+    /// feeds it settled, producing a blank grey box on the first open.
+    @State private var editingConfig: ModelConfig?
 
     var body: some View {
         NavigationSplitView(columnVisibility: .constant(
@@ -45,68 +48,71 @@ struct DocumentWindowContent: View {
                 .help("Toggle Inspector")
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleNavigatorSidebar)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .toggleNavigatorSidebar)) { notification in
+            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
             showNavigator.toggle()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleInspectorSidebar)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .toggleInspectorSidebar)) { notification in
+            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
             showInspector.toggle()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .editModelConfig)) { _ in
-            // Initialize config from document if not already set
-            if modelConfig == nil {
-                let specURL = document.fileURL ?? URL(fileURLWithPath: "/tmp/untitled.tla")
-
-                // Try to load existing .cfg file
-                let configURL = specURL.deletingPathExtension().appendingPathExtension("cfg")
-                let existingConfig = ModelConfig.parse(from: configURL)
-
-                // Merge existing config with detected invariants
-                let constants = existingConfig?.constants ?? [:]
-                var invariants = existingConfig?.invariants ?? []
-
-                // Add detected invariants that aren't already in the config
-                let detectedInvariants = detectInvariants(in: document.symbols)
-                for inv in detectedInvariants {
-                    if !invariants.contains(inv) {
-                        invariants.append(inv)
-                    }
-                }
-
-                modelConfig = ModelConfig(
-                    name: "Default",
-                    specFile: specURL,
-                    initPredicate: existingConfig?.initPredicate ?? "Init",
-                    nextAction: existingConfig?.nextAction ?? "Next",
-                    constants: constants,
-                    invariants: invariants,
-                    temporalProperties: existingConfig?.temporalProperties ?? [],
-                    stateConstraint: existingConfig?.stateConstraint,
-                    actionConstraint: existingConfig?.actionConstraint,
-                    workers: ProcessInfo.processInfo.activeProcessorCount
-                )
-            }
-            showConfigEditor = true
+        .onReceive(NotificationCenter.default.publisher(for: .editModelConfig)) { notification in
+            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+            editingConfig = document.resolvedModelConfig()
         }
-        .sheet(isPresented: $showConfigEditor) {
-            if let binding = Binding($modelConfig) {
-                ModelConfigEditorSheet(
-                    config: binding,
-                    symbols: document.symbols,
-                    isPresented: $showConfigEditor
-                )
-            }
+        .sheet(item: $editingConfig) { seed in
+            ModelConfigEditorSheetContainer(
+                initial: seed,
+                symbols: document.symbols,
+                configStore: document.modelConfigStore,
+                onSave: { savedConfig in
+                    document.activeModelConfig = savedConfig
+                },
+                onDismiss: { editingConfig = nil }
+            )
         }
     }
+}
 
-    private func detectInvariants(in symbols: [TLASymbol]) -> [String] {
-        symbols.compactMap { symbol in
-            if symbol.name.contains("Invariant") ||
-               symbol.name.contains("Safety") ||
-               symbol.name == "TypeOK" ||
-               symbol.name.hasPrefix("Type") {
-                return symbol.name
-            }
-            return nil
-        }
+// MARK: - Model Config Editor Sheet Container
+
+/// Owns the mutable ModelConfig for the editor sheet. Splitting this out lets us
+/// seed the @State from the `.sheet(item:)` value exactly once per presentation
+/// without fighting SwiftUI's view-identity rules.
+private struct ModelConfigEditorSheetContainer: View {
+    let symbols: [TLASymbol]
+    @ObservedObject var configStore: ModelConfigStore
+    let onSave: (ModelConfig) -> Void
+    let onDismiss: () -> Void
+
+    @State private var config: ModelConfig
+
+    init(
+        initial: ModelConfig,
+        symbols: [TLASymbol],
+        configStore: ModelConfigStore,
+        onSave: @escaping (ModelConfig) -> Void,
+        onDismiss: @escaping () -> Void
+    ) {
+        self.symbols = symbols
+        self.configStore = configStore
+        self.onSave = onSave
+        self.onDismiss = onDismiss
+        _config = State(initialValue: initial)
+    }
+
+    var body: some View {
+        ModelConfigEditorSheet(
+            config: $config,
+            symbols: symbols,
+            configStore: configStore,
+            onSave: onSave,
+            isPresented: Binding(
+                get: { true },
+                set: { newValue in
+                    if !newValue { onDismiss() }
+                }
+            )
+        )
     }
 }

@@ -38,6 +38,14 @@ struct ModelCheckPanel: View {
                     .disabled(!viewModel.canRun)
 
                     TLCModePicker(selectedMode: $document.selectedTLCMode)
+
+                    Text(viewModel.config.name)
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.accentColor.opacity(0.1))
+                        .clipShape(Capsule())
+                        .help("Current model")
                 }
 
                 Spacer()
@@ -68,7 +76,12 @@ struct ModelCheckPanel: View {
             case .config:
                 ModelConfigEditor(
                     config: $viewModel.config,
-                    symbols: document.symbols
+                    symbols: document.symbols,
+                    configStore: document.modelConfigStore,
+                    onActivateModel: { activatedConfig in
+                        viewModel.config = activatedConfig
+                        document.activeModelConfig = activatedConfig
+                    }
                 )
 
             case .coverage:
@@ -87,6 +100,9 @@ struct ModelCheckPanel: View {
                     ErrorTraceView(trace: trace) { location in
                         viewModel.jumpToSource(location, in: document)
                     }
+                } else if viewModel.isLoadingErrorTrace {
+                    ProgressView("Loading trace...")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     Text("No error trace available")
                         .foregroundColor(.secondary)
@@ -96,6 +112,9 @@ struct ModelCheckPanel: View {
             case .stateGraph:
                 if let trace = viewModel.errorTrace {
                     StateGraphView(trace: trace)
+                } else if viewModel.isLoadingErrorTrace {
+                    ProgressView("Loading trace...")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     Text("No error trace available")
                         .foregroundColor(.secondary)
@@ -144,6 +163,9 @@ struct ModelCheckPanel: View {
                 }
             }
         }
+        .task(id: viewModel.traceLoadKey) {
+            await viewModel.refreshLoadedErrorTrace(loadIfNeeded: viewModel.shouldLoadErrorTrace)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .runModelCheck)) { notification in
             // Handle both nil (from menu) and specific document (from toolbar)
             if notification.object == nil || (notification.object as? TLADocument) === document {
@@ -178,8 +200,15 @@ struct ModelCheckPanel: View {
                     )
                 }
 
-                if let trace = lastResult.errorTrace {
+                if let trace = viewModel.errorTrace {
                     CompactErrorTraceView(trace: trace) {
+                        viewModel.viewMode = .trace
+                    }
+                } else if lastResult.hasErrorTrace {
+                    LazyErrorTraceSummaryView(
+                        stateCount: lastResult.errorTraceStateCount,
+                        isLoading: viewModel.isLoadingErrorTrace
+                    ) {
                         viewModel.viewMode = .trace
                     }
                 }
@@ -234,36 +263,15 @@ class ModelCheckViewModel: ObservableObject {
 
     @Published var config: ModelConfig
     @Published var viewMode: ModelCheckViewMode = .progress
+    @Published private(set) var loadedErrorTrace: ErrorTrace?
+    @Published private(set) var isLoadingErrorTrace = false
+
+    private var loadedTraceSessionID: UUID?
 
     init(document: TLADocument) {
         self.document = document
 
-        let specURL = document.fileURL ?? URL(fileURLWithPath: "/tmp/untitled.tla")
-        let configURL = specURL.deletingPathExtension().appendingPathExtension("cfg")
-        let existingConfig = ModelConfig.parse(from: configURL)
-
-        let constants = existingConfig?.constants ?? [:]
-        var invariants = existingConfig?.invariants ?? []
-
-        let detectedInvariants = Self.detectInvariants(in: document.symbols)
-        for inv in detectedInvariants {
-            if !invariants.contains(inv) {
-                invariants.append(inv)
-            }
-        }
-
-        self.config = ModelConfig(
-            name: "Default",
-            specFile: specURL,
-            initPredicate: existingConfig?.initPredicate ?? "Init",
-            nextAction: existingConfig?.nextAction ?? "Next",
-            constants: constants,
-            invariants: invariants,
-            temporalProperties: existingConfig?.temporalProperties ?? [],
-            stateConstraint: existingConfig?.stateConstraint,
-            actionConstraint: existingConfig?.actionConstraint,
-            workers: ProcessInfo.processInfo.activeProcessorCount
-        )
+        self.config = document.resolvedModelConfig()
     }
 
     // Use document's session directly instead of maintaining a separate copy
@@ -285,11 +293,30 @@ class ModelCheckViewModel: ObservableObject {
     }
 
     var hasErrorTrace: Bool {
-        lastResult?.errorTrace != nil || session?.result?.errorTrace != nil
+        errorTrace != nil || activeTraceResult?.hasErrorTrace == true
     }
 
     var errorTrace: ErrorTrace? {
-        session?.result?.errorTrace ?? lastResult?.errorTrace
+        if let trace = activeTraceResult?.errorTrace {
+            return trace
+        }
+        guard loadedTraceSessionID == activeTraceResult?.sessionId else {
+            return nil
+        }
+        return loadedErrorTrace
+    }
+
+    var traceLoadKey: UUID? {
+        shouldLoadErrorTrace ? activeTraceResult?.sessionId : nil
+    }
+
+    var shouldLoadErrorTrace: Bool {
+        switch viewMode {
+        case .trace, .stateGraph:
+            return true
+        default:
+            return false
+        }
     }
 
     func runModelCheck() {
@@ -297,14 +324,8 @@ class ModelCheckViewModel: ObservableObject {
             return
         }
         viewMode = .progress
-
-        // Save config to .cfg file so document reads our edits
-        if let fileURL = document.fileURL {
-            let configURL = fileURL.deletingPathExtension().appendingPathExtension("cfg")
-            try? config.write(to: configURL)
-        }
-
-        document.runModelCheck()  // Uses document.selectedTLCMode
+        document.activeModelConfig = config
+        document.runModelCheck(config: config)
     }
 
     func stopModelCheck() {
@@ -410,6 +431,90 @@ class ModelCheckViewModel: ObservableObject {
 
         return invariants
     }
+
+    private var activeTraceResult: ModelCheckResult? {
+        session?.result ?? lastResult
+    }
+
+    func refreshLoadedErrorTrace(loadIfNeeded: Bool) async {
+        guard let result = activeTraceResult else {
+            loadedErrorTrace = nil
+            loadedTraceSessionID = nil
+            isLoadingErrorTrace = false
+            return
+        }
+
+        if let trace = result.errorTrace {
+            loadedErrorTrace = trace
+            loadedTraceSessionID = result.sessionId
+            isLoadingErrorTrace = false
+            return
+        }
+
+        guard let lazyTrace = result.lazyErrorTrace else {
+            loadedErrorTrace = nil
+            loadedTraceSessionID = result.sessionId
+            isLoadingErrorTrace = false
+            return
+        }
+
+        guard loadIfNeeded else {
+            isLoadingErrorTrace = false
+            return
+        }
+
+        if loadedTraceSessionID == result.sessionId, loadedErrorTrace != nil {
+            isLoadingErrorTrace = false
+            return
+        }
+
+        isLoadingErrorTrace = true
+        defer { isLoadingErrorTrace = false }
+        do {
+            let trace = try await lazyTrace.toErrorTrace()
+            guard activeTraceResult?.sessionId == result.sessionId else { return }
+            loadedErrorTrace = trace
+            loadedTraceSessionID = result.sessionId
+        } catch {
+            guard activeTraceResult?.sessionId == result.sessionId else { return }
+            loadedErrorTrace = nil
+            loadedTraceSessionID = result.sessionId
+        }
+    }
+}
+
+private struct LazyErrorTraceSummaryView: View {
+    let stateCount: Int
+    let isLoading: Bool
+    let onOpenTrace: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .foregroundColor(.orange)
+                Text("Counterexample available")
+                    .font(.headline)
+            }
+
+            Text("\(stateCount) states are available in the trace. Load the detailed trace view only when needed.")
+                .font(.callout)
+                .foregroundColor(.secondary)
+
+            Button(action: onOpenTrace) {
+                if isLoading {
+                    Label("Loading Trace...", systemImage: "hourglass")
+                } else {
+                    Label("Open Trace", systemImage: "list.bullet.rectangle")
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(isLoading)
+        }
+        .padding()
+        .background(Color.orange.opacity(0.08))
+        .cornerRadius(8)
+    }
 }
 
 
@@ -479,7 +584,7 @@ struct ModelCheckPanelCompact: View {
 
                 Spacer()
 
-                if result.errorTrace != nil {
+                if result.hasErrorTrace {
                     Button("View Trace") {
                         // Show trace in popover or new window
                     }

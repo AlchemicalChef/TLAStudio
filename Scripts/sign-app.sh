@@ -67,54 +67,52 @@ fi
 
 echo "Signing embedded binaries (inside-out)..."
 
-# Sign TLC binaries
-for tlc in "$APP_PATH/Contents/Resources/tlc-native" "$APP_PATH/Contents/Resources/tlc-native-fast"; do
-    if [ -f "$tlc" ]; then
-        echo "  Signing $(basename "$tlc")..."
+RESOURCE_ROOT="$APP_PATH/Contents/Resources"
+BUNDLE_ROOT="$RESOURCE_ROOT/TLAStudio_TLAStudioApp.bundle"
+
+for binary in \
+    "$RESOURCE_ROOT/tlc-native" \
+    "$RESOURCE_ROOT/tlc-native-fast" \
+    "$RESOURCE_ROOT/bin/tlapm" \
+    "$RESOURCE_ROOT/Provers/z3" \
+    "$RESOURCE_ROOT/Provers/cvc5" \
+    "$RESOURCE_ROOT/Provers/zenon" \
+    "$RESOURCE_ROOT/Provers/SPASS" \
+    "$RESOURCE_ROOT/Provers/ls4" \
+    "$RESOURCE_ROOT/Provers/isabelle-wrapper" \
+    "$BUNDLE_ROOT/tlc-native" \
+    "$BUNDLE_ROOT/tlc-native-fast" \
+    "$BUNDLE_ROOT/bin/tlapm" \
+    "$BUNDLE_ROOT/Provers/z3" \
+    "$BUNDLE_ROOT/Provers/cvc5" \
+    "$BUNDLE_ROOT/Provers/zenon" \
+    "$BUNDLE_ROOT/Provers/SPASS" \
+    "$BUNDLE_ROOT/Provers/ls4" \
+    "$BUNDLE_ROOT/Provers/isabelle-wrapper" \
+    "$BUNDLE_ROOT/lib/tlapm/backends/bin/zenon" \
+    "$BUNDLE_ROOT/lib/tlapm/backends/bin/ls4"; do
+    if [ -f "$binary" ]; then
+        echo "  Signing $(basename "$binary")..."
         codesign --force --options runtime --timestamp \
-            --entitlements "$ENTITLEMENTS" \
-            --sign "$IDENTITY" "$tlc"
+            --sign "$IDENTITY" "$binary"
     fi
 done
 
-# Sign TLAPM binary
-if [ -d "$APP_PATH/Contents/Resources/bin" ]; then
-    for binary in "$APP_PATH/Contents/Resources/bin/"*; do
-        if [ -f "$binary" ] && [ -x "$binary" ]; then
-            echo "  Signing $(basename "$binary")..."
-            codesign --force --options runtime --timestamp \
-                --sign "$IDENTITY" "$binary"
-        fi
-    done
-fi
-
-# Sign backend provers
-if [ -d "$APP_PATH/Contents/Resources/Provers" ]; then
-    # Sign individual prover binaries
-    for binary in z3 cvc5 zenon SPASS ls4 isabelle-wrapper; do
-        PROVER="$APP_PATH/Contents/Resources/Provers/$binary"
-        if [ -f "$PROVER" ]; then
-            echo "  Signing $binary..."
-            codesign --force --options runtime --timestamp \
-                --sign "$IDENTITY" "$PROVER"
-        fi
-    done
-
-    # Sign Isabelle binaries if present
-    if [ -d "$APP_PATH/Contents/Resources/Provers/isabelle" ]; then
-        echo "  Signing Isabelle binaries..."
-        # Sign all executables in Isabelle's bin directory
-        find "$APP_PATH/Contents/Resources/Provers/isabelle/bin" -type f -perm +111 2>/dev/null | while read binary; do
+for isabelle_dir in \
+    "$RESOURCE_ROOT/Provers/isabelle" \
+    "$BUNDLE_ROOT/Provers/isabelle"; do
+    if [ -d "$isabelle_dir" ]; then
+        echo "  Signing Isabelle binaries in $isabelle_dir..."
+        find "$isabelle_dir/bin" -type f -perm +111 2>/dev/null | while read binary; do
             codesign --force --options runtime --timestamp \
                 --sign "$IDENTITY" "$binary" 2>/dev/null || true
         done
-        # Sign Isabelle's contrib binaries
-        find "$APP_PATH/Contents/Resources/Provers/isabelle/contrib" -type f -perm +111 2>/dev/null | while read binary; do
+        find "$isabelle_dir/contrib" -type f -perm +111 2>/dev/null | while read binary; do
             codesign --force --options runtime --timestamp \
                 --sign "$IDENTITY" "$binary" 2>/dev/null || true
         done
     fi
-fi
+done
 
 # Sign frameworks if any
 if [ -d "$APP_PATH/Contents/Frameworks" ]; then

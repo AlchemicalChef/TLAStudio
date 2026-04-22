@@ -27,10 +27,7 @@ final class CurrentLineHighlighter {
     }
 
     deinit {
-        if let observer = selectionObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        lineHighlightView?.removeFromSuperview()
+        tearDownLineHighlight()
     }
 
     // MARK: - Configuration
@@ -41,8 +38,7 @@ final class CurrentLineHighlighter {
             setupLineHighlight()
             updateHighlight()
         } else {
-            lineHighlightView?.removeFromSuperview()
-            lineHighlightView = nil
+            tearDownLineHighlight()
         }
     }
 
@@ -56,33 +52,45 @@ final class CurrentLineHighlighter {
     private func setupLineHighlight() {
         guard let textView = textView else { return }
 
-        // Create highlight view
-        let highlightView = NSView(frame: .zero)
-        highlightView.wantsLayer = true
-        highlightView.layer?.backgroundColor = highlightColor.cgColor
-        highlightView.alphaValue = 1.0
+        if lineHighlightView == nil,
+           let scrollView = textView.enclosingScrollView {
+            let highlightView = NSView(frame: .zero)
+            highlightView.wantsLayer = true
+            highlightView.layer?.backgroundColor = highlightColor.cgColor
+            highlightView.alphaValue = 1.0
 
-        // Insert behind text
-        if let scrollView = textView.enclosingScrollView {
-            // Add to clip view so it scrolls with content
-            if let clipView = scrollView.contentView as? NSClipView {
-                clipView.addSubview(highlightView, positioned: .below, relativeTo: textView)
-            }
+            // Add to the clip view so the highlight scrolls with the text content.
+            scrollView.contentView.addSubview(highlightView, positioned: .below, relativeTo: textView)
+            lineHighlightView = highlightView
         }
 
-        lineHighlightView = highlightView
+        installSelectionObserver(for: textView) { [weak self] in
+            self?.updateHighlight()
+        }
+        updateHighlight()
+    }
 
-        // Observe selection changes
+    private func tearDownLineHighlight() {
+        removeSelectionObserver()
+        lineHighlightView?.removeFromSuperview()
+        lineHighlightView = nil
+    }
+
+    private func installSelectionObserver(for textView: NSTextView, handler: @escaping () -> Void) {
+        removeSelectionObserver()
         selectionObserver = NotificationCenter.default.addObserver(
             forName: NSTextView.didChangeSelectionNotification,
             object: textView,
             queue: .main
-        ) { [weak self] _ in
-            self?.updateHighlight()
+        ) { _ in
+            handler()
         }
+    }
 
-        // Initial update
-        updateHighlight()
+    private func removeSelectionObserver() {
+        guard let selectionObserver else { return }
+        NotificationCenter.default.removeObserver(selectionObserver)
+        self.selectionObserver = nil
     }
 
     // MARK: - Update
@@ -130,8 +138,18 @@ final class BracketMatcher {
     // MARK: - Types
 
     private struct BracketPair {
-        let open: Character
-        let close: Character
+        let open: unichar
+        let close: unichar
+
+        init(open: Character, close: Character) {
+            self.open = String(open).utf16.first ?? 0
+            self.close = String(close).utf16.first ?? 0
+        }
+    }
+
+    private struct HighlightedBracket {
+        let range: NSRange
+        let originalBackgroundColor: Any?
     }
 
     // MARK: - Properties
@@ -140,7 +158,7 @@ final class BracketMatcher {
     private var enabled: Bool = true
     private var highlightColor: NSColor = NSColor.systemBlue.withAlphaComponent(0.3)
 
-    private var matchHighlightRanges: [NSRange] = []
+    private var highlightedBrackets: [HighlightedBracket] = []
     private var selectionObserver: NSObjectProtocol?
 
     private let bracketPairs: [BracketPair] = [
@@ -162,9 +180,7 @@ final class BracketMatcher {
     }
 
     deinit {
-        if let observer = selectionObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
+        removeSelectionObserver()
     }
 
     // MARK: - Configuration
@@ -175,6 +191,7 @@ final class BracketMatcher {
             setupBracketMatching()
             updateBracketHighlight()
         } else {
+            removeSelectionObserver()
             clearHighlights()
         }
     }
@@ -189,17 +206,27 @@ final class BracketMatcher {
     private func setupBracketMatching() {
         guard let textView = textView else { return }
 
-        // Observe selection changes
+        installSelectionObserver(for: textView) { [weak self] in
+            self?.updateBracketHighlight()
+        }
+        updateBracketHighlight()
+    }
+
+    private func installSelectionObserver(for textView: NSTextView, handler: @escaping () -> Void) {
+        removeSelectionObserver()
         selectionObserver = NotificationCenter.default.addObserver(
             forName: NSTextView.didChangeSelectionNotification,
             object: textView,
             queue: .main
-        ) { [weak self] _ in
-            self?.updateBracketHighlight()
+        ) { _ in
+            handler()
         }
+    }
 
-        // Initial update
-        updateBracketHighlight()
+    private func removeSelectionObserver() {
+        guard let selectionObserver else { return }
+        NotificationCenter.default.removeObserver(selectionObserver)
+        self.selectionObserver = nil
     }
 
     // MARK: - Bracket Finding
@@ -213,16 +240,14 @@ final class BracketMatcher {
         let selectedRange = textView.selectedRange()
         guard selectedRange.location != NSNotFound else { return }
 
-        let text = textView.string
-        let nsText = text as NSString
+        let text = textView.string as NSString
 
         // Check character at cursor and before cursor
-        let positions = [selectedRange.location, max(0, selectedRange.location - 1)]
+        let positions = candidatePositions(for: selectedRange.location)
 
-        for pos in positions where pos < nsText.length {
-            let char = Character(UnicodeScalar(nsText.character(at: pos))!)
+        for pos in positions where pos < text.length {
+            let char = text.character(at: pos)
 
-            // Check if it's an opening bracket
             if let pair = bracketPairs.first(where: { $0.open == char }) {
                 if let matchPos = findMatchingCloseBracket(from: pos, pair: pair, in: text) {
                     highlightBrackets(at: pos, and: matchPos)
@@ -230,7 +255,6 @@ final class BracketMatcher {
                 }
             }
 
-            // Check if it's a closing bracket
             if let pair = bracketPairs.first(where: { $0.close == char }) {
                 if let matchPos = findMatchingOpenBracket(from: pos, pair: pair, in: text) {
                     highlightBrackets(at: matchPos, and: pos)
@@ -240,15 +264,20 @@ final class BracketMatcher {
         }
     }
 
-    private func findMatchingCloseBracket(from start: Int, pair: BracketPair, in text: String) -> Int? {
-        let chars = Array(text)
+    private func candidatePositions(for location: Int) -> [Int] {
+        guard location > 0 else { return [0] }
+        return [location, location - 1]
+    }
+
+    private func findMatchingCloseBracket(from start: Int, pair: BracketPair, in text: NSString) -> Int? {
         var depth = 1
         var pos = start + 1
 
-        while pos < chars.count && depth > 0 {
-            if chars[pos] == pair.open {
+        while pos < text.length && depth > 0 {
+            let character = text.character(at: pos)
+            if character == pair.open {
                 depth += 1
-            } else if chars[pos] == pair.close {
+            } else if character == pair.close {
                 depth -= 1
             }
             if depth == 0 {
@@ -260,15 +289,15 @@ final class BracketMatcher {
         return nil
     }
 
-    private func findMatchingOpenBracket(from start: Int, pair: BracketPair, in text: String) -> Int? {
-        let chars = Array(text)
+    private func findMatchingOpenBracket(from start: Int, pair: BracketPair, in text: NSString) -> Int? {
         var depth = 1
         var pos = start - 1
 
         while pos >= 0 && depth > 0 {
-            if chars[pos] == pair.close {
+            let character = text.character(at: pos)
+            if character == pair.close {
                 depth += 1
-            } else if chars[pos] == pair.open {
+            } else if character == pair.open {
                 depth -= 1
             }
             if depth == 0 {
@@ -289,10 +318,11 @@ final class BracketMatcher {
         let range1 = NSRange(location: pos1, length: 1)
         let range2 = NSRange(location: pos2, length: 1)
 
-        // Store ranges for clearing later
-        matchHighlightRanges = [range1, range2]
+        highlightedBrackets = [range1, range2].map { range in
+            let existingBackground = textStorage.attribute(.backgroundColor, at: range.location, effectiveRange: nil)
+            return HighlightedBracket(range: range, originalBackgroundColor: existingBackground)
+        }
 
-        // Apply highlight
         textStorage.beginEditing()
         textStorage.addAttribute(.backgroundColor, value: highlightColor, range: range1)
         textStorage.addAttribute(.backgroundColor, value: highlightColor, range: range2)
@@ -303,17 +333,19 @@ final class BracketMatcher {
         guard let textView = textView,
               let textStorage = textView.textStorage else { return }
 
-        guard !matchHighlightRanges.isEmpty else { return }
+        guard !highlightedBrackets.isEmpty else { return }
 
         textStorage.beginEditing()
-        for range in matchHighlightRanges {
-            if range.location + range.length <= textStorage.length {
-                textStorage.removeAttribute(.backgroundColor, range: range)
+        for bracket in highlightedBrackets where bracket.range.location + bracket.range.length <= textStorage.length {
+            if let originalBackgroundColor = bracket.originalBackgroundColor {
+                textStorage.addAttribute(.backgroundColor, value: originalBackgroundColor, range: bracket.range)
+            } else {
+                textStorage.removeAttribute(.backgroundColor, range: bracket.range)
             }
         }
         textStorage.endEditing()
 
-        matchHighlightRanges = []
+        highlightedBrackets = []
     }
 }
 

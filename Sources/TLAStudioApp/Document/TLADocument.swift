@@ -19,6 +19,10 @@ final class TLADocument: NSDocument, ObservableObject {
     @Published var content: String = "" {
         didSet {
             if content != oldValue {
+                guard !suppressContentChangeHandling else {
+                    lineIndexNeedsRebuild = true
+                    return
+                }
                 updateChangeCount(.changeDone)
                 contentDidChange()
             }
@@ -55,6 +59,12 @@ final class TLADocument: NSDocument, ObservableObject {
     /// Proof annotation manager for editor integration
     @Published var proofAnnotationManager = ProofAnnotationManager()
 
+    /// Model configuration store for persisting named configs
+    @Published var modelConfigStore = ModelConfigStore()
+
+    /// The currently active model configuration used by menu, toolbar, and inspector actions.
+    @Published var activeModelConfig: ModelConfig?
+
     /// Document encoding (default UTF-8, preserve original on open)
     var encoding: String.Encoding = .utf8
 
@@ -89,12 +99,26 @@ final class TLADocument: NSDocument, ObservableObject {
     private var proofWatchTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
+    /// Set by `close()` to make subsequent operations no-ops. Guards against
+    /// late-arriving work running against a deallocated document.
+    private var isClosed = false
+
     // MARK: - Line Offset Index (Performance Optimization)
 
-    /// Cached line start offsets for O(log n) line/offset conversions.
-    /// Index i contains the character offset where line i starts (0-indexed).
+    /// Cached UTF-16 line start offsets for O(log n) line lookup from editor selections.
+    /// Index i contains the UTF-16 offset where line i starts (0-indexed).
     /// Line 0 always starts at offset 0.
     private var lineStartOffsets: [Int] = [0]
+
+    /// Used while loading content from disk to avoid duplicate parse scheduling and dirty-state churn.
+    private var suppressContentChangeHandling = false
+
+    /// Fast path for the common case of ASCII-only specs where UTF-16 offsets and character
+    /// columns are identical.
+    private var contentIsASCII = true
+
+    /// Cached UTF-16 length of the current content for editor range math.
+    private var contentUTF16Length = 0
 
     /// Whether the line offset index needs to be rebuilt
     private var lineIndexNeedsRebuild = true
@@ -255,12 +279,21 @@ final class TLADocument: NSDocument, ObservableObject {
 
         // Parse immediately
         scheduleParseContent()
+
+        // Load saved model configurations
+        Task { @MainActor in
+            modelConfigStore.load(for: url)
+            activeModelConfig = resolvedModelConfig(for: url)
+        }
     }
 
     private func setContentWithoutTriggeringChange(_ text: String) {
         // Temporarily remove the change observer
         let oldValue = content
+        suppressContentChangeHandling = true
         content = text
+        suppressContentChangeHandling = false
+        lineIndexNeedsRebuild = true
         // Restore dirty state if it was clean
         if oldValue.isEmpty {
             updateChangeCount(.changeCleared)
@@ -293,13 +326,12 @@ final class TLADocument: NSDocument, ObservableObject {
         for saveOperation: NSDocument.SaveOperationType,
         originalContentsURL: URL?
     ) throws {
-        try super.write(to: url, ofType: typeName, for: saveOperation,
-                        originalContentsURL: originalContentsURL)
-
-        // Update module name on Save As
         if saveOperation == .saveAsOperation {
             updateModuleNameFromFilename(url.deletingPathExtension().lastPathComponent)
         }
+
+        try super.write(to: url, ofType: typeName, for: saveOperation,
+                        originalContentsURL: originalContentsURL)
     }
 
     // MARK: - Window Controller
@@ -323,6 +355,9 @@ final class TLADocument: NSDocument, ObservableObject {
     }
 
     override func close() {
+        guard !isClosed else { return }
+        isClosed = true
+
         // Cancel all running tasks first to prevent any new state updates
         let parseTaskToCancel = parseTask
         let tlcWatchTaskToCancel = tlcWatchTask
@@ -336,27 +371,36 @@ final class TLADocument: NSDocument, ObservableObject {
         tlcWatchTaskToCancel?.cancel()
         proofWatchTaskToCancel?.cancel()
 
-        // Stop active sessions - these use ProcessRegistry for synchronous termination
-        // Capture and nil first to prevent race conditions
+        // Capture sessions and nil immediately so any re-entrant access sees clean state.
         let tlcSessionToStop = tlcSession
         let proofSessionToStop = proofSession
 
         tlcSession = nil
         proofSession = nil
 
-        tlcSessionToStop?.stop()
-        proofSessionToStop?.stop()
+        // Terminate subprocesses asynchronously: ProcessRegistry.terminate can block
+        // up to ~1s (SIGTERM → SIGKILL escalation) and we don't want a UI hang on Cmd-W.
+        // `applicationShouldTerminate` still calls ProcessRegistry.terminateAll synchronously
+        // at app quit, so nothing outlives the app.
+        if tlcSessionToStop != nil || proofSessionToStop != nil {
+            Task { @MainActor in
+                await tlcSessionToStop?.stopAsync()
+                await proofSessionToStop?.stopAsync()
+            }
+        }
 
         // Clear all Combine subscriptions before clearing state
         cancellables.removeAll()
 
-        // Clear state
+        // Clear state (reuse the existing annotation manager instead of instantiating a new one
+        // mid-teardown, which would churn SwiftUI observers bound to the old value).
         parseResult = nil
         symbols = []
         diagnostics = []
         lastTLCResult = nil
         lastProofResult = nil
-        proofAnnotationManager = ProofAnnotationManager()  // Reset annotation manager
+        proofAnnotationManager.updateAnnotations(for: [])
+        activeModelConfig = nil
 
         delegate = nil
 
@@ -390,7 +434,8 @@ final class TLADocument: NSDocument, ObservableObject {
 
             delegate?.documentDidParse(self)
         } catch {
-            // Handle parse error
+            parseResult = nil
+            symbols = []
             self.diagnostics = [TLADiagnostic(
                 range: TLARange(
                     start: TLAPosition(line: 0, column: 0),
@@ -405,77 +450,97 @@ final class TLADocument: NSDocument, ObservableObject {
 
     // MARK: - Model Checking
 
-    /// Run TLC model checker on this document
-    /// - Parameter binaryMode: TLC binary mode to use (default: uses document's selectedTLCMode)
-    @MainActor
-    func runModelCheck(binaryMode: TLCProcessManager.TLCBinaryMode? = nil) {
-        let mode = binaryMode ?? selectedTLCMode
-
-        // Get spec URL (save to temp if unsaved)
-        let specURL: URL
-        if let fileURL = self.fileURL {
-            specURL = fileURL
-        } else {
-            do {
-                specURL = try SecureTempFile.create(prefix: moduleName, extension: "tla", content: content)
-            } catch {
-                return
-            }
-        }
-
-        // Try to load existing .cfg file
-        let configURL = specURL.deletingPathExtension().appendingPathExtension("cfg")
-        let existingConfig = ModelConfig.parse(from: configURL)
-
-        // Detect invariants from symbols
-        let detectedInvariants = symbols.filter {
+    private func detectedModelInvariants() -> [String] {
+        symbols.filter {
             $0.name == "TypeOK" || $0.name == "TypeInvariant" ||
             $0.name.contains("Invariant") || $0.name.contains("Safe")
-        }.map { $0.name }
+        }
+        .map(\.name)
+    }
 
-        // Merge existing config with detected invariants
-        let constants = existingConfig?.constants ?? [:]
-        var invariants = existingConfig?.invariants ?? []
-        for inv in detectedInvariants {
-            if !invariants.contains(inv) {
-                invariants.append(inv)
+    @MainActor
+    func resolvedModelConfig(for specURL: URL? = nil, override overrideConfig: ModelConfig? = nil) -> ModelConfig {
+        let resolvedSpecURL = specURL ?? fileURL ?? URL(fileURLWithPath: "/tmp/untitled.tla")
+        let configURL = resolvedSpecURL.deletingPathExtension().appendingPathExtension("cfg")
+        let parsedConfig = ModelConfig.parse(from: configURL)
+        let settings = UserSettings.shared
+
+        var config = overrideConfig
+            ?? activeModelConfig
+            ?? modelConfigStore.selectedConfig?.config
+            ?? modelConfigStore.config(named: "Default")
+            ?? ModelConfig(
+                name: "Default",
+                specFile: resolvedSpecURL,
+                specification: parsedConfig?.specification,
+                initPredicate: parsedConfig?.initPredicate ?? "Init",
+                nextAction: parsedConfig?.nextAction ?? "Next",
+                constants: parsedConfig?.constants ?? [:],
+                invariants: parsedConfig?.invariants ?? [],
+                temporalProperties: parsedConfig?.temporalProperties ?? [],
+                stateConstraint: parsedConfig?.stateConstraint,
+                actionConstraint: parsedConfig?.actionConstraint,
+                symmetrySets: parsedConfig?.symmetrySets ?? [:],
+                workers: max(1, settings.tlcWorkers),
+                checkpointInterval: TimeInterval(max(5, settings.tlcCheckpointInterval) * 60),
+                checkpointEnabled: settings.tlcCheckpointEnabled
+            )
+
+        config.specFile = resolvedSpecURL
+
+        if config.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            config.name = "Default"
+        }
+
+        let specification = config.specification?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let initPredicate = config.initPredicate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextAction = config.nextAction.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if (specification == nil || specification?.isEmpty == true)
+            && initPredicate.isEmpty
+            && nextAction.isEmpty {
+            config.specification = parsedConfig?.specification
+            config.initPredicate = parsedConfig?.initPredicate ?? "Init"
+            config.nextAction = parsedConfig?.nextAction ?? "Next"
+        } else if specification == nil || specification?.isEmpty == true {
+            if initPredicate.isEmpty {
+                config.initPredicate = parsedConfig?.initPredicate ?? "Init"
+            }
+            if nextAction.isEmpty {
+                config.nextAction = parsedConfig?.nextAction ?? "Next"
             }
         }
 
-        // Create config
-        let config = ModelConfig(
-            name: "Default",
-            specFile: specURL,
-            initPredicate: existingConfig?.initPredicate ?? "Init",
-            nextAction: existingConfig?.nextAction ?? "Next",
-            constants: constants,
-            invariants: invariants,
-            temporalProperties: existingConfig?.temporalProperties ?? [],
-            stateConstraint: existingConfig?.stateConstraint,
-            actionConstraint: existingConfig?.actionConstraint,
-            workers: ProcessInfo.processInfo.activeProcessorCount
-        )
+        return config
+    }
 
-        // Cancel any existing watch task
-        tlcWatchTask?.cancel()
+    /// Run TLC model checker on this document
+    /// - Parameters:
+    ///   - config: Explicit model configuration to run. Falls back to the active/default config when nil.
+    ///   - binaryMode: TLC binary mode to use (default: uses document's selectedTLCMode)
+    @MainActor
+    func runModelCheck(
+        config overrideConfig: ModelConfig? = nil,
+        binaryMode: TLCProcessManager.TLCBinaryMode? = nil
+    ) {
+        let mode = binaryMode ?? selectedTLCMode
+        let specURL: URL
+        do {
+            specURL = try specURLForTooling()
+        } catch {
+            logger.error("Unable to prepare spec for TLC: \(error.localizedDescription)")
+            return
+        }
+
+        let config = resolvedModelConfig(for: specURL, override: overrideConfig)
+        activeModelConfig = config
+        lastTLCResult = nil
 
         // Create and start session with specified mode
         let session = TLCSession(specURL: specURL, config: config, binaryMode: mode)
-        self.tlcSession = session
+        replaceModelCheckSession(with: session)
         session.start()
-
-        // Watch for completion (store task for cleanup)
-        // The weak self check prevents orphaned loops if document deallocates
-        tlcWatchTask = Task { @MainActor [weak self] in
-            while session.isRunning {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                if Task.isCancelled { return }
-                // Exit if document deallocated (prevents orphaned loop)
-                guard self != nil else { return }
-            }
-            self?.lastTLCResult = session.result
-            self?.tlcWatchTask = nil
-        }
+        watchModelCheckSession(session)
     }
 
     /// Stop the current TLC session synchronously
@@ -495,42 +560,22 @@ final class TLADocument: NSDocument, ObservableObject {
     /// Run TLAPS proof checker on this document
     @MainActor
     func runProofCheck() {
-
-        // Get spec URL (save to temp if unsaved)
         let specURL: URL
-        if let fileURL = self.fileURL {
-            specURL = fileURL
-        } else {
-            do {
-                specURL = try SecureTempFile.create(prefix: moduleName, extension: "tla", content: content)
-            } catch {
-                return
-            }
+        do {
+            specURL = try specURLForTooling()
+        } catch {
+            logger.error("Unable to prepare spec for TLAPS: \(error.localizedDescription)")
+            return
         }
 
-        // Cancel any existing watch task
-        proofWatchTask?.cancel()
+        lastProofResult = nil
+        proofAnnotationManager.updateAnnotations(for: [])
 
         // Create and start session
-        let session = ProofSession(specURL: specURL)
-        self.proofSession = session
+        let session = ProofSession(specURL: specURL, options: currentProofCheckOptions())
+        replaceProofSession(with: session)
         session.start()
-
-        // Watch for completion (store task for cleanup)
-        // The weak self check prevents orphaned loops if document deallocates
-        proofWatchTask = Task { @MainActor [weak self] in
-            while session.isRunning {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                if Task.isCancelled { return }
-                // Exit if document deallocated (prevents orphaned loop)
-                guard let strongSelf = self else { return }
-                // Update annotations while running
-                strongSelf.proofAnnotationManager.updateAnnotations(for: session.obligations)
-            }
-            self?.lastProofResult = session.result
-            self?.proofAnnotationManager.updateAnnotations(for: session.obligations)
-            self?.proofWatchTask = nil
-        }
+        watchProofSession(session)
     }
 
     /// Check a single proof step at the current editor selection
@@ -540,18 +585,9 @@ final class TLADocument: NSDocument, ObservableObject {
             return
         }
 
-        // Get selection directly from the first responder text view
-        guard let window = NSApp.keyWindow,
-              let textView = window.firstResponder as? NSTextView else {
-            logger.debug("checkSelectionProofStep: No text view found")
-            return
-        }
-
-        let selection = textView.selectedRange()
-        let location = selection.location
-
+        let location = selectedRange.location
         guard location != NSNotFound else {
-            logger.debug("checkSelectionProofStep: No selection")
+            logger.debug("checkSelectionProofStep: Selection unavailable")
             return
         }
 
@@ -559,10 +595,11 @@ final class TLADocument: NSDocument, ObservableObject {
         logger.debug("checkSelectionProofStep: selection at line=\(line + 1), column=\(column + 1)")
 
         // Create or reuse session
-        let session = proofSession ?? ProofSession(specURL: fileURL)
+        let session = proofSession ?? ProofSession(specURL: fileURL, options: currentProofCheckOptions())
         if proofSession == nil {
             self.proofSession = session
         }
+        session.options = currentProofCheckOptions()
 
         session.checkStep(line: line + 1, column: column + 1) // Convert to 1-based
     }
@@ -585,6 +622,68 @@ final class TLADocument: NSDocument, ObservableObject {
         proofAnnotationManager.navigateToNextFailed()
     }
 
+    // MARK: - PlusCal Translation
+
+    /// Whether a PlusCal translation is currently in progress
+    @Published var isTranslatingPlusCal = false
+
+    /// Translate PlusCal algorithm in the current document
+    @MainActor
+    func translatePlusCal() {
+        guard !isTranslatingPlusCal else { return }
+
+        let originalContent = content
+        let originalSelection = selectedRange
+        isTranslatingPlusCal = true
+
+        Task { @MainActor in
+            defer { isTranslatingPlusCal = false }
+
+            let result = await PlusCalTranslator.shared.translate(
+                content: content,
+                specURL: fileURL
+            )
+
+            switch result {
+            case .success(let translatedContent):
+                content = translatedContent
+                selectedRange = PlusCalSourceMapping.remapSelection(
+                    originalSelection,
+                    from: originalContent,
+                    to: translatedContent
+                ) ?? originalSelection
+                logger.info("PlusCal translation applied successfully")
+
+            case .noChangeNeeded:
+                logger.info("PlusCal translation: no changes needed")
+
+            case .error(let message):
+                logger.error("PlusCal translation error: \(message)")
+                presentPlusCalTranslationError(message)
+            }
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func goToPlusCalAlgorithm() -> Bool {
+        guard let range = PlusCalSourceMapping.range(for: .algorithm, in: content) else {
+            return false
+        }
+        selectedRange = NSRange(location: range.location, length: 0)
+        return true
+    }
+
+    @MainActor
+    @discardableResult
+    func goToPlusCalTranslation() -> Bool {
+        guard let range = PlusCalSourceMapping.range(for: .translation, in: content) else {
+            return false
+        }
+        selectedRange = NSRange(location: range.location, length: 0)
+        return true
+    }
+
     // MARK: - Helper Methods
 
     private func detectLineEnding(in text: String) -> LineEnding {
@@ -600,6 +699,97 @@ final class TLADocument: NSDocument, ObservableObject {
                            " MODULE \(name) " +
                            String(repeating: "-", count: 32)
             content = content.replacingCharacters(in: range, with: newHeader)
+        }
+    }
+
+    private func currentProofCheckOptions() -> ProofCheckOptions {
+        let settings = UserSettings.shared
+        let backend = ProverBackend(rawValue: settings.defaultProverBackend)
+
+        return ProofCheckOptions(
+            backend: backend == .auto ? nil : backend,
+            timeout: TimeInterval(max(1, settings.defaultProverTimeout)),
+            threads: max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+        )
+    }
+
+    private func specURLForTooling() throws -> URL {
+        if let fileURL {
+            return fileURL
+        }
+
+        // TLA+ SANY rejects files whose basename doesn't match the `MODULE <name>` declaration,
+        // so the temp file must be named exactly `<moduleName>.tla` (not prefix-UUID.tla).
+        return try SecureTempFile.createWithExactName(
+            name: moduleName,
+            extension: "tla",
+            content: content
+        )
+    }
+
+    @MainActor
+    private func replaceModelCheckSession(with session: TLCSession) {
+        tlcWatchTask?.cancel()
+        tlcWatchTask = nil
+        tlcSession?.stop()
+        tlcSession = session
+    }
+
+    @MainActor
+    private func replaceProofSession(with session: ProofSession) {
+        proofWatchTask?.cancel()
+        proofWatchTask = nil
+        proofSession?.stop()
+        proofSession = session
+    }
+
+    @MainActor
+    private func watchModelCheckSession(_ session: TLCSession) {
+        tlcWatchTask = Task { @MainActor [weak self] in
+            while session.isRunning {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if Task.isCancelled { return }
+                guard self != nil else { return }
+            }
+            // Commit the final result only if this task is still the active watcher
+            // for the current session — guards against a stale task clobbering state
+            // after the user has already started a new run.
+            guard !Task.isCancelled,
+                  let self,
+                  self.tlcSession === session else { return }
+            self.lastTLCResult = session.result
+        }
+    }
+
+    @MainActor
+    private func watchProofSession(_ session: ProofSession) {
+        proofWatchTask = Task { @MainActor [weak self] in
+            while session.isRunning {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if Task.isCancelled { return }
+                guard let self, self.proofSession === session else { return }
+                self.proofAnnotationManager.updateAnnotations(for: session.obligations)
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.proofSession === session else { return }
+            self.lastProofResult = session.result
+            self.proofAnnotationManager.updateAnnotations(for: session.obligations)
+        }
+    }
+
+    @MainActor
+    private func presentPlusCalTranslationError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "PlusCal Translation Failed"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+
+        if let window = windowControllers.first?.window {
+            alert.beginSheetModal(for: window) { _ in }
+        } else {
+            alert.runModal()
         }
     }
 
@@ -621,90 +811,79 @@ final class TLADocument: NSDocument, ObservableObject {
     // MARK: - Public API
 
     /// Rebuilds the line offset index if content has changed. O(n) but only on content change.
-    private func rebuildLineIndexIfNeeded() {
+    private func rebuildLineIndexIfNeeded(using text: String? = nil) {
         guard lineIndexNeedsRebuild else { return }
 
-        lineStartOffsets = [0]
-        lineStartOffsets.reserveCapacity(content.count / 40 + 1) // Estimate ~40 chars per line
-
-        var offset = 0
-        for char in content {
-            offset += 1
-            if char == "\n" {
-                lineStartOffsets.append(offset)
-            }
-        }
-
+        let currentContent = text ?? content
+        let analysis = TextCoordinateMapper.analyze(currentContent)
+        lineStartOffsets = analysis.lineStartOffsets
+        contentIsASCII = analysis.isASCII
+        contentUTF16Length = analysis.utf16Length
         lineIndexNeedsRebuild = false
     }
 
-    /// Get the current line and column for a character offset.
-    /// Uses cached line index for O(log n) lookup instead of O(n) string splitting.
-    /// Returns (0, 0) for invalid offsets (negative or beyond content).
+    /// Get the current line and column for a UTF-16 editor offset.
+    /// Lines and columns are reported in logical Swift characters.
     func lineAndColumn(for offset: Int) -> (line: Int, column: Int) {
-        rebuildLineIndexIfNeeded()
+        let currentContent = content
+        rebuildLineIndexIfNeeded(using: currentContent)
 
-        // Validate input: clamp to valid range
-        let clampedOffset = max(0, min(offset, content.count))
-
-        // Handle empty content
-        guard !lineStartOffsets.isEmpty else {
-            return (0, 0)
+        if contentIsASCII {
+            let clampedOffset = max(0, min(offset, contentUTF16Length))
+            let line = TextCoordinateMapper.lineIndex(forUTF16Offset: clampedOffset, in: lineStartOffsets)
+            return (line, clampedOffset - lineStartOffsets[line])
         }
 
-        // Binary search for the largest line start <= offset
-        var low = 0
-        var high = lineStartOffsets.count - 1
-
-        while low < high {
-            let mid = (low + high + 1) / 2
-            if lineStartOffsets[mid] <= clampedOffset {
-                low = mid
-            } else {
-                high = mid - 1
-            }
-        }
-
-        let line = low  // 0-indexed line number
-        let column = clampedOffset - lineStartOffsets[line]  // Column is offset from line start
-        return (line, max(0, column))
+        return TextCoordinateMapper.lineAndColumn(
+            forUTF16Offset: offset,
+            in: currentContent,
+            lineStartOffsets: lineStartOffsets
+        )
     }
 
-    /// Get the character offset for a line and column.
-    /// Uses cached line index for O(1) lookup instead of O(n) line counting.
-    /// Returns clamped values for invalid inputs.
+    var totalLineCount: Int {
+        rebuildLineIndexIfNeeded(using: content)
+        return lineStartOffsets.count
+    }
+
+    /// Get the UTF-16 editor offset for a logical line and column.
     func offset(forLine line: Int, column: Int) -> Int {
-        rebuildLineIndexIfNeeded()
+        let currentContent = content
+        rebuildLineIndexIfNeeded(using: currentContent)
 
-        // Validate line: clamp negative values and beyond-end values
-        let clampedLine = max(0, line)
-        guard clampedLine < lineStartOffsets.count else {
-            // Line beyond end of document - return end of content
-            return content.count
+        if contentIsASCII {
+            let clampedLine = max(0, line)
+            guard clampedLine < lineStartOffsets.count else {
+                return contentUTF16Length
+            }
+
+            let lineStart = lineStartOffsets[clampedLine]
+            let lineEnd: Int
+            if clampedLine + 1 < lineStartOffsets.count {
+                lineEnd = max(lineStart, lineStartOffsets[clampedLine + 1] - 1)
+            } else {
+                lineEnd = contentUTF16Length
+            }
+
+            let clampedColumn = max(0, min(column, lineEnd - lineStart))
+            return lineStart + clampedColumn
         }
 
-        let lineStart = lineStartOffsets[clampedLine]
-
-        // Validate column: clamp negative values
-        let clampedColumn = max(0, column)
-
-        // Calculate line length to clamp column
-        let lineEnd: Int
-        if clampedLine + 1 < lineStartOffsets.count {
-            lineEnd = lineStartOffsets[clampedLine + 1] - 1  // -1 to exclude newline
-        } else {
-            lineEnd = content.count
-        }
-
-        let lineLength = max(0, lineEnd - lineStart)
-        return lineStart + min(clampedColumn, lineLength)
+        return TextCoordinateMapper.utf16Offset(
+            forLine: line,
+            column: column,
+            in: currentContent,
+            lineStartOffsets: lineStartOffsets
+        )
     }
 
     // MARK: - Go To Definition
 
-    /// Navigate to the definition of the symbol at the given character offset
-    /// Returns true if a definition was found and navigated to
+    /// Navigate to the definition of the symbol at the given character offset.
+    /// First checks local definitions, then tries cross-module navigation for EXTENDS'd modules.
+    /// Returns true if a definition was found and navigated to.
     @MainActor
+    @discardableResult
     func goToDefinition(at characterOffset: Int) -> Bool {
         let (line, column) = lineAndColumn(for: characterOffset)
         let position = TLAPosition(line: UInt32(line), column: UInt32(column))
@@ -714,19 +893,109 @@ final class TLADocument: NSDocument, ObservableObject {
             return false
         }
 
-        // Find the definition
-        guard let definitionRange = TLACoreWrapper.shared.findDefinition(named: word, in: symbols) else {
-            return false
+        // Try local definition first
+        if let definitionRange = TLACoreWrapper.shared.findDefinition(named: word, in: symbols) {
+            let targetOffset = offset(forLine: Int(definitionRange.start.line), column: Int(definitionRange.start.column))
+            selectedRange = NSRange(location: targetOffset, length: 0)
+            delegate?.documentDidNavigate(self, to: definitionRange)
+            return true
         }
 
-        // Navigate to the definition
-        let targetOffset = offset(forLine: Int(definitionRange.start.line), column: Int(definitionRange.start.column))
-        selectedRange = NSRange(location: targetOffset, length: 0)
+        // Check if the word is an EXTENDS'd module name — try to open it.
+        if Self.extendedModuleNames(in: content).contains(word) {
+            let specDir = fileURL?.deletingLastPathComponent()
+            if let moduleURL = BinaryDiscovery.findModule(named: word, specDirectory: specDir) {
+                NSDocumentController.shared.openDocument(
+                    withContentsOf: moduleURL,
+                    display: true
+                ) { _, _, _ in }
+                return true
+            }
+        }
 
-        // Notify delegate to scroll to the position
-        delegate?.documentDidNavigate(self, to: definitionRange)
+        return false
+    }
 
-        return true
+    static func extendedModuleNames(in content: String) -> Set<String> {
+        var moduleNames = Set<String>()
+        var collectingContinuation = false
+
+        for rawLine in content.components(separatedBy: .newlines) {
+            let line = strippingLineComment(from: rawLine)
+
+            if let extendsRange = line.range(
+                of: #"\bEXTENDS\b"#,
+                options: .regularExpression
+            ) {
+                let fragment = String(line[extendsRange.upperBound...])
+                collectingContinuation = collectExtendedModuleNames(
+                    from: fragment,
+                    into: &moduleNames
+                )
+                continue
+            }
+
+            guard collectingContinuation else { continue }
+
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                continue
+            }
+
+            guard isValidExtendsContinuation(trimmed) else {
+                collectingContinuation = false
+                continue
+            }
+
+            collectingContinuation = collectExtendedModuleNames(
+                from: trimmed,
+                into: &moduleNames
+            )
+        }
+
+        return moduleNames
+    }
+
+    private static func strippingLineComment(from line: String) -> String {
+        line.components(separatedBy: "\\*").first ?? line
+    }
+
+    private static func collectExtendedModuleNames(
+        from fragment: String,
+        into moduleNames: inout Set<String>
+    ) -> Bool {
+        let trimmed = fragment.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+
+        let endsWithComma = trimmed.hasSuffix(",")
+        let candidates = trimmed
+            .split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+
+        guard !candidates.isEmpty else { return false }
+
+        for candidate in candidates where isValidModuleIdentifier(candidate) {
+            moduleNames.insert(candidate)
+        }
+
+        return endsWithComma
+    }
+
+    private static func isValidExtendsContinuation(_ line: String) -> Bool {
+        let candidates = line
+            .split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+
+        guard !candidates.isEmpty else { return false }
+        return candidates.allSatisfy(isValidModuleIdentifier)
+    }
+
+    private static func isValidModuleIdentifier(_ candidate: String) -> Bool {
+        guard !candidate.isEmpty else { return false }
+        return candidate.range(
+            of: #"^[A-Za-z_][A-Za-z0-9_]*$"#,
+            options: .regularExpression
+        ) != nil
     }
 
     /// Get the symbol at a given character offset, if any

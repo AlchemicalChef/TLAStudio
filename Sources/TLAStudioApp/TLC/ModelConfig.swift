@@ -3,13 +3,15 @@ import Foundation
 // MARK: - Model Configuration
 
 /// Configuration for TLC model checking
-struct ModelConfig: Codable, Identifiable, Sendable {
-    let id: UUID
+struct ModelConfig: Codable, Identifiable, Sendable, Equatable {
+    var id: UUID
     var name: String
+    var comment: String
 
     // Specification
     var specFile: URL
     var configFile: URL?
+    var specification: String?
 
     // Init and Next (required for TLC)
     var initPredicate: String
@@ -50,8 +52,10 @@ struct ModelConfig: Codable, Identifiable, Sendable {
     init(
         id: UUID = UUID(),
         name: String = "Default",
+        comment: String = "",
         specFile: URL,
         configFile: URL? = nil,
+        specification: String? = nil,
         initPredicate: String = "Init",
         nextAction: String = "Next",
         constants: [String: ConstantValue] = [:],
@@ -73,8 +77,10 @@ struct ModelConfig: Codable, Identifiable, Sendable {
     ) {
         self.id = id
         self.name = name
+        self.comment = comment
         self.specFile = specFile
         self.configFile = configFile
+        self.specification = specification
         self.initPredicate = initPredicate
         self.nextAction = nextAction
         self.constants = constants
@@ -313,6 +319,22 @@ struct ModelCheckResult {
         }
         return errorTrace?.states.count ?? 0
     }
+
+    func withSuggestJVMRetry(_ suggestJVMRetry: Bool) -> ModelCheckResult {
+        ModelCheckResult(
+            sessionId: sessionId,
+            success: success,
+            statesFound: statesFound,
+            distinctStates: distinctStates,
+            duration: duration,
+            coverage: coverage,
+            errorTrace: errorTrace,
+            message: message,
+            lazyErrorTrace: lazyErrorTrace,
+            outOfMemory: outOfMemory,
+            suggestJVMRetry: suggestJVMRetry
+        )
+    }
 }
 
 // MARK: - Config File Generation
@@ -352,12 +374,17 @@ extension ModelConfig {
         lines.append("\\* Model: \(name)")
         lines.append("")
 
-        // Init and Next (required) — must be valid identifiers
-        if let sanitizedInit = Self.sanitizeTLCExpression(initPredicate) {
-            lines.append("INIT \(sanitizedInit)")
-        }
-        if let sanitizedNext = Self.sanitizeTLCExpression(nextAction) {
-            lines.append("NEXT \(sanitizedNext)")
+        // A model uses either SPECIFICATION or INIT/NEXT.
+        if let specification, !specification.isEmpty,
+           let sanitizedSpecification = Self.sanitizeTLCExpression(specification) {
+            lines.append("SPECIFICATION \(sanitizedSpecification)")
+        } else {
+            if let sanitizedInit = Self.sanitizeTLCExpression(initPredicate) {
+                lines.append("INIT \(sanitizedInit)")
+            }
+            if let sanitizedNext = Self.sanitizeTLCExpression(nextAction) {
+                lines.append("NEXT \(sanitizedNext)")
+            }
         }
         lines.append("")
 
@@ -482,6 +509,11 @@ extension ModelConfig {
                 result.stateConstraint = String(trimmed.dropFirst(11)).trimmingCharacters(in: .whitespaces)
             } else if trimmed.hasPrefix("ACTION_CONSTRAINT ") {
                 result.actionConstraint = String(trimmed.dropFirst(18)).trimmingCharacters(in: .whitespaces)
+            } else if trimmed.hasPrefix("SYMMETRY ") {
+                let setName = String(trimmed.dropFirst(9)).trimmingCharacters(in: .whitespaces)
+                if !setName.isEmpty {
+                    result.symmetrySets[setName] = []
+                }
             } else if trimmed.hasPrefix("CONSTANT ") || trimmed.hasPrefix("CONSTANTS") {
                 // Parse CONSTANT name = value or CONSTANTS block
                 parseConstants(from: trimmed, into: &result)
@@ -523,8 +555,11 @@ extension ModelConfig {
         result.constants[name] = value
     }
 
-    private static func parseConstantValue(_ str: String) -> ConstantValue {
+    static func parseConstantValue(_ str: String) -> ConstantValue {
         let trimmed = str.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else {
+            return .string("")
+        }
 
         // Try integer
         if let intVal = Int(trimmed) {
@@ -539,14 +574,112 @@ extension ModelConfig {
             return .bool(false)
         }
 
-        // Set like {a, b, c} or {1, 2, 3}
-        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
-            // For model values, keep as string for now
-            return .modelValue(trimmed)
+        // Quoted string
+        if trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"") && trimmed.count >= 2 {
+            let start = trimmed.index(after: trimmed.startIndex)
+            let end = trimmed.index(before: trimmed.endIndex)
+            return .string(unescapeStringLiteral(String(trimmed[start..<end])))
         }
 
-        // Default to string/model value
-        return .string(trimmed)
+        // Set like {a, b, c} or {1, 2, 3}
+        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
+            let bodyStart = trimmed.index(after: trimmed.startIndex)
+            let bodyEnd = trimmed.index(before: trimmed.endIndex)
+            let body = String(trimmed[bodyStart..<bodyEnd])
+            let elements = splitTopLevelSetElements(in: body).map { parseConstantValue($0) }
+            return .set(elements)
+        }
+
+        // Preserve bare identifiers and expressions without introducing quotes on rewrite.
+        return .modelValue(trimmed)
+    }
+
+    private static func unescapeStringLiteral(_ value: String) -> String {
+        var result = ""
+        var isEscaping = false
+
+        for character in value {
+            if isEscaping {
+                switch character {
+                case "\\":
+                    result.append("\\")
+                case "\"":
+                    result.append("\"")
+                case "n":
+                    result.append("\n")
+                case "r":
+                    result.append("\r")
+                case "t":
+                    result.append("\t")
+                default:
+                    result.append(character)
+                }
+                isEscaping = false
+            } else if character == "\\" {
+                isEscaping = true
+            } else {
+                result.append(character)
+            }
+        }
+
+        if isEscaping {
+            result.append("\\")
+        }
+
+        return result
+    }
+
+    private static func splitTopLevelSetElements(in body: String) -> [String] {
+        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+
+        var elements: [String] = []
+        var current = ""
+        var braceDepth = 0
+        var inString = false
+        var isEscaping = false
+
+        for character in body {
+            if inString {
+                current.append(character)
+                if isEscaping {
+                    isEscaping = false
+                } else if character == "\\" {
+                    isEscaping = true
+                } else if character == "\"" {
+                    inString = false
+                }
+                continue
+            }
+
+            switch character {
+            case "\"":
+                inString = true
+                current.append(character)
+            case "{":
+                braceDepth += 1
+                current.append(character)
+            case "}":
+                braceDepth = max(0, braceDepth - 1)
+                current.append(character)
+            case "," where braceDepth == 0:
+                let trimmedElement = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedElement.isEmpty {
+                    elements.append(trimmedElement)
+                }
+                current.removeAll(keepingCapacity: true)
+            default:
+                current.append(character)
+            }
+        }
+
+        let trailingElement = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trailingElement.isEmpty {
+            elements.append(trailingElement)
+        }
+
+        return elements
     }
 
     /// Parsed configuration from a .cfg file
@@ -559,5 +692,6 @@ extension ModelConfig {
         var temporalProperties: [String] = []
         var stateConstraint: String?
         var actionConstraint: String?
+        var symmetrySets: [String: [String]] = [:]
     }
 }

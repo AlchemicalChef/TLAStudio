@@ -9,6 +9,42 @@ private let logger = Log.logger(category: "BinaryDiscovery")
 /// TLAPMProcessManager, and GraphvizProcessManager into a single utility.
 enum BinaryDiscovery {
 
+    private static var developmentProjectRoot: URL? {
+        let fileURL = URL(fileURLWithPath: #filePath)
+        let root = fileURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        guard FileManager.default.fileExists(atPath: root.appendingPathComponent("Package.swift").path) else {
+            return nil
+        }
+        return root
+    }
+
+    static func findDevelopmentFile(relativePath: String) -> URL? {
+        guard let root = developmentProjectRoot else {
+            return nil
+        }
+        let candidate = root.appendingPathComponent(relativePath)
+        return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+    }
+
+    static func configuredModuleLibraryDirectories() -> [URL] {
+        UserSettings.existingModuleLibraryFolders(
+            from: UserDefaults.standard.stringArray(forKey: UserSettings.Keys.moduleLibraryFolders) ?? []
+        )
+        .map { URL(fileURLWithPath: $0) }
+    }
+
+    static func configuredTLALibraryPropertyValue() -> String? {
+        let paths = configuredModuleLibraryDirectories().map(\.path)
+        guard !paths.isEmpty else {
+            return nil
+        }
+        return paths.joined(separator: ":")
+    }
+
     /// Options controlling where to search for binaries.
     struct SearchOptions {
         /// Subdirectories to check within bundle resource paths (e.g., `["bin", "Provers"]`).
@@ -173,6 +209,118 @@ enum BinaryDiscovery {
         }
 
         logger.warning("Binary '\(name)' not found in any location")
+        return nil
+    }
+
+    /// Search for a TLA+ module file by name.
+    ///
+    /// Search order:
+    /// 1. Same directory as the current spec file
+    /// 2. Standard library locations (TLC resource bundle)
+    /// 3. User-installed modules (`~/.tlaplus/`, `~/.tla/`)
+    /// 4. System paths (`/usr/local/share/tla+/`)
+    ///
+    /// - Parameters:
+    ///   - name: Module name (without `.tla` extension)
+    ///   - specDirectory: The directory of the current spec file (searched first)
+    /// - Returns: URL to the module file if found
+    static func findModule(named name: String, specDirectory: URL? = nil) -> URL? {
+        // Validate module name: TLA+ identifiers are alphanumeric + underscore.
+        // Reject anything else to prevent path traversal via crafted EXTENDS lines.
+        let validPattern = #"^[A-Za-z_][A-Za-z0-9_]*$"#
+        guard name.range(of: validPattern, options: .regularExpression) != nil else {
+            logger.warning("Rejecting invalid module name: \(name)")
+            return nil
+        }
+
+        let fileName = "\(name).tla"
+        let fm = FileManager.default
+
+        // 1. Same directory as current spec
+        if let specDir = specDirectory {
+            let localPath = specDir.appendingPathComponent(fileName)
+            if fm.fileExists(atPath: localPath.path) {
+                logger.debug("Found module \(name) in spec directory: \(localPath.path)")
+                return localPath
+            }
+        }
+
+        // 2. User-configured library folders
+        for directory in configuredModuleLibraryDirectories() {
+            let libraryPath = directory.appendingPathComponent(fileName)
+            if fm.fileExists(atPath: libraryPath.path) {
+                logger.debug("Found module \(name) in configured library: \(libraryPath.path)")
+                return libraryPath
+            }
+        }
+
+        // 3. Bundle resources (standard library modules)
+        if let url = Bundle.main.url(forResource: name, withExtension: "tla") {
+            logger.debug("Found module \(name) in bundle: \(url.path)")
+            return url
+        }
+
+        // Check known resource subdirectories used by the app bundle.
+        if let resourcePath = Bundle.main.resourcePath {
+            let resourceDirectories = [
+                "modules",
+                "StandardModules",
+                "lib/tlapm/stdlib"
+            ]
+            for directory in resourceDirectories {
+                let modulesPath = URL(fileURLWithPath: resourcePath)
+                    .appendingPathComponent(directory)
+                    .appendingPathComponent(fileName)
+                if fm.fileExists(atPath: modulesPath.path) {
+                    logger.debug("Found module \(name) in Resources/\(directory): \(modulesPath.path)")
+                    return modulesPath
+                }
+            }
+        }
+
+        // Development checkout fallback for `swift run` / test builds.
+        let developmentPaths = [
+            "Resources/StandardModules/\(fileName)",
+            "Scripts/tlapm/library/\(fileName)"
+        ]
+        for relativePath in developmentPaths {
+            if let path = findDevelopmentFile(relativePath: relativePath) {
+                logger.debug("Found module \(name) in development path: \(path.path)")
+                return path
+            }
+        }
+
+        // 4. User-installed locations
+        let home = fm.homeDirectoryForCurrentUser
+        let userPaths = [
+            home.appendingPathComponent(".tlaplus").appendingPathComponent(fileName),
+            home.appendingPathComponent(".tla").appendingPathComponent(fileName),
+            home.appendingPathComponent(".tlaplus/modules").appendingPathComponent(fileName),
+        ]
+
+        for path in userPaths {
+            if fm.fileExists(atPath: path.path) {
+                logger.debug("Found module \(name) at user path: \(path.path)")
+                return path
+            }
+        }
+
+        // 5. System paths
+        let systemPaths = [
+            "/usr/local/share/tla+/\(fileName)",
+            "/usr/local/share/tla+/modules/\(fileName)",
+            "/opt/homebrew/share/tla+/\(fileName)",
+            "/opt/homebrew/share/tla+/modules/\(fileName)"
+        ]
+
+        for path in systemPaths {
+            if fm.fileExists(atPath: path) {
+                logger.debug("Found module \(name) at system path: \(path)")
+                return URL(fileURLWithPath: path)
+            }
+        }
+
+        logger.debug("Module '\(name)' not found in any location")
         return nil
     }
 }

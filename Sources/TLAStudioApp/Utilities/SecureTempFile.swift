@@ -147,6 +147,84 @@ enum SecureTempFile {
         return fileURL
     }
 
+    /// Creates a secure temp file with an *exact* filename (no UUID suffix) by placing it
+    /// inside a unique per-call subdirectory. Required when an external tool enforces
+    /// `filename == moduleName` (e.g., TLA+ SANY rejects `MyModule-<UUID>.tla`).
+    ///
+    /// - Parameters:
+    ///   - name: Exact filename base (no extension), e.g. `"MutualExclusion"`.
+    ///   - extension: File extension, e.g. `"tla"`.
+    ///   - content: Text content to write.
+    /// - Returns: URL to the created file at `<tempDir>/<UUID>/<name>.<ext>`.
+    static func createWithExactName(
+        name: String,
+        extension ext: String,
+        content: String
+    ) throws -> URL {
+        try ensureSecureDirectory()
+
+        let sanitized = sanitizeFilename(name)
+        guard !sanitized.isEmpty else {
+            throw Error.fileCreationFailed(NSError(
+                domain: "SecureTempFile", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Exact-name file requires a non-empty name after sanitization"]
+            ))
+        }
+
+        // Per-call subdirectory isolates the stable filename from collisions with other runs.
+        let subdirectory = secureTempDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: subdirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            throw Error.directoryCreationFailed(error)
+        }
+
+        let fileURL = subdirectory.appendingPathComponent("\(sanitized).\(ext)")
+
+        let fd = fileURL.path.withCString { path in
+            open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        }
+
+        guard fd >= 0 else {
+            let error = NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                              userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+            try? FileManager.default.removeItem(at: subdirectory)
+            throw Error.fileCreationFailed(error)
+        }
+
+        defer { Darwin.close(fd) }
+
+        guard let data = content.data(using: .utf8) else {
+            try? FileManager.default.removeItem(at: subdirectory)
+            throw Error.writeError(NSError(domain: "SecureTempFile", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to encode content as UTF-8"]))
+        }
+
+        guard !data.isEmpty else {
+            logger.debug("Created empty secure temp file: \(fileURL.path)")
+            return fileURL
+        }
+
+        let bytesWritten = data.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return -1 }
+            return write(fd, baseAddress, data.count)
+        }
+
+        guard bytesWritten == data.count else {
+            try? FileManager.default.removeItem(at: subdirectory)
+            let error = NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                              userInfo: [NSLocalizedDescriptionKey: "Write incomplete: \(bytesWritten)/\(data.count) bytes"])
+            throw Error.writeError(error)
+        }
+
+        logger.debug("Created secure temp file with exact name: \(fileURL.path)")
+        return fileURL
+    }
+
     /// Cleans up a secure temp file.
     /// - Parameter url: URL of the file to remove
     static func cleanup(_ url: URL) {

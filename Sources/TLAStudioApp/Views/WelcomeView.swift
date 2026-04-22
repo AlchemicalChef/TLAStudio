@@ -4,113 +4,133 @@ import SwiftUI
 
 /// Welcome screen shown on first launch
 struct WelcomeView: View {
-    @Environment(\.dismiss) private var dismiss
     @AppStorage(UserSettings.Keys.showWelcomeOnLaunch) private var showWelcomeOnLaunch = true
+
+    /// Close the welcome window (dismiss() doesn't work in NSHostingView-hosted views)
+    private func closeWindow() {
+        WelcomeWindowController.shared.window?.close()
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            VStack(spacing: 16) {
+            VStack(spacing: 12) {
                 Image(systemName: "doc.text.magnifyingglass")
-                    .font(.system(size: 64))
+                    .font(.system(size: 48))
                     .foregroundColor(.accentColor)
 
                 Text("Welcome to TLA+ Studio")
-                    .font(.largeTitle.bold())
+                    .font(.title.bold())
 
                 Text("A native macOS IDE for TLA+ specifications")
-                    .font(.title3)
+                    .font(.subheadline)
                     .foregroundColor(.secondary)
             }
-            .padding(.top, 40)
-            .padding(.bottom, 32)
+            .padding(.top, 24)
+            .padding(.bottom, 16)
 
             Divider()
 
-            // Quick actions
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Get Started")
-                    .font(.headline)
-                    .padding(.horizontal, 24)
-                    .padding(.top, 20)
-                    .padding(.bottom, 12)
+            // Two-column layout: Templates + Recent Files
+            HStack(alignment: .top, spacing: 0) {
+                // Left: Template gallery
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("New from Template")
+                        .font(.headline)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, 8)
 
-                WelcomeActionButton(
-                    icon: "doc.badge.plus",
-                    title: "New Specification",
-                    description: "Create a new TLA+ specification from scratch",
-                    shortcut: "N"
-                ) {
-                    dismiss()
-                    NSDocumentController.shared.newDocument(nil)
-                }
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(DocumentTemplate.grouped, id: \.category) { group in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(group.category)
+                                        .font(.caption.bold())
+                                        .foregroundColor(.secondary)
+                                        .textCase(.uppercase)
 
-                WelcomeActionButton(
-                    icon: "folder",
-                    title: "Open Specification",
-                    description: "Open an existing .tla file",
-                    shortcut: "O"
-                ) {
-                    dismiss()
-                    NSDocumentController.shared.openDocument(nil)
-                }
-
-                WelcomeActionButton(
-                    icon: "doc.on.doc",
-                    title: "Open Recent",
-                    description: "Open a recently edited specification",
-                    shortcut: nil
-                ) {
-                    // Show recent documents menu
-                    if let recentURLs = NSDocumentController.shared.recentDocumentURLs.first {
-                        dismiss()
-                        NSDocumentController.shared.openDocument(withContentsOf: recentURLs, display: true) { _, _, _ in }
+                                    LazyVGrid(columns: [
+                                        GridItem(.flexible(), spacing: 8),
+                                        GridItem(.flexible(), spacing: 8)
+                                    ], spacing: 8) {
+                                        ForEach(group.templates, id: \.rawValue) { template in
+                                            TemplateCard(template: template) {
+                                                closeWindow()
+                                                if let controller = NSDocumentController.shared as? TLADocumentController {
+                                                    controller.newDocument(from: template)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
                     }
                 }
+                .frame(maxWidth: .infinity)
+
+                Divider()
+
+                // Right: Recent files + Quick actions
+                VStack(alignment: .leading, spacing: 0) {
+                    // Quick actions
+                    HStack(spacing: 8) {
+                        Button {
+                            closeWindow()
+                            NSDocumentController.shared.newDocument(nil)
+                        } label: {
+                            Label("New", systemImage: "doc.badge.plus")
+                        }
+                        .keyboardShortcut("n")
+
+                        Button {
+                            closeWindow()
+                            NSDocumentController.shared.openDocument(nil)
+                        } label: {
+                            Label("Open", systemImage: "folder")
+                        }
+                        .keyboardShortcut("o")
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+                    .padding(.bottom, 8)
+
+                    Text("Recent Files")
+                        .font(.headline)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+
+                    let recentURLs = NSDocumentController.shared.recentDocumentURLs
+
+                    if recentURLs.isEmpty {
+                        Text("No recent files")
+                            .foregroundColor(.secondary)
+                            .font(.caption)
+                            .padding(.horizontal, 16)
+                        Spacer()
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(recentURLs, id: \.absoluteString) { url in
+                                    RecentFileRow(url: url) {
+                                        closeWindow()
+                                        NSDocumentController.shared.openDocument(
+                                            withContentsOf: url, display: true
+                                        ) { _, _, _ in }
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                        }
+                    }
+                }
+                .frame(width: 220)
             }
 
             Divider()
-                .padding(.top, 16)
-
-            // Features overview
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Features")
-                    .font(.headline)
-                    .padding(.horizontal, 24)
-                    .padding(.top, 20)
-                    .padding(.bottom, 12)
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 16) {
-                        FeatureCard(
-                            icon: "play.fill",
-                            title: "Model Checking",
-                            description: "Run TLC to verify your specifications"
-                        )
-
-                        FeatureCard(
-                            icon: "checkmark.seal",
-                            title: "Proof Verification",
-                            description: "Check proofs with TLAPS"
-                        )
-
-                        FeatureCard(
-                            icon: "arrow.triangle.2.circlepath",
-                            title: "PlusCal Translation",
-                            description: "Translate PlusCal algorithms to TLA+"
-                        )
-
-                        FeatureCard(
-                            icon: "text.magnifyingglass",
-                            title: "Syntax Highlighting",
-                            description: "Rich editor with TLA+ syntax support"
-                        )
-                    }
-                    .padding(.horizontal, 24)
-                }
-            }
-
-            Spacer()
 
             // Footer
             HStack {
@@ -120,14 +140,15 @@ struct WelcomeView: View {
                 Spacer()
 
                 Button("Get Started") {
-                    dismiss()
+                    closeWindow()
                     NSDocumentController.shared.newDocument(nil)
                 }
                 .buttonStyle(.borderedProminent)
             }
-            .padding(24)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
         }
-        .frame(width: 600, height: 550)
+        .frame(width: 700, height: 550)
         .background(Color(NSColor.windowBackgroundColor))
     }
 }
@@ -185,31 +206,78 @@ private struct WelcomeActionButton: View {
     }
 }
 
-// MARK: - Feature Card
+// MARK: - Template Card
 
-private struct FeatureCard: View {
-    let icon: String
-    let title: String
-    let description: String
+private struct TemplateCard: View {
+    let template: DocumentTemplate
+    let action: () -> Void
+
+    @State private var isHovered = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Image(systemName: icon)
-                .font(.title)
-                .foregroundColor(.accentColor)
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: template.icon)
+                    .font(.title3)
+                    .foregroundColor(.accentColor)
+                    .frame(width: 24)
 
-            Text(title)
-                .font(.headline)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(template.displayName)
+                        .font(.caption.bold())
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
 
-            Text(description)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(2)
+                    Text(template.description)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(isHovered ? Color.accentColor.opacity(0.1) : Color(NSColor.controlBackgroundColor))
+            .cornerRadius(6)
         }
-        .frame(width: 140, alignment: .leading)
-        .padding(12)
-        .background(Color(NSColor.controlBackgroundColor))
-        .cornerRadius(8)
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+}
+
+// MARK: - Recent File Row
+
+private struct RecentFileRow: View {
+    let url: URL
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(url.deletingPathExtension().lastPathComponent)
+                    .font(.caption.bold())
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+
+                Text(url.deletingLastPathComponent().path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(isHovered ? Color.accentColor.opacity(0.1) : Color.clear)
+            .cornerRadius(4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
     }
 }
 
@@ -221,7 +289,7 @@ final class WelcomeWindowController: NSWindowController {
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 550),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 550),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -239,18 +307,6 @@ final class WelcomeWindowController: NSWindowController {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
-    }
-
-    func showIfNeeded() {
-        let showWelcome = UserDefaults.standard.bool(forKey: UserSettings.Keys.showWelcomeOnLaunch)
-        // Default to true if not set
-        if !UserDefaults.standard.bool(forKey: "welcomeShownBefore") {
-            UserDefaults.standard.set(true, forKey: UserSettings.Keys.showWelcomeOnLaunch)
-            UserDefaults.standard.set(true, forKey: "welcomeShownBefore")
-            show()
-        } else if showWelcome {
-            show()
-        }
     }
 
     func show() {

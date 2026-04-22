@@ -25,6 +25,10 @@ final class FoldingGutterOverlay: NSView {
 
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
+        // Clip drawing to the overlay's own bounds. Without this, disclosure triangles
+        // computed at stale Y positions (e.g. during a bottom-panel resize) can leak
+        // outside the editor region and render over the bottom bar.
+        layer?.masksToBounds = true
 
         // Observe text changes
         NotificationCenter.default.addObserver(

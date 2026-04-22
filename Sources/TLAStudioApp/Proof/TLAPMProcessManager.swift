@@ -24,12 +24,38 @@ actor TLAPMProcessManager {
 
     // MARK: - Binary Discovery
 
+    private func configuredExecutableURL(
+        forKey key: String,
+        appending executableSuffix: String? = nil
+    ) -> URL? {
+        let configuredPath = UserDefaults.standard.string(forKey: key)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !configuredPath.isEmpty else { return nil }
+
+        var url = URL(fileURLWithPath: configuredPath)
+        if let executableSuffix {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                url.appendPathComponent(executableSuffix)
+            }
+        }
+
+        guard FileManager.default.fileExists(atPath: url.path),
+              FileManager.default.isExecutableFile(atPath: url.path) else {
+            return nil
+        }
+        return url
+    }
+
     /// Path to TLAPM binary
     private var tlapmPath: URL? {
-        BinaryDiscovery.find(
+        if let configured = configuredExecutableURL(forKey: UserSettings.Keys.tlapmPath) {
+            return configured
+        }
+        return BinaryDiscovery.find(
             named: "tlapm",
             options: .init(
-                bundleSubdirectories: ["bin"],
+                bundleSubdirectories: ["bin", "Provers"],
                 systemPaths: ["/usr/local/bin", "/opt/homebrew/bin"],
                 homeRelativePaths: [".tla"]
             )
@@ -70,6 +96,26 @@ actor TLAPMProcessManager {
         return nil
     }
 
+    private var configuredModuleLibraryPaths: [URL] {
+        BinaryDiscovery.configuredModuleLibraryDirectories()
+    }
+
+    private func appendLibrarySearchPaths(to args: inout [String], includeStdlib: Bool = true) {
+        var seen = Set<String>()
+
+        for libraryPath in configuredModuleLibraryPaths {
+            guard seen.insert(libraryPath.standardizedFileURL.path).inserted else { continue }
+            args.append("-I")
+            args.append(libraryPath.path)
+        }
+
+        if includeStdlib, let stdlib = stdlibPath,
+           seen.insert(stdlib.standardizedFileURL.path).inserted {
+            args.append("-I")
+            args.append(stdlib.path)
+        }
+    }
+
     // MARK: - Prover Discovery
 
     /// Discovered paths to backend provers
@@ -77,6 +123,8 @@ actor TLAPMProcessManager {
 
     /// Discover paths to backend provers
     private func discoverProvers() {
+        proverPaths.removeAll()
+
         let provers: [(ProverBackend, String)] = [
             (.zenon, "zenon"),
             (.z3, "z3"),
@@ -94,10 +142,32 @@ actor TLAPMProcessManager {
     }
 
     private func findProverBinary(named name: String) -> URL? {
-        BinaryDiscovery.find(
+        switch name {
+        case "zenon":
+            if let configured = configuredExecutableURL(forKey: UserSettings.Keys.zenonPath) {
+                return configured
+            }
+        case "z3":
+            if let configured = configuredExecutableURL(forKey: UserSettings.Keys.z3Path) {
+                return configured
+            }
+        case "isabelle":
+            if let configured = configuredExecutableURL(
+                forKey: UserSettings.Keys.isabellePath,
+                appending: "bin/isabelle"
+            ) {
+                return configured
+            }
+        default:
+            break
+        }
+
+        return BinaryDiscovery.find(
             named: name,
             options: .init(
-                bundleSubdirectories: ["Provers"],
+                // Resource layout migrated from `lib/tlapm/backends/bin/` to a flat `bin/` dir;
+                // check all three so either layout works until the bundle is fully normalized.
+                bundleSubdirectories: ["bin", "Provers", "lib/tlapm/backends/bin"],
                 systemPaths: ["/usr/local/bin", "/opt/homebrew/bin"],
                 homeRelativePaths: [".tla/provers"]
             )
@@ -106,17 +176,13 @@ actor TLAPMProcessManager {
 
     /// Get available provers
     func availableProvers() -> [ProverBackend] {
-        if proverPaths.isEmpty {
-            discoverProvers()
-        }
+        discoverProvers()
         return Array(proverPaths.keys).sorted { $0.rawValue < $1.rawValue }
     }
 
     /// Check if a specific prover is available
     func isProverAvailable(_ prover: ProverBackend) -> Bool {
-        if proverPaths.isEmpty {
-            discoverProvers()
-        }
+        discoverProvers()
         return proverPaths[prover] != nil
     }
 
@@ -208,7 +274,8 @@ actor TLAPMProcessManager {
             stdoutHandle.readabilityHandler = { [weak parser, weak streamState] handle in
                 let data = handle.availableData
                 if data.isEmpty {
-                    // EOF reached
+                    // EOF reached. Self-clear the handler so a closed pipe can't keep firing.
+                    handle.readabilityHandler = nil
                     return
                 }
                 guard let parser = parser, let state = streamState else { return }
@@ -232,7 +299,10 @@ actor TLAPMProcessManager {
 
             stderrHandle.readabilityHandler = { [weak parser, weak streamState] handle in
                 let data = handle.availableData
-                if data.isEmpty { return }
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
+                }
 
                 guard let parser = parser, let state = streamState else { return }
 
@@ -400,11 +470,7 @@ actor TLAPMProcessManager {
         // Build arguments for single step
         var arguments: [String] = []
 
-        // Add TLAPS standard library path
-        if let stdlib = stdlibPath {
-            arguments.append("-I")
-            arguments.append(stdlib.path)
-        }
+        appendLibrarySearchPaths(to: &arguments)
 
         // Toolbox mode with line range (check just this line)
         arguments.append("--toolbox")
@@ -503,11 +569,16 @@ actor TLAPMProcessManager {
             throw TLAPMError.failedToStart(error)
         }
 
-        // Wait for process to complete using async termination handler
-        let exitStatus = await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
-            process.terminationHandler = { terminatedProcess in
-                continuation.resume(returning: terminatedProcess.terminationStatus)
-            }
+        let exitStatus: Int32
+        do {
+            exitStatus = try await Self.waitForExit(of: process, timeout: timeout)
+        } catch {
+            stdoutHandle.readabilityHandler = nil
+            stderrHandle.readabilityHandler = nil
+            ProcessRegistry.shared.terminate(sessionId)
+            activeProcesses.removeValue(forKey: sessionId)
+            logger.error("checkSingleStep: Process timed out after \(String(format: "%.1f", timeout))s")
+            throw error
         }
 
         logger.info("checkSingleStep: Process exited with status \(exitStatus)")
@@ -623,6 +694,19 @@ actor TLAPMProcessManager {
         activeProcesses.count
     }
 
+    static func waitForExit(of process: Process, timeout: TimeInterval? = nil) async throws -> Int32 {
+        let startTime = Date()
+
+        while process.isRunning {
+            if let timeout, Date().timeIntervalSince(startTime) >= timeout {
+                throw TLAPMError.timeout
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        return process.terminationStatus
+    }
+
     // MARK: - Environment Building
 
     /// Build a minimal environment with prover paths prepended to PATH.
@@ -630,34 +714,37 @@ actor TLAPMProcessManager {
     private func buildTLAPMEnvironment() -> [String: String] {
         var environment = ProcessEnvironment.minimal()
 
-        // Add discovered prover env vars
-        if proverPaths.isEmpty {
-            discoverProvers()
-        }
+        // Add discovered prover env vars AND collect their parent directories into PATH.
+        // TLAPM shells out `type zenon` / `type z3` etc., so those executables must be on
+        // PATH regardless of which subdirectory BinaryDiscovery ultimately found them in.
+        discoverProvers()
+        var discoveredDirs: [String] = []
         for (prover, path) in proverPaths {
             let envVar = "\(prover.rawValue.uppercased())_PATH"
-            environment[envVar] = path.deletingLastPathComponent().path
+            let parentDir = path.deletingLastPathComponent().path
+            environment[envVar] = parentDir
+            if !discoveredDirs.contains(parentDir) {
+                discoveredDirs.append(parentDir)
+            }
         }
 
-        // Add backend prover paths to PATH for TLAPM discovery
-        var pathComponents: [String] = []
-        if let bundlePath = Bundle.main.resourcePath {
-            let backendsPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("lib/tlapm/backends/bin").path
-            if FileManager.default.fileExists(atPath: backendsPath) {
-                pathComponents.append(backendsPath)
-            }
-            let proversPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("Provers").path
-            if FileManager.default.fileExists(atPath: proversPath) {
-                pathComponents.append(proversPath)
-            }
-            let binPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("bin").path
-            if FileManager.default.fileExists(atPath: binPath) {
-                pathComponents.append(binPath)
+        // Add backend prover paths to PATH for TLAPM discovery. We check the SPM module
+        // bundle (`Bundle.module`) explicitly because for a raw executable launch
+        // `Bundle.main.resourcePath` is the enclosing directory, not the resource bundle.
+        var pathComponents: [String] = discoveredDirs
+        let bundleRoots = [Bundle.module.resourcePath, Bundle.main.resourcePath].compactMap { $0 }
+        for root in bundleRoots {
+            // Both old (`lib/tlapm/backends/bin`) and new (`bin`) layouts are supported so
+            // we don't break users on either build. `Provers/` is the historical prover dir.
+            for subdir in ["bin", "Provers", "lib/tlapm/backends/bin"] {
+                let candidate = URL(fileURLWithPath: root).appendingPathComponent(subdir).path
+                if FileManager.default.fileExists(atPath: candidate),
+                   !pathComponents.contains(candidate) {
+                    pathComponents.append(candidate)
+                }
             }
         }
+
         if !pathComponents.isEmpty {
             let existingPath = environment["PATH"] ?? "/usr/bin:/bin"
             pathComponents.append(existingPath)
@@ -672,11 +759,7 @@ actor TLAPMProcessManager {
     private func buildArguments(for options: ProofCheckOptions, specPath: String) -> [String] {
         var args: [String] = []
 
-        // Add TLAPS standard library path
-        if let stdlib = stdlibPath {
-            args.append("-I")
-            args.append(stdlib.path)
-        }
+        appendLibrarySearchPaths(to: &args)
 
         // Toolbox mode for machine-readable output
         // --toolbox <start> <end> specifies line range (0 means start/end of file)
@@ -818,4 +901,3 @@ enum TLAPMError: Error, LocalizedError {
         }
     }
 }
-

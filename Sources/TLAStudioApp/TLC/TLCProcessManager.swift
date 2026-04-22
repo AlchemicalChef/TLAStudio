@@ -32,6 +32,18 @@ actor TLCProcessManager {
     /// Above this, we use SerialGC to avoid OOM with Epsilon GC
     private let autoSelectThreshold = 500_000
 
+    private var configuredTLCPath: URL? {
+        let configuredPath = UserSettings.shared.tlcPath
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !configuredPath.isEmpty else { return nil }
+
+        let url = URL(fileURLWithPath: configuredPath)
+        guard FileManager.default.fileExists(atPath: url.path),
+              FileManager.default.isExecutableFile(atPath: url.path) else {
+            return nil
+        }
+        return url
+    }
 
     /// Find a TLC binary by name
     private func findBinary(named name: String) -> URL? {
@@ -50,7 +62,12 @@ actor TLCProcessManager {
 
     /// Path to TLC binary (prefers fast, falls back to standard)
     private var tlcPath: URL? {
-        tlcFastPath ?? tlcStandardPath
+        configuredTLCPath ?? tlcFastPath ?? tlcStandardPath
+    }
+
+    /// Get the discovered TLC path for display and tests.
+    var discoveredTLCPath: String? {
+        tlcPath?.path
     }
 
     /// Path to tla2tools.jar for JVM fallback
@@ -62,7 +79,7 @@ actor TLCProcessManager {
                 systemPaths: ["/usr/local/lib", "/usr/local/bin"],
                 homeRelativePaths: [".tla"]
             )
-        )
+        ) ?? BinaryDiscovery.findDevelopmentFile(relativePath: "Scripts/tla2tools.jar")
     }
 
     /// Path to Java executable (cached to avoid blocking actor with `which java`)
@@ -160,6 +177,10 @@ actor TLCProcessManager {
     /// Select the appropriate TLC binary based on mode and config
     /// Returns nil for .jvm mode (JVM uses java executable instead)
     private func selectBinary(mode: TLCBinaryMode, config: ModelConfig) -> URL? {
+        if let configuredTLCPath {
+            return configuredTLCPath
+        }
+
         switch mode {
         case .fast:
             return tlcFastPath ?? tlcStandardPath
@@ -311,34 +332,24 @@ actor TLCProcessManager {
             throw TLCError.invalidConfig("Config file path is outside spec directory")
         }
 
-        // Write config file with TOCTOU-safe logic:
-        // - If we have UI-configured constants, always write (overwrite any existing)
-        // - If no constants, only create if file doesn't exist (don't overwrite user's file)
+        // Always materialize the resolved model configuration before launching TLC.
+        // TLC reads model semantics from the cfg file, not from CLI flags, so
+        // preserving a stale on-disk cfg can execute different semantics than the UI shows.
         let configContent = config.generateConfigFile()
 
-        if !config.constants.isEmpty {
-            // We have constants to write - overwrite any existing file
-            do {
-                try configContent.write(to: configURL, atomically: true, encoding: .utf8)
-            } catch {
-                throw TLCError.configWriteFailed(error)
-            }
-        } else {
-            // No constants - only create if file doesn't exist (atomic exclusive create)
-            // This is TOCTOU-safe: if file appears between check and write, we keep the existing one
-            do {
-                try writeFileExclusively(content: configContent, to: configURL)
-            } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(EEXIST) {
-                // File already exists - this is fine, we'll use the existing one
-                logger.debug("Config file already exists, preserving user's file")
-            } catch {
-                throw TLCError.configWriteFailed(error)
-            }
+        do {
+            try configContent.write(to: configURL, atomically: true, encoding: .utf8)
+        } catch {
+            throw TLCError.configWriteFailed(error)
         }
 
         var arguments: [String] = []
+        let libraryArgument = BinaryDiscovery.configuredTLALibraryPropertyValue().map { "-DTLA-Library=\($0)" }
 
         if isJVMMode {
+            if let libraryArgument {
+                arguments.append(libraryArgument)
+            }
             // JVM arguments: -Xmx, -jar, then TLC arguments
             let physicalMemoryBytes = ProcessInfo.processInfo.physicalMemory
             // JVM has no 32GB limit - use 85% of physical memory, capped at 64GB (Issue #6)
@@ -352,6 +363,9 @@ actor TLCProcessManager {
             arguments.append(contentsOf: buildArguments(for: config, configURL: configURL, isJVM: true))
         } else {
             arguments = buildArguments(for: config, configURL: configURL, isJVM: false)
+            if let libraryArgument {
+                arguments.insert(libraryArgument, at: 0)
+            }
         }
 
         // Add recover argument if resuming from checkpoint (Issue #4: validate checkpoint ID)
@@ -416,7 +430,9 @@ actor TLCProcessManager {
             stdoutHandle.readabilityHandler = { [weak parser, weak streamState] handle in
                 let data = handle.availableData
                 if data.isEmpty {
-                    // EOF reached - stream will be finished when process terminates
+                    // EOF reached. Self-clear the handler so we don't keep getting scheduled
+                    // on a dead pipe if `continuation.onTermination` didn't fire for any reason.
+                    handle.readabilityHandler = nil
                     return
                 }
                 guard let parser = parser, let state = streamState else { return }
@@ -440,7 +456,11 @@ actor TLCProcessManager {
 
             stderrHandle.readabilityHandler = { [weak parser] handle in
                 let data = handle.availableData
-                if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                if let str = String(data: data, encoding: .utf8) {
                     logger.error("TLC stderr: \(str)")
                     // Log errors to OutputManager and check for OOM
                     for line in str.components(separatedBy: .newlines) where !line.isEmpty {
@@ -591,39 +611,6 @@ actor TLCProcessManager {
     /// Check if a session is running
     func isRunning(sessionId: UUID) -> Bool {
         activeProcesses[sessionId]?.isRunning ?? false
-    }
-
-    // MARK: - File Utilities
-
-    /// Write content to file with exclusive creation (fails if file already exists).
-    /// This is TOCTOU-safe: uses O_CREAT | O_EXCL to atomically check and create.
-    private func writeFileExclusively(content: String, to url: URL) throws {
-        guard let data = content.data(using: .utf8) else {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL), userInfo: [
-                NSLocalizedDescriptionKey: "Failed to encode content as UTF-8"
-            ])
-        }
-
-        // Open with O_CREAT | O_EXCL | O_WRONLY - fails with EEXIST if file exists
-        let fd = open(url.path, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
-        if fd == -1 {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [
-                NSLocalizedDescriptionKey: String(cString: strerror(errno))
-            ])
-        }
-
-        defer { close(fd) }
-
-        // Write data to the file descriptor
-        try data.withUnsafeBytes { buffer in
-            guard let baseAddress = buffer.baseAddress else { return }
-            let bytesWritten = write(fd, baseAddress, data.count)
-            if bytesWritten == -1 {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [
-                    NSLocalizedDescriptionKey: String(cString: strerror(errno))
-                ])
-            }
-        }
     }
 
     // MARK: - Argument Building
@@ -818,6 +805,9 @@ class TLCSession: ObservableObject {
                         }
                     }
                 }
+                let effectiveResult = finalResult.outOfMemory
+                    ? finalResult.withSuggestJVMRetry(finalResult.suggestJVMRetry && capturedConfig.useJVMFallback)
+                    : finalResult
 
                 // Check for cancellation before updating state
                 guard !Task.isCancelled else { return }
@@ -825,7 +815,7 @@ class TLCSession: ObservableObject {
                 // Guard against self being deallocated during await
                 guard let self else { return }
 
-                self.result = finalResult
+                self.result = effectiveResult
                 self.isRunning = false
                 self.recoveringFrom = nil
 
@@ -837,10 +827,10 @@ class TLCSession: ObservableObject {
                 // Send completion notification
                 let moduleName = capturedSpecURL.deletingPathExtension().lastPathComponent
                 CompletionNotifier.shared.notifyTLCComplete(
-                    success: finalResult.success,
+                    success: effectiveResult.success,
                     moduleName: moduleName,
-                    statesGenerated: Int(finalResult.statesFound),
-                    duration: finalResult.duration
+                    statesGenerated: Int(effectiveResult.statesFound),
+                    duration: effectiveResult.duration
                 )
             } catch {
                 // Check for cancellation before updating state
@@ -909,7 +899,7 @@ class TLCSession: ObservableObject {
 
     /// Retry with JVM mode after OOM
     func retryWithJVM() {
-        guard result?.outOfMemory == true, !isRunning else { return }
+        guard result?.outOfMemory == true, result?.suggestJVMRetry == true, !isRunning else { return }
         binaryMode = .jvm
         result = nil
         error = nil

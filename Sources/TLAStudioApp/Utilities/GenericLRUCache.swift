@@ -67,6 +67,15 @@ final class GenericLRUCache<Key: Hashable, Value> {
         return cache.count
     }
 
+    /// Remove all entries from the cache.
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        cache.removeAll()
+        head = nil
+        tail = nil
+    }
+
     // MARK: - Private List Operations (all O(1), must be called with lock held)
 
     private func addToFront(_ node: GenericLRUNode<Key, Value>) {

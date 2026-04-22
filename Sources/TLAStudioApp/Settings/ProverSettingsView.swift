@@ -752,24 +752,24 @@ final class ProverSettingsViewModel: ObservableObject {
     // MARK: - TLC Settings
 
     @Published var tlcPath: String = "" {
-        didSet { saveSetting(tlcPath, forKey: .tlcPath) }
+        didSet { UserSettings.shared.tlcPath = tlcPath }
     }
     @Published var tlcStatus: ToolStatus = .unknown
     @Published var tlcVersion: String?
     @Published var workerThreads: Int = ProcessInfo.processInfo.processorCount {
-        didSet { saveSetting(workerThreads, forKey: .workerThreads) }
+        didSet { UserSettings.shared.tlcWorkers = workerThreads }
     }
     @Published var checkpointEnabled: Bool = true {
-        didSet { saveSetting(checkpointEnabled, forKey: .checkpointEnabled) }
+        didSet { UserSettings.shared.tlcCheckpointEnabled = checkpointEnabled }
     }
     @Published var checkpointInterval: Int = 30 {
-        didSet { saveSetting(checkpointInterval, forKey: .checkpointInterval) }
+        didSet { UserSettings.shared.tlcCheckpointInterval = checkpointInterval }
     }
 
     // MARK: - TLAPM Settings
 
     @Published var tlapmPath: String = "" {
-        didSet { saveSetting(tlapmPath, forKey: .tlapmPath) }
+        didSet { UserSettings.shared.tlapmPath = tlapmPath }
     }
     @Published var tlapmStatus: ToolStatus = .unknown
     @Published var tlapmVersion: String?
@@ -777,19 +777,19 @@ final class ProverSettingsViewModel: ObservableObject {
     // MARK: - Backend Prover Settings
 
     @Published var z3Path: String = "" {
-        didSet { saveSetting(z3Path, forKey: .z3Path) }
+        didSet { UserSettings.shared.z3Path = z3Path }
     }
     @Published var zenonPath: String = "" {
-        didSet { saveSetting(zenonPath, forKey: .zenonPath) }
+        didSet { UserSettings.shared.zenonPath = zenonPath }
     }
     @Published var isabellePath: String = "" {
-        didSet { saveSetting(isabellePath, forKey: .isabellePath) }
+        didSet { UserSettings.shared.isabellePath = isabellePath }
     }
     @Published var cvc5Path: String = "" {
-        didSet { saveSetting(cvc5Path, forKey: .cvc5Path) }
+        didSet { UserSettings.shared.cvc5Path = cvc5Path }
     }
     @Published var spassPath: String = "" {
-        didSet { saveSetting(spassPath, forKey: .spassPath) }
+        didSet { UserSettings.shared.spassPath = spassPath }
     }
 
     @Published private var proverStatuses: [ProverBackend: ToolStatus] = [:]
@@ -798,10 +798,10 @@ final class ProverSettingsViewModel: ObservableObject {
     // MARK: - Default Settings
 
     @Published var defaultProverBackend: ProverBackend = .auto {
-        didSet { saveSetting(defaultProverBackend.rawValue, forKey: .defaultProverBackend) }
+        didSet { UserSettings.shared.defaultProverBackend = defaultProverBackend.rawValue }
     }
     @Published var defaultTimeout: Int = 30 {
-        didSet { saveSetting(defaultTimeout, forKey: .defaultTimeout) }
+        didSet { UserSettings.shared.defaultProverTimeout = defaultTimeout }
     }
 
     // MARK: - State
@@ -817,60 +817,30 @@ final class ProverSettingsViewModel: ObservableObject {
         loadSettings()
     }
 
-    // MARK: - Settings Keys
-
-    private enum SettingsKey: String {
-        case tlcPath = "prover.tlc.path"
-        case tlapmPath = "prover.tlapm.path"
-        case z3Path = "prover.z3.path"
-        case zenonPath = "prover.zenon.path"
-        case isabellePath = "prover.isabelle.path"
-        case cvc5Path = "prover.cvc5.path"
-        case spassPath = "prover.spass.path"
-        case workerThreads = "prover.tlc.workerThreads"
-        case checkpointEnabled = "prover.tlc.checkpointEnabled"
-        case checkpointInterval = "prover.tlc.checkpointInterval"
-        case defaultProverBackend = "prover.defaultBackend"
-        case defaultTimeout = "prover.defaultTimeout"
-    }
-
     // MARK: - Settings Persistence
 
+    /// Mirror current persisted values from UserSettings into the view-model's @Published state.
+    /// Legacy-key migration lives in UserSettings.init, so this just reads the canonical keys.
     private func loadSettings() {
-        let defaults = UserDefaults.standard
+        let settings = UserSettings.shared
 
-        tlcPath = defaults.string(forKey: SettingsKey.tlcPath.rawValue) ?? ""
-        tlapmPath = defaults.string(forKey: SettingsKey.tlapmPath.rawValue) ?? ""
-        z3Path = defaults.string(forKey: SettingsKey.z3Path.rawValue) ?? ""
-        zenonPath = defaults.string(forKey: SettingsKey.zenonPath.rawValue) ?? ""
-        isabellePath = defaults.string(forKey: SettingsKey.isabellePath.rawValue) ?? ""
-        cvc5Path = defaults.string(forKey: SettingsKey.cvc5Path.rawValue) ?? ""
-        spassPath = defaults.string(forKey: SettingsKey.spassPath.rawValue) ?? ""
+        tlcPath = settings.tlcPath
+        tlapmPath = settings.tlapmPath
+        z3Path = settings.z3Path
+        zenonPath = settings.zenonPath
+        isabellePath = settings.isabellePath
+        cvc5Path = settings.cvc5Path
+        spassPath = settings.spassPath
 
-        if defaults.object(forKey: SettingsKey.workerThreads.rawValue) != nil {
-            workerThreads = defaults.integer(forKey: SettingsKey.workerThreads.rawValue)
-        }
+        workerThreads = settings.tlcWorkers
+        checkpointEnabled = settings.tlcCheckpointEnabled
+        checkpointInterval = settings.tlcCheckpointInterval
 
-        if defaults.object(forKey: SettingsKey.checkpointEnabled.rawValue) != nil {
-            checkpointEnabled = defaults.bool(forKey: SettingsKey.checkpointEnabled.rawValue)
-        }
-
-        if defaults.object(forKey: SettingsKey.checkpointInterval.rawValue) != nil {
-            checkpointInterval = defaults.integer(forKey: SettingsKey.checkpointInterval.rawValue)
-        }
-
-        if let backendRaw = defaults.string(forKey: SettingsKey.defaultProverBackend.rawValue),
-           let backend = ProverBackend(rawValue: backendRaw) {
+        if let backend = ProverBackend(rawValue: settings.defaultProverBackend) {
             defaultProverBackend = backend
         }
 
-        if defaults.object(forKey: SettingsKey.defaultTimeout.rawValue) != nil {
-            defaultTimeout = defaults.integer(forKey: SettingsKey.defaultTimeout.rawValue)
-        }
-    }
-
-    private func saveSetting<T>(_ value: T, forKey key: SettingsKey) {
-        UserDefaults.standard.set(value, forKey: key.rawValue)
+        defaultTimeout = settings.defaultProverTimeout
     }
 
     // MARK: - Bindings
@@ -1102,19 +1072,19 @@ final class ProverSettingsViewModel: ObservableObject {
 
         switch backend {
         case .z3:
-            path = z3Path.isEmpty ? findInPath("z3") : z3Path
+            path = z3Path.isEmpty ? findBundledBinary(named: "z3", subdirectories: ["Provers", "lib/tlapm/backends/bin"]) : z3Path
             versionFlag = "--version"
         case .zenon:
-            path = zenonPath.isEmpty ? findInPath("zenon") : zenonPath
+            path = zenonPath.isEmpty ? findBundledBinary(named: "zenon", subdirectories: ["Provers", "lib/tlapm/backends/bin"]) : zenonPath
             versionFlag = "-version"
         case .isabelle:
             path = isabellePath.isEmpty ? findInPath("isabelle") : isabellePath
             versionFlag = "version"
         case .cvc5:
-            path = cvc5Path.isEmpty ? findInPath("cvc5") : cvc5Path
+            path = cvc5Path.isEmpty ? findBundledBinary(named: "cvc5", subdirectories: ["Provers"]) : cvc5Path
             versionFlag = "--version"
         case .spass:
-            path = spassPath.isEmpty ? findInPath("SPASS") : spassPath
+            path = spassPath.isEmpty ? findBundledBinary(named: "SPASS", subdirectories: ["Provers"]) : spassPath
             versionFlag = "-V"
         case .auto, .ls4:
             return true
@@ -1140,49 +1110,25 @@ final class ProverSettingsViewModel: ObservableObject {
     // MARK: - Binary Discovery
 
     private func findBundledTLC() -> String? {
-        // Check SPM resource bundle
-        if let url = Bundle.module.url(forResource: "tlc-native", withExtension: nil) {
-            return url.path
-        }
-
-        // Check main bundle
-        if let url = Bundle.main.url(forResource: "tlc-native", withExtension: nil) {
-            return url.path
-        }
-
-        // Check bundle resources directly
-        if let bundlePath = Bundle.main.resourcePath {
-            let path = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("tlc-native").path
-            if FileManager.default.fileExists(atPath: path) {
-                return path
-            }
-        }
-
-        return findInPath("tlc-native")
+        findBundledBinary(named: "tlc-native") ?? findBundledBinary(named: "tlc-native-fast")
     }
 
     private func findBundledTLAPM() -> String? {
-        // Check SPM resource bundle
-        if let url = Bundle.module.url(forResource: "tlapm", withExtension: nil) {
-            return url.path
-        }
+        findBundledBinary(named: "tlapm", subdirectories: ["bin", "Provers"])
+    }
 
-        // Check main bundle
-        if let url = Bundle.main.url(forResource: "tlapm", withExtension: nil) {
-            return url.path
-        }
-
-        // Check bundle resources directly
-        if let bundlePath = Bundle.main.resourcePath {
-            let path = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("tlapm").path
-            if FileManager.default.fileExists(atPath: path) {
-                return path
-            }
-        }
-
-        return findInPath("tlapm")
+    private func findBundledBinary(
+        named name: String,
+        subdirectories: [String] = []
+    ) -> String? {
+        BinaryDiscovery.find(
+            named: name,
+            options: .init(
+                bundleSubdirectories: subdirectories,
+                systemPaths: ["/usr/local/bin", "/opt/homebrew/bin"],
+                homeRelativePaths: [".tla", ".tla/provers"]
+            )
+        )?.path
     }
 
     private func findInPath(_ binaryName: String) -> String? {

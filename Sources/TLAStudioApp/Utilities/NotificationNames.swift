@@ -17,6 +17,8 @@ extension Notification.Name {
     // MARK: TLA+ Commands
 
     static let translatePlusCal = Notification.Name("TLATranslatePlusCal")
+    static let goToPlusCalAlgorithm = Notification.Name("TLAGoToPlusCalAlgorithm")
+    static let goToPlusCalTranslation = Notification.Name("TLAGoToPlusCalTranslation")
     static let goToDefinition = Notification.Name("TLAGoToDefinition")
     static let findReferences = Notification.Name("TLAFindReferences")
 

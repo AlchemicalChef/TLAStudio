@@ -34,10 +34,11 @@ final class DiagnosticHighlighter {
     /// Update diagnostics and apply underlines
     func updateDiagnostics(_ diagnostics: [TLADiagnostic], in text: String) {
         currentDiagnostics = diagnostics
+        let textAnalysis = TextCoordinateMapper.analyze(text)
 
         // Map diagnostics to text ranges
         mappedDiagnostics = diagnostics.compactMap { diagnostic in
-            if let range = calculateRange(for: diagnostic, in: text) {
+            if let range = Self.mappedRange(for: diagnostic, in: text, analysis: textAnalysis) {
                 return MappedDiagnostic(diagnostic: diagnostic, range: range)
             }
             return nil
@@ -83,54 +84,108 @@ final class DiagnosticHighlighter {
 
     // MARK: - Private Methods
 
-    private func calculateRange(for diagnostic: TLADiagnostic, in text: String) -> NSRange? {
-        let lines = text.components(separatedBy: "\n")
+    static func mappedRange(for diagnostic: TLADiagnostic, in text: String) -> NSRange? {
+        mappedRange(for: diagnostic, in: text, analysis: TextCoordinateMapper.analyze(text))
+    }
+
+    private static func mappedRange(
+        for diagnostic: TLADiagnostic,
+        in text: String,
+        analysis: TextCoordinateMapper.TextAnalysis
+    ) -> NSRange? {
         let startLine = Int(diagnostic.range.start.line)
         let startColumn = Int(diagnostic.range.start.column)
         let endLine = Int(diagnostic.range.end.line)
         let endColumn = Int(diagnostic.range.end.column)
+        let lineCount = analysis.lineStartOffsets.count
 
-        guard startLine < lines.count else { return nil }
+        guard startLine >= 0, startLine < lineCount else { return nil }
+        guard analysis.utf16Length >= 0 else { return nil }
 
-        // Calculate start offset
-        var startOffset = 0
-        for i in 0..<startLine {
-            startOffset += lines[i].count + 1 // +1 for newline
-        }
-        startOffset += min(startColumn, lines[startLine].count)
+        let startOffset = TextCoordinateMapper.utf16Offset(
+            forLine: startLine,
+            column: startColumn,
+            in: text,
+            lineStartOffsets: analysis.lineStartOffsets
+        )
+        let effectiveEndLine = max(startLine, min(endLine, lineCount - 1))
+        var endOffset = TextCoordinateMapper.utf16Offset(
+            forLine: effectiveEndLine,
+            column: endColumn,
+            in: text,
+            lineStartOffsets: analysis.lineStartOffsets
+        )
 
-        // Calculate end offset
-        var endOffset = 0
-        let effectiveEndLine = min(endLine, lines.count - 1)
-        for i in 0..<effectiveEndLine {
-            endOffset += lines[i].count + 1
-        }
-        if effectiveEndLine < lines.count {
-            endOffset += min(endColumn, lines[effectiveEndLine].count)
-        }
-
-        // Ensure end is after start and within bounds
         if endOffset <= startOffset {
-            // Single point diagnostic - highlight the word or at least one character
-            let lineLength = lines[startLine].count
-            if startColumn < lineLength {
-                // Find word boundary
-                let lineStr = lines[startLine]
-                var wordEnd = startColumn
-                let chars = Array(lineStr)
-                while wordEnd < chars.count && chars[wordEnd].isLetter || chars[wordEnd].isNumber || chars[wordEnd] == "_" {
-                    wordEnd += 1
-                }
-                endOffset = startOffset + max(1, wordEnd - startColumn)
-            } else {
-                endOffset = startOffset + 1
-            }
+            endOffset = fallbackEndOffset(
+                from: startOffset,
+                line: startLine,
+                column: startColumn,
+                in: text,
+                analysis: analysis
+            )
         }
 
-        let length = min(endOffset - startOffset, text.count - startOffset)
+        let maxLength = max(0, analysis.utf16Length - startOffset)
+        let length = min(endOffset - startOffset, maxLength)
         guard length > 0 else { return nil }
 
         return NSRange(location: startOffset, length: length)
+    }
+
+    private static func fallbackEndOffset(
+        from startOffset: Int,
+        line: Int,
+        column: Int,
+        in text: String,
+        analysis: TextCoordinateMapper.TextAnalysis
+    ) -> Int {
+        guard startOffset < analysis.utf16Length else {
+            return startOffset
+        }
+
+        let lineRange = utf16LineRange(for: line, in: analysis)
+        let lineText = (text as NSString).substring(with: lineRange)
+        let localColumn = TextCoordinateMapper.lineAndColumn(
+            forUTF16Offset: startOffset,
+            in: text,
+            lineStartOffsets: analysis.lineStartOffsets
+        ).column
+
+        let characters = Array(lineText)
+        guard localColumn < characters.count else {
+            return min(startOffset + 1, analysis.utf16Length)
+        }
+
+        var wordEnd = localColumn
+        while wordEnd < characters.count {
+            let character = characters[wordEnd]
+            guard character.isLetter || character.isNumber || character == "_" else { break }
+            wordEnd += 1
+        }
+
+        let highlightedColumns = max(1, wordEnd - localColumn)
+        let candidateEnd = TextCoordinateMapper.utf16Offset(
+            forLine: line,
+            column: column + highlightedColumns,
+            in: text,
+            lineStartOffsets: analysis.lineStartOffsets
+        )
+        return max(startOffset + 1, candidateEnd)
+    }
+
+    private static func utf16LineRange(
+        for line: Int,
+        in analysis: TextCoordinateMapper.TextAnalysis
+    ) -> NSRange {
+        let start = analysis.lineStartOffsets[line]
+        let end: Int
+        if line + 1 < analysis.lineStartOffsets.count {
+            end = max(start, analysis.lineStartOffsets[line + 1] - 1)
+        } else {
+            end = analysis.utf16Length
+        }
+        return NSRange(location: start, length: max(0, end - start))
     }
 
     private func applyUnderlines() {

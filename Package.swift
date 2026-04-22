@@ -43,6 +43,7 @@ let package = Package(
                 .copy("Resources/tlc-native-fast"),
                 .copy("Resources/AppIcon.icns"),
                 .copy("Resources/bin"),      // TLAPM binary
+                .copy("Resources/doc"),      // Bundled TLAPM documentation
                 .copy("Resources/lib"),      // TLAPM stdlib
                 .copy("Resources/Provers"),  // Backend provers (Z3, CVC5, Zenon, Isabelle, SPASS)
             ],

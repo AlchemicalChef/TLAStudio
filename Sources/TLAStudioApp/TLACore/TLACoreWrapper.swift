@@ -359,17 +359,34 @@ private final class ParseResultLRUCache {
 @MainActor
 final class TLACoreWrapper: ObservableObject {
     static let shared = TLACoreWrapper()
+    private static let warmupSource = """
+    ---- MODULE TLAStudioWarmup ----
+    VARIABLES x
+    Init == x = 0
+    ====
+    """
 
     private let core: any TLACoreProtocol
 
     /// LRU cache for parse results - uses content hash as key to avoid storing large strings
     private var parseCache: ParseResultLRUCache
 
-    private init() {
-        // Use the factory to get the best available implementation
-        // This will try Rust tree-sitter first, then fall back to regex
-        self.core = TLACoreFactory.create()
-        self.parseCache = ParseResultLRUCache(capacity: 10)
+    /// Reuses symbol extraction results for cached parse results.
+    private var symbolCache: GenericLRUCache<ObjectIdentifier, [TLASymbol]>
+
+    /// Coalesces concurrent parse requests for identical content.
+    /// Using the full source as the key avoids content-hash collision edge cases.
+    private var inFlightParses: [String: Task<TLAParseResult, Error>] = [:]
+    private var warmupTask: Task<Void, Never>?
+
+    private convenience init() {
+        self.init(core: TLACoreFactory.create())
+    }
+
+    init(core: any TLACoreProtocol, parseCacheCapacity: Int = 10) {
+        self.core = core
+        self.parseCache = ParseResultLRUCache(capacity: parseCacheCapacity)
+        self.symbolCache = GenericLRUCache(capacity: max(1, parseCacheCapacity * 2))
     }
 
     /// Parse TLA+ source code
@@ -388,7 +405,25 @@ final class TLACoreWrapper: ObservableObject {
             logger.debug("Parse cache hash collision detected for hash \(contentHash)")
         }
 
-        let result = try await core.parse(content)
+        if let inFlight = inFlightParses[content] {
+            return try await inFlight.value
+        }
+
+        let core = self.core
+        let parseTask = Task.detached(priority: .userInitiated) {
+            try await core.parse(content)
+        }
+        inFlightParses[content] = parseTask
+
+        let result: TLAParseResult
+        do {
+            result = try await parseTask.value
+        } catch {
+            inFlightParses.removeValue(forKey: content)
+            throw error
+        }
+
+        inFlightParses.removeValue(forKey: content)
 
         // Cache result with LRU eviction
         parseCache.set(contentHash, value: result)
@@ -398,7 +433,14 @@ final class TLACoreWrapper: ObservableObject {
 
     /// Get symbols from parse result
     func getSymbols(from result: TLAParseResult) async -> [TLASymbol] {
-        await core.getSymbols(from: result)
+        let cacheKey = ObjectIdentifier(result)
+        if let cached = symbolCache.get(cacheKey) {
+            return cached
+        }
+
+        let symbols = await core.getSymbols(from: result)
+        symbolCache.set(cacheKey, value: symbols)
+        return symbols
     }
 
     /// Get syntax highlights for a range
@@ -443,6 +485,29 @@ final class TLACoreWrapper: ObservableObject {
     /// Clear parse cache
     func clearCache() {
         parseCache.clear()
+        symbolCache.clear()
+        for task in inFlightParses.values {
+            task.cancel()
+        }
+        inFlightParses.removeAll()
+        warmupTask?.cancel()
+        warmupTask = nil
+    }
+
+    /// Pre-initialize the language core and common symbol queries off the first editor action.
+    func primeForEditing() {
+        guard warmupTask == nil else { return }
+
+        warmupTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.warmupTask = nil }
+
+            guard let result = try? await self.parse(Self.warmupSource) else {
+                return
+            }
+
+            _ = await self.getSymbols(from: result)
+        }
     }
 
     /// Find definition location for a symbol name

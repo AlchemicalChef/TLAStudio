@@ -75,6 +75,7 @@ enum TestFactories {
         actionConstraint: String? = nil
     ) -> ModelConfig {
         ModelConfig(
+            name: name,
             specFile: specFile,
             initPredicate: initPredicate,
             nextAction: nextAction,

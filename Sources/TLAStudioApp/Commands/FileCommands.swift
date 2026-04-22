@@ -2,6 +2,13 @@ import SwiftUI
 
 // MARK: - File Commands
 
+private func activeTLADocument() -> TLADocument? {
+    if let document = NSApp.keyWindow?.windowController?.document as? TLADocument {
+        return document
+    }
+    return NSDocumentController.shared.currentDocument as? TLADocument
+}
+
 /// File menu commands with all file operations
 struct FileCommands: Commands {
 
@@ -89,29 +96,34 @@ struct EditCommands: Commands {
             Divider()
 
             Button("Find...") {
-                NotificationCenter.default.post(name: .showFindReplace, object: nil, userInfo: ["showReplace": false])
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .showFindReplace, object: document, userInfo: ["showReplace": false])
             }
             .keyboardShortcut("f", modifiers: .command)
 
             Button("Find and Replace...") {
-                NotificationCenter.default.post(name: .showFindReplace, object: nil, userInfo: ["showReplace": true])
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .showFindReplace, object: document, userInfo: ["showReplace": true])
             }
             .keyboardShortcut("f", modifiers: [.command, .option])
 
             Button("Find Next") {
-                NotificationCenter.default.post(name: .findNext, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .findNext, object: document)
             }
             .keyboardShortcut("g", modifiers: .command)
 
             Button("Find Previous") {
-                NotificationCenter.default.post(name: .findPrevious, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .findPrevious, object: document)
             }
             .keyboardShortcut("g", modifiers: [.command, .shift])
 
             Divider()
 
             Button("Use Selection for Find") {
-                NotificationCenter.default.post(name: .useSelectionForFind, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .useSelectionForFind, object: document)
             }
             .keyboardShortcut("e", modifiers: .command)
         }
@@ -125,31 +137,36 @@ struct ViewCommands: Commands {
     var body: some Commands {
         CommandMenu("View") {
             Button("Go to Line...") {
-                NotificationCenter.default.post(name: .goToLine, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .goToLine, object: document)
             }
             .keyboardShortcut("g", modifiers: .command)
 
             Divider()
 
             Button("Fold All") {
-                NotificationCenter.default.post(name: .foldAll, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .foldAll, object: document)
             }
             .keyboardShortcut("k", modifiers: [.command, .option])
 
             Button("Unfold All") {
-                NotificationCenter.default.post(name: .unfoldAll, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .unfoldAll, object: document)
             }
             .keyboardShortcut("j", modifiers: [.command, .option])
 
             Button("Toggle Fold") {
-                NotificationCenter.default.post(name: .toggleFold, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .toggleFold, object: document)
             }
             .keyboardShortcut("[", modifiers: .command)
 
             Divider()
 
             Button("Show Symbol Outline") {
-                NotificationCenter.default.post(name: .toggleSymbolOutline, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .toggleSymbolOutline, object: document)
             }
             .keyboardShortcut("0", modifiers: .command)
         }
@@ -162,19 +179,32 @@ struct TLACommands: Commands {
     var body: some Commands {
         CommandMenu("TLA+") {
             Button("Translate PlusCal") {
-                NotificationCenter.default.post(name: .translatePlusCal, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .translatePlusCal, object: document)
             }
             .keyboardShortcut("t", modifiers: [.command, .shift])
+
+            Button("Go to PlusCal Algorithm") {
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .goToPlusCalAlgorithm, object: document)
+            }
+
+            Button("Go to Translation") {
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .goToPlusCalTranslation, object: document)
+            }
 
             Divider()
 
             Button("Go to Definition") {
-                NotificationCenter.default.post(name: .goToDefinition, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .goToDefinition, object: document)
             }
             .keyboardShortcut("d", modifiers: .command)
 
             Button("Find All References") {
-                NotificationCenter.default.post(name: .findReferences, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .findReferences, object: document)
             }
             .keyboardShortcut("r", modifiers: [.command, .shift])
         }
@@ -187,14 +217,14 @@ struct ModelCheckCommands: Commands {
     var body: some Commands {
         CommandMenu("Model") {
             Button("Run TLC") {
-                if let doc = NSDocumentController.shared.currentDocument as? TLADocument {
+                if let doc = activeTLADocument() {
                     doc.runModelCheck()
                 }
             }
             .keyboardShortcut("r", modifiers: .command)
 
             Button("Stop TLC") {
-                if let doc = NSDocumentController.shared.currentDocument as? TLADocument {
+                if let doc = activeTLADocument() {
                     doc.stopModelCheck()
                 }
             }
@@ -203,7 +233,8 @@ struct ModelCheckCommands: Commands {
             Divider()
 
             Button("Edit Model Configuration...") {
-                NotificationCenter.default.post(name: .editModelConfig, object: nil)
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .editModelConfig, object: document)
             }
             .keyboardShortcut("m", modifiers: [.command, .shift])
         }
@@ -216,14 +247,14 @@ struct ProofCommands: Commands {
     var body: some Commands {
         CommandMenu("Proof") {
             Button("Check All Proofs") {
-                if let doc = NSDocumentController.shared.currentDocument as? TLADocument {
+                if let doc = activeTLADocument() {
                     doc.runProofCheck()
                 }
             }
             .keyboardShortcut("p", modifiers: [.command, .shift])
 
             Button("Check Selection") {
-                if let doc = NSDocumentController.shared.currentDocument as? TLADocument {
+                if let doc = activeTLADocument() {
                     doc.checkSelectionProofStep()
                 }
             }

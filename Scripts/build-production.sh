@@ -84,6 +84,80 @@ check_command() {
     fi
 }
 
+embed_tlacore_dylib() {
+    local app_dir="$1"
+    local executable_path="$app_dir/Contents/MacOS/TLAStudio"
+    local frameworks_dir="$app_dir/Contents/Frameworks"
+    local bundled_dylib="$frameworks_dir/libtla_core.dylib"
+    local linked_dylib
+    local dylib_source=""
+
+    linked_dylib="$(otool -L "$executable_path" | awk '/libtla_core\.dylib/{print $1; exit}')"
+
+    if [ -n "$linked_dylib" ] && [ -f "$linked_dylib" ]; then
+        dylib_source="$linked_dylib"
+    else
+        for candidate in \
+            "$PROJECT_DIR/Sources/TLACore/target/release/libtla_core.dylib" \
+            "$PROJECT_DIR/Sources/TLACore/target/release/deps/libtla_core.dylib" \
+            "$PROJECT_DIR/Sources/TLACore/target/aarch64-apple-darwin/release/libtla_core.dylib" \
+            "$PROJECT_DIR/Sources/TLACore/target/aarch64-apple-darwin/release/deps/libtla_core.dylib"
+        do
+            if [ -f "$candidate" ]; then
+                dylib_source="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$dylib_source" ]; then
+        log_error "libtla_core.dylib not found; app bundle would not be self-contained"
+        exit 1
+    fi
+
+    mkdir -p "$frameworks_dir"
+    cp "$dylib_source" "$bundled_dylib"
+    chmod +x "$bundled_dylib"
+
+    install_name_tool -id "@rpath/libtla_core.dylib" "$bundled_dylib"
+    if [ -n "$linked_dylib" ]; then
+        install_name_tool -change "$linked_dylib" "@executable_path/../Frameworks/libtla_core.dylib" "$executable_path"
+    fi
+}
+
+install_executable() {
+    local source_path="$1"
+    local target_path="$2"
+
+    rm -f "$target_path"
+    cp "$source_path" "$target_path"
+    chmod +x "$target_path"
+}
+
+prepare_tlapm_zenon_build() {
+    local tlapm_dir="$1"
+
+    if [ -d "$tlapm_dir/zenon" ]; then
+        log_info "Cleaning vendored Zenon artifacts..."
+        (cd "$tlapm_dir/zenon" && make clean >/dev/null 2>&1 || true)
+        rm -f \
+            "$tlapm_dir/zenon/config.ml" \
+            "$tlapm_dir/zenon/checksum.ml" \
+            "$tlapm_dir/zenon/.config_var" \
+            "$tlapm_dir/zenon/.depend"
+    fi
+
+    # Zenon's generated config.ml can be read-only in the Dune build tree; remove
+    # before replacing it so repeated production builds do not fail in deps/zenon.
+    if grep -q 'cp config.ml.tmp config.ml' "$tlapm_dir/deps/zenon/zenon-src/Makefile" 2>/dev/null; then
+        log_info "Patching Zenon build for writable config.ml updates..."
+        sed -i '' \
+            's/if ! cmp -s config\.ml config\.ml\.tmp; then cp config\.ml\.tmp config\.ml; fi/if ! cmp -s config.ml config.ml.tmp; then rm -f config.ml \&\& cp config.ml.tmp config.ml; fi/' \
+            "$tlapm_dir/deps/zenon/zenon-src/Makefile"
+        rm -rf "$tlapm_dir/_build/default/deps/zenon"
+    fi
+}
+
 # ============================================================================
 # STEP 1: Check and Install Prerequisites
 # ============================================================================
@@ -286,37 +360,36 @@ build_tlapm() {
     fi
 
     cd "$TLAPM_DIR"
+    prepare_tlapm_zenon_build "$TLAPM_DIR"
 
     # Build TLAPM
     log_info "Building TLAPM..."
     eval $(opam env)
-    dune build
+    # TLAPM's vendored zenon build rewrites config.ml in its generated build tree,
+    # which is incompatible with Dune's default read-only sandboxing.
+    dune build --sandbox=none
 
     # Install to project resources
     RESOURCES_DIR="$PROJECT_DIR/Sources/TLAStudioApp/Resources"
     mkdir -p "$RESOURCES_DIR/bin"
+    rm -rf "$RESOURCES_DIR/lib/tlapm"
     mkdir -p "$RESOURCES_DIR/lib/tlapm"
 
     # Copy TLAPM binary
-    cp _build/default/src/tlapm.exe "$RESOURCES_DIR/bin/tlapm"
-    chmod +x "$RESOURCES_DIR/bin/tlapm"
+    install_executable "_build/default/src/tlapm.exe" "$RESOURCES_DIR/bin/tlapm"
 
-    # Copy standard library
-    cp -R library/* "$RESOURCES_DIR/lib/tlapm/" 2>/dev/null || true
+    # Copy standard library as a clean snapshot to avoid stale files from previous builds.
+    cp -R library/. "$RESOURCES_DIR/lib/tlapm/" 2>/dev/null || true
 
     log_success "TLAPM built"
 
-    # Build/copy Zenon
+    # Reuse the prover built by TLAPM instead of rebuilding Zenon separately.
     log_info "Setting up Zenon..."
-    if [ -d "zenon" ]; then
-        cd zenon
-        ./configure && make
-        cp zenon "$RESOURCES_DIR/bin/"
-        chmod +x "$RESOURCES_DIR/bin/zenon"
-        cd ..
-        log_success "Zenon built"
+    if [ -x "_build/default/deps/zenon/zenon" ]; then
+        install_executable "_build/default/deps/zenon/zenon" "$RESOURCES_DIR/bin/zenon"
+        log_success "Zenon copied from TLAPM build"
     elif check_command zenon; then
-        cp "$(which zenon)" "$RESOURCES_DIR/bin/"
+        install_executable "$(which zenon)" "$RESOURCES_DIR/bin/zenon"
         log_success "Zenon copied from system"
     else
         log_info "Zenon not available (some proofs may fail)"
@@ -325,8 +398,7 @@ build_tlapm() {
     # Copy Z3
     log_info "Setting up Z3..."
     if check_command z3; then
-        cp "$(which z3)" "$RESOURCES_DIR/bin/"
-        chmod +x "$RESOURCES_DIR/bin/z3"
+        install_executable "$(which z3)" "$RESOURCES_DIR/bin/z3"
         log_success "Z3 copied"
     fi
 
@@ -380,9 +452,11 @@ create_app_bundle() {
     # Create structure
     mkdir -p "$APP_DIR/Contents/MacOS"
     mkdir -p "$APP_DIR/Contents/Resources"
+    mkdir -p "$APP_DIR/Contents/Frameworks"
 
     # Copy executable
     cp "$BUILD_DIR/TLAStudio" "$APP_DIR/Contents/MacOS/TLAStudio"
+    embed_tlacore_dylib "$APP_DIR"
 
     # Copy icon
     if [ -f "$PROJECT_DIR/Sources/TLAStudioApp/Resources/AppIcon.icns" ]; then
@@ -392,6 +466,17 @@ create_app_bundle() {
     # Copy resource bundle
     if [ -d "$BUILD_DIR/TLAStudio_TLAStudioApp.bundle" ]; then
         cp -R "$BUILD_DIR/TLAStudio_TLAStudioApp.bundle" "$APP_DIR/Contents/Resources/"
+    fi
+
+    # Copy runtime resources that are required outside the SwiftPM bundle definition
+    if [ -f "$PROJECT_DIR/Scripts/tla2tools.jar" ]; then
+        cp "$PROJECT_DIR/Scripts/tla2tools.jar" "$APP_DIR/Contents/Resources/tla2tools.jar"
+    elif [ -f "$PROJECT_DIR/Sources/TLAStudioApp/Resources/tla2tools.jar" ]; then
+        cp "$PROJECT_DIR/Sources/TLAStudioApp/Resources/tla2tools.jar" "$APP_DIR/Contents/Resources/tla2tools.jar"
+    fi
+
+    if [ -d "$PROJECT_DIR/Resources/StandardModules" ]; then
+        cp -R "$PROJECT_DIR/Resources/StandardModules" "$APP_DIR/Contents/Resources/"
     fi
 
     # Set executable permissions
@@ -452,6 +537,20 @@ create_app_bundle() {
             <key>NSDocumentClass</key>
             <string>TLAStudioApp.TLADocument</string>
         </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>TLA+ Configuration</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.tlaplus.configuration</string>
+            </array>
+            <key>NSDocumentClass</key>
+            <string>TLAStudioApp.TLADocument</string>
+        </dict>
     </array>
     <key>UTImportedTypeDeclarations</key>
     <array>
@@ -470,6 +569,24 @@ create_app_bundle() {
                 <key>public.filename-extension</key>
                 <array>
                     <string>tla</string>
+                </array>
+            </dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.tlaplus.configuration</string>
+            <key>UTTypeDescription</key>
+            <string>TLA+ Configuration</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.plain-text</string>
+                <string>public.source-code</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>cfg</string>
                 </array>
             </dict>
         </dict>

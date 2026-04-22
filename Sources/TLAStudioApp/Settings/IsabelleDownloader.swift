@@ -79,8 +79,15 @@ final class IsabelleDownloader: ObservableObject {
     ///   - fileURL: URL to the downloaded file
     /// - Returns: true if the hash matches the expected value
     private func verifySHA256(of fileURL: URL) throws -> Bool {
-        let fileData = try Data(contentsOf: fileURL)
-        let digest = SHA256.hash(data: fileData)
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+
+        let digest = hasher.finalize()
         let hashString = digest.map { String(format: "%02x", $0) }.joined()
         let matches = hashString == Self.expectedSHA256
         if !matches {

@@ -33,6 +33,18 @@ struct TLAStudioApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
 
+    private func presentInitialInterfaceIfNeeded() {
+        guard NSDocumentController.shared.documents.isEmpty else {
+            return
+        }
+
+        if UserSettings.shared.showWelcomeOnLaunch {
+            WelcomeWindowController.shared.show()
+        } else {
+            NSDocumentController.shared.newDocument(nil)
+        }
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         logger.info("applicationWillFinishLaunching")
         // Ensure app is a regular foreground app that can receive keyboard input
@@ -44,8 +56,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         logger.info("applicationDidFinishLaunching")
-        // Setup custom menus (also try here in case init timing was wrong)
-        setupModelMenu()
 
         // Apply saved appearance setting
         applyAppearanceSetting()
@@ -55,31 +65,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Show welcome screen or create new document if none are open
         DispatchQueue.main.async {
-            if NSDocumentController.shared.documents.isEmpty {
-                let showWelcome = UserDefaults.standard.object(forKey: UserSettings.Keys.showWelcomeOnLaunch) as? Bool ?? true
-                if showWelcome {
-                    WelcomeWindowController.shared.show()
-                } else {
-                    NSDocumentController.shared.newDocument(nil)
-                }
+            self.presentInitialInterfaceIfNeeded()
+
+            // Prime the parser off the first edit so initial completions/highlighting
+            // do not also pay the language-core startup cost.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                TLACoreWrapper.shared.primeForEditing()
             }
 
-            // Aggressively activate app and make window key
+            // Activate and focus the first window. `WelcomeWindowController.show()` and
+            // `TLAWindowController.init` each also call `NSApp.activate(...)`, so one call
+            // here is enough — earlier code retried after 100ms to paper over a cold-start
+            // race that no longer exists.
             NSApp.activate(ignoringOtherApps: true)
-            if let window = NSApp.windows.first {
-                window.makeKeyAndOrderFront(nil)
-            }
-
-            // Activate again after a short delay to ensure it takes effect
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first?.makeKeyAndOrderFront(nil)
-            }
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
         }
     }
 
     private func applyAppearanceSetting() {
-        let appearance = UserDefaults.standard.string(forKey: UserSettings.Keys.appearance) ?? "system"
+        let appearance = UserSettings.shared.appearance
         let nsAppearance: NSAppearance?
 
         switch appearance {
@@ -105,61 +109,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func setupModelMenu() {
-        guard let mainMenu = NSApp.mainMenu else {
-            return
-        }
-
-        // Avoid adding duplicate menu
-        if mainMenu.item(withTitle: "Model") != nil {
-            return
-        }
-
-        // Create Model menu
-        let modelMenu = NSMenu(title: "Model")
-
-        let runTLCItem = NSMenuItem(title: "Run TLC", action: #selector(runTLC(_:)), keyEquivalent: "r")
-        runTLCItem.keyEquivalentModifierMask = .command
-        runTLCItem.target = self
-        modelMenu.addItem(runTLCItem)
-
-        let stopTLCItem = NSMenuItem(title: "Stop TLC", action: #selector(stopTLC(_:)), keyEquivalent: ".")
-        stopTLCItem.keyEquivalentModifierMask = .command
-        stopTLCItem.target = self
-        modelMenu.addItem(stopTLCItem)
-
-        let modelMenuItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
-        modelMenuItem.submenu = modelMenu
-
-        // Insert before Window menu (usually second to last)
-        let insertIndex = max(mainMenu.items.count - 2, 0)
-        mainMenu.insertItem(modelMenuItem, at: insertIndex)
-    }
-
-    @objc func runTLC(_ sender: Any?) {
-        Task { @MainActor in
-            if let doc = NSDocumentController.shared.currentDocument as? TLADocument {
-                doc.runModelCheck()
-            }
-        }
-    }
-
-    @objc func stopTLC(_ sender: Any?) {
-        Task { @MainActor in
-            if let doc = NSDocumentController.shared.currentDocument as? TLADocument {
-                doc.stopModelCheck()
-            }
-        }
-    }
-
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        // Create new document on launch if none open
-        true
+        // Launch flow is handled explicitly in applicationDidFinishLaunching to avoid
+        // racing the welcome screen against NSDocument's automatic untitled-document path.
+        false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Standard macOS behavior for document apps
         false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            presentInitialInterfaceIfNeeded()
+        }
+        return true
     }
 
     func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {

@@ -172,11 +172,20 @@ struct CheckpointSettingsView: View {
 
     func loadCheckpoints() async {
         guard let specURL = specURL else { return }
+        let specName = specURL.deletingPathExtension().lastPathComponent
 
         await MainActor.run { isLoading = true }
 
         do {
-            let discovered = try await CheckpointManager.shared.discoverCheckpoints(forSpec: specURL)
+            let discovered: [CheckpointInfo]
+            if let customDirectory = config.checkpointDir {
+                discovered = try await CheckpointManager.shared.discoverCheckpoints(
+                    in: customDirectory,
+                    specName: specName
+                )
+            } else {
+                discovered = try await CheckpointManager.shared.discoverCheckpoints(forSpec: specURL)
+            }
             await MainActor.run {
                 checkpoints = discovered
                 isLoading = false

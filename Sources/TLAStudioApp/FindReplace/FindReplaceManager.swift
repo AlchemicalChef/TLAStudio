@@ -22,6 +22,11 @@ import Combine
 @MainActor
 public final class FindReplaceManager: ObservableObject {
 
+    private struct RegexCacheKey: Equatable {
+        let pattern: String
+        let options: NSRegularExpression.Options
+    }
+
     // MARK: - Published Properties
 
     /// Current search text.
@@ -158,7 +163,9 @@ public final class FindReplaceManager: ObservableObject {
 
     private let maxHistoryCount = 10
     private var searchDebounceTask: Task<Void, Never>?
-    private let debounceInterval: Duration = .milliseconds(150)
+    private let debounceInterval: Duration
+    private var cachedRegexKey: RegexCacheKey?
+    private var cachedRegex: NSRegularExpression?
 
     /// Attribute key for find highlight.
     private static let findHighlightKey = NSAttributedString.Key("TLAFindHighlight")
@@ -168,7 +175,9 @@ public final class FindReplaceManager: ObservableObject {
 
     // MARK: - Initialization
 
-    public init() {}
+    public init(debounceInterval: Duration = .milliseconds(150)) {
+        self.debounceInterval = debounceInterval
+    }
 
     // MARK: - Panel Visibility
 
@@ -361,6 +370,11 @@ public final class FindReplaceManager: ObservableObject {
     private func scheduleSearch() {
         searchDebounceTask?.cancel()
 
+        if debounceInterval == .zero {
+            performSearch()
+            return
+        }
+
         searchDebounceTask = Task {
             try? await Task.sleep(for: debounceInterval)
 
@@ -393,21 +407,15 @@ public final class FindReplaceManager: ObservableObject {
             return
         }
 
-        // Calculate new matches using regex for consistency
         do {
-            let pattern = buildSearchPattern()
-            var options: NSRegularExpression.Options = []
-
-            if !isCaseSensitive {
-                options.insert(.caseInsensitive)
+            if isRegex || isWholeWord {
+                let pattern = buildSearchPattern()
+                let regex = try compiledRegex(for: pattern, options: regexOptions())
+                matches = regexMatches(in: text, using: regex)
+            } else {
+                matches = literalMatches(in: text)
+                regexError = nil
             }
-
-            let regex = try NSRegularExpression(pattern: pattern, options: options)
-            let nsText = text as NSString
-            let searchRange = NSRange(location: 0, length: nsText.length)
-
-            let results = regex.matches(in: text, options: [], range: searchRange)
-            matches = results.map { $0.range }
             totalMatches = matches.count
 
             // Clear any previous regex error
@@ -462,6 +470,66 @@ public final class FindReplaceManager: ObservableObject {
         }
 
         return pattern
+    }
+
+    private func regexOptions() -> NSRegularExpression.Options {
+        var options: NSRegularExpression.Options = []
+        if !isCaseSensitive {
+            options.insert(.caseInsensitive)
+        }
+        return options
+    }
+
+    private func compiledRegex(
+        for pattern: String,
+        options: NSRegularExpression.Options
+    ) throws -> NSRegularExpression {
+        let cacheKey = RegexCacheKey(pattern: pattern, options: options)
+        if cachedRegexKey == cacheKey, let cachedRegex {
+            return cachedRegex
+        }
+
+        let regex = try NSRegularExpression(pattern: pattern, options: options)
+        cachedRegexKey = cacheKey
+        cachedRegex = regex
+        return regex
+    }
+
+    private func regexMatches(in text: String, using regex: NSRegularExpression) -> [NSRange] {
+        let nsText = text as NSString
+        let searchRange = NSRange(location: 0, length: nsText.length)
+        var ranges: [NSRange] = []
+        ranges.reserveCapacity(16)
+
+        regex.enumerateMatches(in: text, options: [], range: searchRange) { match, _, _ in
+            if let match {
+                ranges.append(match.range)
+            }
+        }
+
+        return ranges
+    }
+
+    private func literalMatches(in text: String) -> [NSRange] {
+        let nsText = text as NSString
+        let queryLength = (searchQuery as NSString).length
+        guard queryLength > 0 else { return [] }
+
+        let options: NSString.CompareOptions = isCaseSensitive ? [.literal] : [.caseInsensitive, .literal]
+        var ranges: [NSRange] = []
+        ranges.reserveCapacity(16)
+
+        var searchLocation = 0
+        while searchLocation < nsText.length {
+            let searchRange = NSRange(location: searchLocation, length: nsText.length - searchLocation)
+            let match = nsText.range(of: searchQuery, options: options, range: searchRange)
+            guard match.location != NSNotFound else { break }
+
+            ranges.append(match)
+            searchLocation = match.location + max(match.length, 1)
+        }
+
+        return ranges
     }
 
     // MARK: - Private Methods - Highlighting

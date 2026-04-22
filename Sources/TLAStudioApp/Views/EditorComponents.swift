@@ -5,6 +5,7 @@ import SwiftUI
 
 class LineNumberGutterView: NSView {
     private weak var textView: NSTextView?
+    private var lineStartOffsets: [Int] = [0]
     let gutterWidth: CGFloat = 44
 
     override var isFlipped: Bool { true }
@@ -12,6 +13,7 @@ class LineNumberGutterView: NSView {
     init(textView: NSTextView) {
         self.textView = textView
         super.init(frame: NSRect(x: 0, y: 0, width: gutterWidth, height: 100))
+        rebuildLineIndex()
 
         // Observe text changes
         NotificationCenter.default.addObserver(
@@ -35,12 +37,22 @@ class LineNumberGutterView: NSView {
     }
 
     @objc private func textDidChange(_ notification: Notification) {
+        rebuildLineIndex()
         needsDisplay = true
+    }
+
+    private func rebuildLineIndex() {
+        guard let textView else {
+            lineStartOffsets = [0]
+            return
+        }
+        lineStartOffsets = TextCoordinateMapper.lineStartOffsets(in: textView.string)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let textView = textView,
               let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer,
               let scrollView = textView.enclosingScrollView else {
             return
         }
@@ -69,23 +81,46 @@ class LineNumberGutterView: NSView {
         let visibleRect = scrollView.documentVisibleRect
         let containerOrigin = textView.textContainerOrigin
 
-        // Get all line ranges
-        var lineRanges: [NSRange] = []
-        var searchStart = 0
         let nsText = text as NSString
-        while searchStart < nsText.length {
-            let lineRange = nsText.lineRange(for: NSRange(location: searchStart, length: 0))
-            lineRanges.append(lineRange)
-            searchStart = NSMaxRange(lineRange)
-        }
+        guard !lineStartOffsets.isEmpty else { return }
+
+        let textContainerVisibleRect = NSRect(
+            x: visibleRect.minX - containerOrigin.x,
+            y: visibleRect.minY - containerOrigin.y,
+            width: visibleRect.width,
+            height: visibleRect.height
+        )
+        let visibleGlyphRange = layoutManager.glyphRange(forBoundingRect: textContainerVisibleRect, in: textContainer)
+        guard visibleGlyphRange.location != NSNotFound else { return }
+
+        let visibleCharacterRange = layoutManager.characterRange(
+            forGlyphRange: visibleGlyphRange,
+            actualGlyphRange: nil
+        )
+        let firstVisibleLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: visibleCharacterRange.location,
+            in: lineStartOffsets
+        )
+        let lastVisibleOffset = max(
+            visibleCharacterRange.location,
+            min(NSMaxRange(visibleCharacterRange), nsText.length) - 1
+        )
+        let lastVisibleLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: lastVisibleOffset,
+            in: lineStartOffsets
+        )
 
         // Draw each visible line number
-        for (index, lineRange) in lineRanges.enumerated() {
-            let lineNumber = index + 1
+        guard firstVisibleLine <= lastVisibleLine else { return }
+        for lineIndex in firstVisibleLine...lastVisibleLine {
+            let lineStart = min(lineStartOffsets[lineIndex], nsText.length)
+            let lineRange = nsText.lineRange(for: NSRange(location: lineStart, length: 0))
+            let lineNumber = lineIndex + 1
 
             // Get the glyph range for this line
             let glyphRange = layoutManager.glyphRange(forCharacterRange: lineRange, actualCharacterRange: nil)
-            guard glyphRange.location != NSNotFound else { continue }
+            guard glyphRange.location != NSNotFound,
+                  glyphRange.location < layoutManager.numberOfGlyphs else { continue }
 
             // Get the line rect in layout manager coordinates
             let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: nil)
@@ -118,10 +153,12 @@ class LineNumberGutterView: NSView {
 class EditorContainerView: NSView {
     let gutterView: LineNumberGutterView
     var foldingGutterView: FoldingGutterOverlay?
+    var proofGutterView: ProofStatusGutterOverlay?
     let scrollView: NSScrollView
     private var scrollObserver: NSObjectProtocol?
 
     private let foldingGutterWidth: CGFloat = 14
+    private let proofGutterWidth: CGFloat = 14
 
     override var isFlipped: Bool { true }
 
@@ -141,6 +178,11 @@ class EditorContainerView: NSView {
             addSubview(foldingView)
         }
 
+        // Add proof status gutter overlay
+        let proofView = ProofStatusGutterOverlay(textView: textView)
+        self.proofGutterView = proofView
+        addSubview(proofView)
+
         addSubview(scrollView)
 
         // Observe scroll changes
@@ -151,6 +193,7 @@ class EditorContainerView: NSView {
         ) { [weak self] _ in
             self?.gutterView.scrollViewBoundsDidChange()
             self?.foldingGutterView?.needsDisplay = true
+            self?.proofGutterView?.scrollDidChange()
         }
     }
 
@@ -170,16 +213,26 @@ class EditorContainerView: NSView {
         let lineNumberWidth = gutterView.gutterWidth
         let showLineNumbers = gutterView.superview != nil
         let showFolding = foldingGutterView?.superview != nil
+        let showProof = proofGutterView?.superview != nil && !(proofGutterView?.annotations.isEmpty ?? true)
         let foldWidth = showFolding ? foldingGutterWidth : 0
-        let totalGutterWidth = (showLineNumbers ? lineNumberWidth : 0) + foldWidth
+        let proofWidth = showProof ? proofGutterWidth : 0
+        let totalGutterWidth = (showLineNumbers ? lineNumberWidth : 0) + foldWidth + proofWidth
+
+        var xOffset: CGFloat = 0
 
         if showLineNumbers {
-            gutterView.frame = NSRect(x: 0, y: 0, width: lineNumberWidth, height: bounds.height)
+            gutterView.frame = NSRect(x: xOffset, y: 0, width: lineNumberWidth, height: bounds.height)
+            xOffset += lineNumberWidth
         }
 
         if showFolding, let foldingView = foldingGutterView {
-            let foldX = showLineNumbers ? lineNumberWidth : 0
-            foldingView.frame = NSRect(x: foldX, y: 0, width: foldingGutterWidth, height: bounds.height)
+            foldingView.frame = NSRect(x: xOffset, y: 0, width: foldingGutterWidth, height: bounds.height)
+            xOffset += foldingGutterWidth
+        }
+
+        if showProof, let proofView = proofGutterView {
+            proofView.frame = NSRect(x: xOffset, y: 0, width: proofGutterWidth, height: bounds.height)
+            xOffset += proofGutterWidth
         }
 
         scrollView.frame = NSRect(x: totalGutterWidth, y: 0, width: bounds.width - totalGutterWidth, height: bounds.height)
@@ -188,39 +241,63 @@ class EditorContainerView: NSView {
 
 // MARK: - Resizable Divider
 
-/// A draggable divider for resizing panels
+/// A draggable divider for resizing panels.
+///
+/// Contract: the caller owns a single `CGFloat` for the panel dimension and passes
+/// `resolveTarget` to compute the new value from `(anchor, totalTranslation)` —
+/// typically `anchor - translation` for a "bottom" panel or `anchor + translation`
+/// for a "top" panel, with clamping.
+///
+/// Why this shape: all drag state (active, anchor value) lives in `@GestureState`
+/// which SwiftUI auto-resets the moment the gesture ends — including interruptions
+/// we can't observe. Parent-owned `@Binding`s for `isDragging` tended to get stuck
+/// when `onEnded` didn't fire (modal appearance, window deactivation during drag,
+/// etc.), which then made subsequent drags use a stale anchor and appear to "do
+/// nothing". `@GestureState` eliminates that class of bugs.
 struct ResizableDivider: View {
-    @Binding var isDragging: Bool
-    let onDrag: (CGFloat) -> Void
+    /// Current value of the dimension being resized (read at drag start).
+    let current: CGFloat
+    /// Maps `(anchor, totalTranslation)` to the new value (including clamping).
+    let resolveTarget: (_ anchor: CGFloat, _ translation: CGFloat) -> CGFloat
+    /// Called whenever the computed target changes.
+    let apply: (CGFloat) -> Void
 
-    /// Tracks last cumulative translation to compute per-frame delta
-    @State private var lastTranslation: CGFloat = 0
+    /// Captured height at drag start. Automatically resets to `nil` when the
+    /// gesture ends or is interrupted, so each new drag begins fresh.
+    @GestureState private var dragAnchor: CGFloat?
+
+    @State private var isHovering = false
+
+    private var isDragging: Bool { dragAnchor != nil }
 
     var body: some View {
         Rectangle()
             .fill(isDragging ? Color.accentColor : Color(NSColor.separatorColor))
             .frame(height: isDragging ? 3 : 1)
             .frame(maxWidth: .infinity)
+            // Bigger hit area than the visible divider so the cursor doesn't have
+            // to hit a 1-pixel target.
             .contentShape(Rectangle().size(width: .infinity, height: 8))
             .onHover { hovering in
+                isHovering = hovering
                 if hovering {
-                    NSCursor.resizeUpDown.push()
+                    NSCursor.resizeUpDown.set()
                 } else if !isDragging {
-                    NSCursor.pop()
+                    NSCursor.arrow.set()
                 }
             }
             .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { value in
-                        let currentTranslation = value.translation.height
-                        let delta = currentTranslation - lastTranslation
-                        lastTranslation = currentTranslation
-                        isDragging = true
-                        onDrag(delta)
+                // `.global` coordinate space is stable regardless of the divider's
+                // own movement; `value.translation.height` is the cumulative delta
+                // since drag start in screen pixels.
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .updating($dragAnchor) { _, state, _ in
+                        if state == nil { state = current }
                     }
-                    .onEnded { _ in
-                        isDragging = false
-                        lastTranslation = 0
+                    .onChanged { value in
+                        let anchor = dragAnchor ?? current
+                        let target = resolveTarget(anchor, value.translation.height)
+                        apply(target)
                     }
             )
     }

@@ -125,11 +125,11 @@ final class TLAWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func toggleNavigator(_ sender: Any?) {
-        NotificationCenter.default.post(name: .toggleNavigatorSidebar, object: nil)
+        NotificationCenter.default.post(name: .toggleNavigatorSidebar, object: tlaDocument)
     }
 
     @objc func toggleInspector(_ sender: Any?) {
-        NotificationCenter.default.post(name: .toggleInspectorSidebar, object: nil)
+        NotificationCenter.default.post(name: .toggleInspectorSidebar, object: tlaDocument)
     }
 }
 
@@ -239,8 +239,10 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
     @Binding var selectedRange: NSRange
     @ObservedObject var findReplaceManager: FindReplaceManager
 
+    var notificationTarget: AnyObject?
     var configuration: TLASourceEditor.Configuration
     var diagnostics: [TLADiagnostic]
+    var proofAnnotations: [ProofAnnotation]
     var onTextChange: ((String) -> Void)?
     var onSelectionChange: ((NSRange) -> Void)?
     var onGoToDefinition: ((Int) -> Bool)?
@@ -253,8 +255,10 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         text: Binding<String>,
         selectedRange: Binding<NSRange> = .constant(NSRange(location: 0, length: 0)),
         findReplaceManager: FindReplaceManager,
+        notificationTarget: AnyObject? = nil,
         configuration: TLASourceEditor.Configuration = .init(),
         diagnostics: [TLADiagnostic] = [],
+        proofAnnotations: [ProofAnnotation] = [],
         onTextChange: ((String) -> Void)? = nil,
         onSelectionChange: ((NSRange) -> Void)? = nil,
         onGoToDefinition: ((Int) -> Bool)? = nil,
@@ -266,8 +270,10 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         self._text = text
         self._selectedRange = selectedRange
         self.findReplaceManager = findReplaceManager
+        self.notificationTarget = notificationTarget
         self.configuration = configuration
         self.diagnostics = diagnostics
+        self.proofAnnotations = proofAnnotations
         self.onTextChange = onTextChange
         self.onSelectionChange = onSelectionChange
         self.onGoToDefinition = onGoToDefinition
@@ -277,20 +283,21 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         self.showFoldingGutter = showFoldingGutter
     }
 
-    func makeNSView(context: Context) -> EditorContainerView {
-        // Create scroll view
+    private func makeEditorScrollView() -> NSScrollView {
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
+        return scrollView
+    }
 
-        // Check word wrap setting
-        let wordWrap = UserDefaults.standard.bool(forKey: UserSettings.Keys.wordWrap)
-
-        // Create custom text view
+    private func makeEditorTextView(in scrollView: NSScrollView) -> GoToDefinitionTextView {
+        let wordWrap = UserSettings.shared.wordWrap
         let contentSize = scrollView.contentSize
         let containerWidth = wordWrap ? contentSize.width : CGFloat.greatestFiniteMagnitude
-        let textContainer = NSTextContainer(containerSize: NSSize(width: containerWidth, height: CGFloat.greatestFiniteMagnitude))
+        let textContainer = NSTextContainer(
+            containerSize: NSSize(width: containerWidth, height: CGFloat.greatestFiniteMagnitude)
+        )
         textContainer.widthTracksTextView = wordWrap
 
         let layoutManager = NSLayoutManager()
@@ -299,9 +306,10 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         let textStorage = NSTextStorage()
         textStorage.addLayoutManager(layoutManager)
 
-        let textView = GoToDefinitionTextView(frame: NSRect(origin: .zero, size: contentSize), textContainer: textContainer)
-
-        // Configure the text view for code editing
+        let textView = GoToDefinitionTextView(
+            frame: NSRect(origin: .zero, size: contentSize),
+            textContainer: textContainer
+        )
         textView.isEditable = true
         textView.isSelectable = true
         textView.isRichText = false
@@ -317,86 +325,132 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         textView.isHorizontallyResizable = !wordWrap
         textView.autoresizingMask = wordWrap ? [.width] : []
         textView.minSize = NSSize(width: 0, height: contentSize.height)
-        textView.maxSize = NSSize(width: wordWrap ? CGFloat.greatestFiniteMagnitude : CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainerInset = NSSize(width: 0, height: 4)
+        textView.string = text
 
-        // Enable/disable horizontal scrolling based on word wrap
         scrollView.hasHorizontalScroller = !wordWrap
+        scrollView.documentView = textView
 
-        // Wire up callbacks
+        return textView
+    }
+
+    private func configureEditorCallbacks(
+        for textView: GoToDefinitionTextView,
+        coordinator: Coordinator
+    ) {
         textView.onGoToDefinition = onGoToDefinition
         textView.onHover = onHover
         textView.onHoverEnd = onHoverEnd
         textView.completionProvider = completionProvider
-
-        // Set up IntelliSense
         textView.setupIntelliSense()
-        textView.detailedCompletionProvider = context.coordinator.getDetailedCompletions
-        textView.signatureHelpProvider = context.coordinator.getSignatureHelp
+        textView.detailedCompletionProvider = coordinator.getDetailedCompletions
+        textView.signatureHelpProvider = coordinator.getSignatureHelp
+    }
 
-        // Set text
-        textView.string = text
-
-        // Add to scroll view
-        scrollView.documentView = textView
-
-        // Add small top padding
-        textView.textContainerInset = NSSize(width: 0, height: 4)
-
-        // Store reference and initial text
+    private func configureCoordinator(for textView: GoToDefinitionTextView, context: Context) {
         context.coordinator.textView = textView
         context.coordinator.lastKnownText = text
+    }
 
-        // Connect FindReplaceManager to the text view
-        Task { @MainActor in
-            findReplaceManager.textView = textView
-        }
-
-        // Create highlighter for this text view with saved color scheme
-        let savedColorScheme = UserDefaults.standard.string(forKey: UserSettings.Keys.colorScheme) ?? "Default"
+    private func applyInitialTheme(
+        to textView: GoToDefinitionTextView,
+        coordinator: Coordinator
+    ) {
+        let savedColorScheme = UserSettings.shared.colorScheme
         let theme = EditorColorScheme(rawValue: savedColorScheme)?.syntaxTheme ?? .default
-        context.coordinator.highlighter = TLASyntaxHighlighter(textView: textView, theme: theme)
-        context.coordinator.highlighter?.highlightImmediately()
 
-        // Apply theme colors to text view
+        coordinator.highlighter = TLASyntaxHighlighter(textView: textView, theme: theme)
+        coordinator.highlighter?.highlightImmediately()
         textView.backgroundColor = theme.background
         textView.insertionPointColor = theme.cursor
+    }
 
-        // Create diagnostic highlighter
-        context.coordinator.diagnosticHighlighter = DiagnosticHighlighter(textView: textView)
+    private func configureDiagnostics(
+        for textView: GoToDefinitionTextView,
+        coordinator: Coordinator
+    ) {
+        coordinator.diagnosticHighlighter = DiagnosticHighlighter(textView: textView)
         if !diagnostics.isEmpty {
-            context.coordinator.diagnosticHighlighter?.updateDiagnostics(diagnostics, in: text)
-            context.coordinator.lastKnownDiagnostics = diagnostics
+            coordinator.diagnosticHighlighter?.updateDiagnostics(diagnostics, in: text)
+            coordinator.lastKnownDiagnostics = diagnostics
         }
+    }
 
-        // Set up editor enhancements (current line highlight, bracket matching)
-        let highlightCurrentLine = UserDefaults.standard.bool(forKey: UserSettings.Keys.highlightCurrentLine)
-        let matchBrackets = UserDefaults.standard.bool(forKey: UserSettings.Keys.matchBrackets)
-        context.coordinator.editorEnhancements = EditorEnhancements(
+    private func configureEditorEnhancements(
+        for textView: GoToDefinitionTextView,
+        coordinator: Coordinator
+    ) {
+        let highlightCurrentLine = UserSettings.shared.highlightCurrentLine
+        let matchBrackets = UserSettings.shared.matchBrackets
+        coordinator.editorEnhancements = EditorEnhancements(
             textView: textView,
             enableCurrentLineHighlight: highlightCurrentLine,
             enableBracketMatching: matchBrackets
         )
+    }
 
-        // Set up folding if enabled
-        var foldingManager: CodeFoldingManager? = nil
-        if showFoldingGutter {
-            let manager = CodeFoldingManager(textView: textView)
-            textView.foldingManager = manager
-            context.coordinator.foldingManager = manager
-            foldingManager = manager
-
-            Task { @MainActor in
-                manager.updateFoldingRanges(from: text)
-            }
+    private func configureFolding(
+        for textView: GoToDefinitionTextView,
+        coordinator: Coordinator
+    ) -> CodeFoldingManager? {
+        guard showFoldingGutter else {
+            return nil
         }
 
-        // Listen for text changes
+        let manager = CodeFoldingManager(textView: textView)
+        textView.foldingManager = manager
+        coordinator.foldingManager = manager
+
+        Task { @MainActor in
+            manager.updateFoldingRanges(from: text)
+        }
+
+        return manager
+    }
+
+    private func connectFindReplace(to textView: GoToDefinitionTextView) {
+        Task { @MainActor in
+            findReplaceManager.textView = textView
+        }
+    }
+
+    private func installEditorObservers(for textView: NSTextView, coordinator: Coordinator) {
         NotificationCenter.default.addObserver(
-            context.coordinator,
+            coordinator,
             selector: #selector(Coordinator.textDidChange(_:)),
             name: NSText.didChangeNotification,
             object: textView
         )
+        NotificationCenter.default.addObserver(
+            coordinator,
+            selector: #selector(Coordinator.textViewDidChangeSelection(_:)),
+            name: NSTextView.didChangeSelectionNotification,
+            object: textView
+        )
+    }
+
+    private func focus(_ textView: NSTextView) {
+        DispatchQueue.main.async {
+            textView.window?.makeFirstResponder(textView)
+        }
+    }
+
+    func makeNSView(context: Context) -> EditorContainerView {
+        let scrollView = makeEditorScrollView()
+        let textView = makeEditorTextView(in: scrollView)
+
+        configureEditorCallbacks(for: textView, coordinator: context.coordinator)
+        configureCoordinator(for: textView, context: context)
+        connectFindReplace(to: textView)
+        applyInitialTheme(to: textView, coordinator: context.coordinator)
+        configureDiagnostics(for: textView, coordinator: context.coordinator)
+        configureEditorEnhancements(for: textView, coordinator: context.coordinator)
+        let foldingManager = configureFolding(for: textView, coordinator: context.coordinator)
+        installEditorObservers(for: textView, coordinator: context.coordinator)
 
         // Create container with line numbers, folding gutter, and editor
         let containerView = EditorContainerView(
@@ -406,87 +460,104 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             foldingManager: foldingManager
         )
 
-        // Make first responder
-        DispatchQueue.main.async {
-            textView.window?.makeFirstResponder(textView)
-        }
-
+        focus(textView)
         return containerView
     }
 
-    func updateNSView(_ containerView: EditorContainerView, context: Context) {
-        guard let textView = containerView.scrollView.documentView as? NSTextView else { return }
-
-        // Update font if changed
+    private func syncEditorConfiguration(for textView: NSTextView) {
         if textView.font != configuration.font {
             textView.font = configuration.font
         }
 
-        // Update FindReplaceManager reference if needed
         if findReplaceManager.textView !== textView {
             Task { @MainActor in
                 findReplaceManager.textView = textView
             }
         }
+    }
 
-        // Only update if the binding changed from OUTSIDE
-        if context.coordinator.lastKnownText != text {
-            context.coordinator.lastKnownText = text
-
-            NotificationCenter.default.removeObserver(
-                context.coordinator,
-                name: NSText.didChangeNotification,
-                object: textView
-            )
-
-            textView.string = text
-
-            NotificationCenter.default.addObserver(
-                context.coordinator,
-                selector: #selector(Coordinator.textDidChange(_:)),
-                name: NSText.didChangeNotification,
-                object: textView
-            )
-
-            context.coordinator.highlighter?.highlightImmediately()
-
-            // Re-apply diagnostics after text change
-            if !context.coordinator.lastKnownDiagnostics.isEmpty {
-                context.coordinator.diagnosticHighlighter?.updateDiagnostics(
-                    context.coordinator.lastKnownDiagnostics,
-                    in: text
-                )
-            }
+    private func syncTextIfNeeded(for textView: NSTextView, coordinator: Coordinator) {
+        guard coordinator.lastKnownText != text else {
+            return
         }
 
-        // Update diagnostics if changed
-        if !diagnosticsEqual(context.coordinator.lastKnownDiagnostics, diagnostics) {
-            context.coordinator.lastKnownDiagnostics = diagnostics
-            context.coordinator.diagnosticHighlighter?.updateDiagnostics(diagnostics, in: textView.string)
-        }
+        coordinator.lastKnownText = text
 
-        // Handle selection changes from external sources (e.g., symbol outline navigation)
-        if context.coordinator.lastKnownSelection != selectedRange {
-            context.coordinator.lastKnownSelection = selectedRange
+        NotificationCenter.default.removeObserver(
+            coordinator,
+            name: NSText.didChangeNotification,
+            object: textView
+        )
 
-            // Ensure the range is valid
-            let maxLocation = textView.string.count
-            let validLocation = min(selectedRange.location, maxLocation)
-            let validLength = min(selectedRange.length, maxLocation - validLocation)
-            let validRange = NSRange(location: validLocation, length: validLength)
+        textView.string = text
 
-            // Set selection and scroll to it
-            textView.setSelectedRange(validRange)
-            textView.scrollRangeToVisible(validRange)
+        NotificationCenter.default.addObserver(
+            coordinator,
+            selector: #selector(Coordinator.textDidChange(_:)),
+            name: NSText.didChangeNotification,
+            object: textView
+        )
+
+        coordinator.highlighter?.highlightImmediately()
+
+        if !coordinator.lastKnownDiagnostics.isEmpty {
+            coordinator.diagnosticHighlighter?.updateDiagnostics(
+                coordinator.lastKnownDiagnostics,
+                in: text
+            )
         }
     }
 
-    private func diagnosticsEqual(_ lhs: [TLADiagnostic], _ rhs: [TLADiagnostic]) -> Bool {
-        guard lhs.count == rhs.count else { return false }
-        for (l, r) in zip(lhs, rhs) {
-            if l.id != r.id { return false }
+    private func syncDiagnostics(
+        for textView: NSTextView,
+        coordinator: Coordinator
+    ) {
+        guard !diagnosticsEqual(coordinator.lastKnownDiagnostics, diagnostics) else {
+            return
         }
-        return true
+
+        coordinator.lastKnownDiagnostics = diagnostics
+        coordinator.diagnosticHighlighter?.updateDiagnostics(diagnostics, in: textView.string)
+    }
+
+    private func syncProofAnnotations(for containerView: EditorContainerView) {
+        guard let proofGutter = containerView.proofGutterView,
+              proofGutter.annotations != proofAnnotations else {
+            return
+        }
+
+        proofGutter.annotations = proofAnnotations
+        containerView.needsLayout = true
+    }
+
+    private func syncSelectionIfNeeded(for textView: NSTextView, coordinator: Coordinator) {
+        guard coordinator.lastKnownSelection != selectedRange else {
+            return
+        }
+
+        coordinator.lastKnownSelection = selectedRange
+
+        let maxLocation = (textView.string as NSString).length
+        let validLocation = min(selectedRange.location, maxLocation)
+        let validLength = min(selectedRange.length, maxLocation - validLocation)
+        let validRange = NSRange(location: validLocation, length: validLength)
+
+        textView.setSelectedRange(validRange)
+        textView.scrollRangeToVisible(validRange)
+    }
+
+    func updateNSView(_ containerView: EditorContainerView, context: Context) {
+        guard let textView = containerView.scrollView.documentView as? NSTextView else { return }
+
+        syncEditorConfiguration(for: textView)
+        syncTextIfNeeded(for: textView, coordinator: context.coordinator)
+        syncDiagnostics(for: textView, coordinator: context.coordinator)
+        syncProofAnnotations(for: containerView)
+        syncSelectionIfNeeded(for: textView, coordinator: context.coordinator)
+    }
+
+    private func diagnosticsEqual(_ lhs: [TLADiagnostic], _ rhs: [TLADiagnostic]) -> Bool {
+        lhs == rhs
     }
 
     func makeCoordinator() -> Coordinator {
@@ -541,10 +612,21 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             // Cancel any pending tasks
             diagnosticsTask?.cancel()
             foldingTask?.cancel()
+            NotificationCenter.default.removeObserver(self)
             // Remove notification observers
             for observer in notificationObservers {
                 NotificationCenter.default.removeObserver(observer)
             }
+        }
+
+        private func handles(_ notification: Notification) -> Bool {
+            guard let target = parent.notificationTarget else {
+                return notification.object == nil
+            }
+            guard let object = notification.object as AnyObject? else {
+                return false
+            }
+            return object === target
         }
 
         private func setupFoldNotifications() {
@@ -552,9 +634,10 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
                 forName: .foldAll,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in
-                self?.foldingManager?.foldAll()
-                self?.highlighter?.highlightImmediately()
+            ) { [weak self] notification in
+                guard let self, self.handles(notification) else { return }
+                self.foldingManager?.foldAll()
+                self.highlighter?.highlightImmediately()
             }
             notificationObservers.append(foldAllObserver)
 
@@ -562,9 +645,10 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
                 forName: .unfoldAll,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in
-                self?.foldingManager?.unfoldAll()
-                self?.highlighter?.highlightImmediately()
+            ) { [weak self] notification in
+                guard let self, self.handles(notification) else { return }
+                self.foldingManager?.unfoldAll()
+                self.highlighter?.highlightImmediately()
             }
             notificationObservers.append(unfoldAllObserver)
 
@@ -572,8 +656,9 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
                 forName: .toggleFold,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in
-                self?.toggleFoldAtCursor()
+            ) { [weak self] notification in
+                guard let self, self.handles(notification) else { return }
+                self.toggleFoldAtCursor()
             }
             notificationObservers.append(toggleFoldObserver)
         }
@@ -584,8 +669,10 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
 
             let cursorLocation = textView.selectedRange().location
             let text = textView.string
-            let lines = text.prefix(cursorLocation).components(separatedBy: "\n")
-            let currentLine = lines.count - 1
+            let currentLine = TextCoordinateMapper.lineAndColumn(
+                forUTF16Offset: cursorLocation,
+                in: text
+            ).line
 
             if let range = foldingManager.foldingRange(at: currentLine) {
                 foldingManager.toggleFold(at: range.startLine)
@@ -600,14 +687,28 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             highlighter?.highlightImmediately()
         }
 
+        @objc public func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = textView, !isUpdating else { return }
+
+            let newSelection = textView.selectedRange()
+            guard newSelection != lastKnownSelection else { return }
+
+            lastKnownSelection = newSelection
+            parent.selectedRange = newSelection
+            parent.onSelectionChange?(newSelection)
+        }
+
         @objc public func textDidChange(_ notification: Notification) {
             guard let textView = textView else { return }
 
             let newText = textView.string
             lastKnownText = newText
+            lastKnownSelection = textView.selectedRange()
 
             isUpdating = true
             parent.text = newText
+            parent.selectedRange = lastKnownSelection
+            parent.onSelectionChange?(lastKnownSelection)
             parent.onTextChange?(newText)
             isUpdating = false
 
@@ -627,6 +728,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             }
 
             foldingTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
                 guard !Task.isCancelled else { return }
                 self.foldingManager?.updateFoldingRanges(from: newText)
             }
@@ -643,12 +745,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         func getDetailedCompletions(at position: Int) async -> [TLADetailedCompletionItem] {
             guard let textView = textView else { return [] }
             let text = textView.string
-
-            // Calculate position as TLAPosition
-            let lines = text.prefix(position).components(separatedBy: "\n")
-            let lineNumber = UInt32(lines.count - 1)
-            let columnNumber = UInt32(lines.last?.count ?? 0)
-            let tlaPosition = TLAPosition(line: lineNumber, column: columnNumber)
+            let tlaPosition = TextCoordinateMapper.position(forUTF16Offset: position, in: text)
 
             // Get parse result and completions from TLACore
             do {
@@ -668,12 +765,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         func getSignatureHelp(at position: Int) async -> TLASignatureHelp? {
             guard let textView = textView else { return nil }
             let text = textView.string
-
-            // Calculate position as TLAPosition
-            let lines = text.prefix(position).components(separatedBy: "\n")
-            let lineNumber = UInt32(lines.count - 1)
-            let columnNumber = UInt32(lines.last?.count ?? 0)
-            let tlaPosition = TLAPosition(line: lineNumber, column: columnNumber)
+            let tlaPosition = TextCoordinateMapper.position(forUTF16Offset: position, in: text)
 
             // Get parse result and signature help from TLACore
             do {
@@ -748,6 +840,12 @@ extension TLAEditorViewWithFindReplace {
         copy.diagnostics = diagnostics
         return copy
     }
+
+    func proofAnnotations(_ annotations: [ProofAnnotation]) -> TLAEditorViewWithFindReplace {
+        var copy = self
+        copy.proofAnnotations = annotations
+        return copy
+    }
 }
 
 // HoverPopover is defined in Document/HoverPopover.swift
@@ -757,4 +855,3 @@ extension TLAEditorViewWithFindReplace {
 
 // InspectorSidebar is now defined in Views/Sidebar/InspectorViews.swift as EnhancedInspectorSidebar
 typealias InspectorSidebar = EnhancedInspectorSidebar
-

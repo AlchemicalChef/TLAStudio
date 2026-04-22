@@ -1,0 +1,70 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.xcresult
+
+# Rust/Cargo
+Sources/TLACore/target/
+**/*.rs.bk
+
+# TLA+ Studio specific
+.tlacache/
+TestSpecs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+PLAN.md
+
+# Build artifacts
+build/
+*.o
+*.a
+*.dylib
+Scripts/tlc-native-epsilon
+Scripts/tlc-native-instrumented
+Scripts/tlc-native-pgo
+Sources/TLAStudioApp/Resources/tlc-native
+Sources/TLAStudioApp/Resources/tlc-native-fast
+
+# Distributable build outputs — never commit to the repo
+*.dmg
+*.zip
+
+# External build trees (tlapm source checkout and its OCaml build cache)
+.deps/
+Scripts/tlapm/
