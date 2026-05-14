@@ -299,11 +299,12 @@ public struct TLAEditorView: NSViewRepresentable {
             guard let textView = textView,
                   let foldingManager = foldingManager else { return }
 
-            // Get current cursor line
             let cursorLocation = textView.selectedRange().location
             let text = textView.string
-            let lines = text.prefix(cursorLocation).components(separatedBy: "\n")
-            let currentLine = lines.count - 1
+            let currentLine = TextCoordinateMapper.lineAndColumn(
+                forUTF16Offset: cursorLocation,
+                in: text
+            ).line
 
             // Find if there's a foldable region at or containing this line
             if let range = foldingManager.foldingRange(at: currentLine) {
@@ -484,11 +485,7 @@ public struct TLAEditorView: NSViewRepresentable {
             guard let textView = textView else { return [] }
             let text = textView.string
 
-            // Calculate position as TLAPosition
-            let lines = text.prefix(position).components(separatedBy: "\n")
-            let lineNumber = UInt32(lines.count - 1)
-            let columnNumber = UInt32(lines.last?.count ?? 0)
-            let tlaPosition = TLAPosition(line: lineNumber, column: columnNumber)
+            let tlaPosition = TextCoordinateMapper.position(forUTF16Offset: position, in: text)
 
             // Get parse result and completions from TLACore
             do {
@@ -509,11 +506,7 @@ public struct TLAEditorView: NSViewRepresentable {
             guard let textView = textView else { return nil }
             let text = textView.string
 
-            // Calculate position as TLAPosition
-            let lines = text.prefix(position).components(separatedBy: "\n")
-            let lineNumber = UInt32(lines.count - 1)
-            let columnNumber = UInt32(lines.last?.count ?? 0)
-            let tlaPosition = TLAPosition(line: lineNumber, column: columnNumber)
+            let tlaPosition = TextCoordinateMapper.position(forUTF16Offset: position, in: text)
 
             // Get parse result and signature help from TLACore
             do {
@@ -597,22 +590,7 @@ class CodeFoldingManager {
             return
         }
 
-        let lines = textView.string.components(separatedBy: "\n")
-
-        // Calculate character range to hide (from end of first line to end of last line)
-        var startOffset = 0
-        for i in 0..<range.startLine {
-            startOffset += lines[i].count + 1  // +1 for newline
-        }
-        startOffset += lines[range.startLine].count  // End of first line
-
-        var endOffset = 0
-        for i in 0...min(range.endLine, lines.count - 1) {
-            endOffset += lines[i].count + 1
-        }
-        endOffset -= 1  // Don't include final newline if at end
-
-        let foldRange = NSRange(location: startOffset, length: endOffset - startOffset)
+        guard let foldRange = hiddenTextRange(for: range, in: textView.string) else { return }
 
         // Add folded attribute to hide the text
         textStorage.beginEditing()
@@ -629,22 +607,7 @@ class CodeFoldingManager {
             return
         }
 
-        let lines = textView.string.components(separatedBy: "\n")
-
-        // Calculate character range
-        var startOffset = 0
-        for i in 0..<range.startLine {
-            startOffset += lines[i].count + 1
-        }
-        startOffset += lines[range.startLine].count
-
-        var endOffset = 0
-        for i in 0...min(range.endLine, lines.count - 1) {
-            endOffset += lines[i].count + 1
-        }
-        endOffset -= 1
-
-        let unfoldRange = NSRange(location: startOffset, length: endOffset - startOffset)
+        guard let unfoldRange = hiddenTextRange(for: range, in: textView.string) else { return }
 
         // Remove folded attributes
         textStorage.beginEditing()
@@ -656,6 +619,38 @@ class CodeFoldingManager {
         textStorage.endEditing()
 
         foldedRanges.remove(range.startLine)
+    }
+
+    private func hiddenTextRange(for range: TLAFoldingRange, in text: String) -> NSRange? {
+        let analysis = TextCoordinateMapper.analyze(text)
+        let lineCount = analysis.lineStartOffsets.count
+        guard range.startLine >= 0, range.startLine < lineCount else { return nil }
+
+        let endLine = max(range.startLine, min(range.endLine, lineCount - 1))
+        let startOffset = lineEndOffset(
+            forLine: range.startLine,
+            lineStartOffsets: analysis.lineStartOffsets,
+            textLength: analysis.utf16Length
+        )
+        let endOffset = lineEndOffset(
+            forLine: endLine,
+            lineStartOffsets: analysis.lineStartOffsets,
+            textLength: analysis.utf16Length
+        )
+
+        guard endOffset > startOffset else { return nil }
+        return NSRange(location: startOffset, length: endOffset - startOffset)
+    }
+
+    private func lineEndOffset(
+        forLine line: Int,
+        lineStartOffsets: [Int],
+        textLength: Int
+    ) -> Int {
+        if line + 1 < lineStartOffsets.count {
+            return max(lineStartOffsets[line], lineStartOffsets[line + 1] - 1)
+        }
+        return textLength
     }
 
     /// Fold all foldable regions

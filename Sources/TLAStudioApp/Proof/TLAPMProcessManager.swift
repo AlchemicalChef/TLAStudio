@@ -3,6 +3,12 @@ import os
 
 private let logger = Log.logger(category: "TLAPM")
 
+private extension String {
+    var nonEmptyOutputLines: [String] {
+        components(separatedBy: .newlines).filter { !$0.isEmpty }
+    }
+}
+
 // MARK: - TLAPM Process Manager
 
 /// Actor that manages TLAPM (TLA+ Proof Manager) processes
@@ -74,26 +80,113 @@ actor TLAPMProcessManager {
 
     /// Path to TLAPS standard library
     private var stdlibPath: URL? {
-        // Check app bundle Resources/lib/tlapm/stdlib
-        if let bundlePath = Bundle.main.resourcePath {
-            let libPath = URL(fileURLWithPath: bundlePath)
-                .appendingPathComponent("lib/tlapm/stdlib")
-            if FileManager.default.fileExists(atPath: libPath.path) {
-                return libPath
+        // Upstream dune install uses `lib/tlapm/stdlib/`; our bundle flattens to `lib/tlapm/`.
+        // Probe both, and require TLAPS.tla to actually exist so we never hand TLAPM a
+        // ghost directory that silently fails the `EXTENDS TLAPS` lookup.
+        let candidateSubdirs = ["lib/tlapm/stdlib", "lib/tlapm"]
+
+        func firstValidStdlib(under base: URL) -> URL? {
+            for subdir in candidateSubdirs {
+                let libPath = base.appendingPathComponent(subdir)
+                let tlapsFile = libPath.appendingPathComponent("TLAPS.tla")
+                if FileManager.default.fileExists(atPath: tlapsFile.path) {
+                    return libPath
+                }
+            }
+            return nil
+        }
+
+        for root in Self.bundleResourceRoots() {
+            if let found = firstValidStdlib(under: root) {
+                return found
             }
         }
 
-        // Check relative to tlapm binary
+        // Check relative to tlapm binary (handles system-installed TLAPM via dune).
         if let tlapm = tlapmPath {
-            let relativePath = tlapm.deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("lib/tlapm/stdlib")
-            if FileManager.default.fileExists(atPath: relativePath.path) {
-                return relativePath
+            let installPrefix = tlapm.deletingLastPathComponent().deletingLastPathComponent()
+            if let found = firstValidStdlib(under: installPrefix) {
+                return found
             }
         }
 
         return nil
+    }
+
+    /// All bundle roots that may contain our packaged resources.
+    ///
+    /// SPM's generated `Bundle.module` accessor only checks `Bundle.main.bundleURL` + the
+    /// bundle name — it misses `Contents/Resources/TLAStudio_TLAStudioApp.bundle/`, which is
+    /// where `build-app.sh` actually places the SPM bundle. So `Bundle.module` silently
+    /// falls through to its build-time absolute path (e.g. `.build/.../release/...`). That
+    /// means an installed .app still reaches into `.build/` for resources and breaks when
+    /// `.build/` is deleted or the app is copied to another machine. We enumerate the
+    /// nested SPM bundle under `Contents/Resources/` so lookups work regardless of what
+    /// path `Bundle.module` resolved to.
+    static func bundleResourceRoots() -> [URL] {
+        let spmBundleName = "TLAStudio_TLAStudioApp.bundle"
+        var roots: [URL] = []
+        var seen = Set<String>()
+
+        func append(_ url: URL) {
+            let key = url.standardizedFileURL.path
+            guard FileManager.default.fileExists(atPath: key), seen.insert(key).inserted else { return }
+            roots.append(url)
+        }
+
+        if let modulePath = Bundle.module.resourcePath {
+            append(URL(fileURLWithPath: modulePath))
+        }
+        if let mainResources = Bundle.main.resourcePath {
+            let mainURL = URL(fileURLWithPath: mainResources)
+            append(mainURL.appendingPathComponent(spmBundleName))
+            append(mainURL)
+        }
+        // Raw SPM exec with resource bundle alongside the executable.
+        if let exec = Bundle.main.executableURL?.deletingLastPathComponent() {
+            append(exec.appendingPathComponent(spmBundleName))
+        }
+        return roots
+    }
+
+    /// Matches TLAPM's "Executable "foo" not found" error surfaced via `@!!reason:`.
+    /// The parser only captures the first line of `@!!reason:` so we look for this
+    /// prefix (which is enough to disambiguate from a genuine proof failure).
+    private static let executableNotFoundRegex = #"Executable "[^"]+" not found"#
+
+    /// If any failed/timed-out obligation's reason indicates a missing tool, delete
+    /// `.tlacache/<spec>.tlaps/fingerprints`. TLAPM caches the full failure reason and
+    /// replays it with `@!!already:true` on subsequent runs — so once a fingerprint is
+    /// poisoned by a tooling-environment error, it sticks even after the tool is
+    /// installed, until the cache is cleared. `fingerprints.history/` is preserved.
+    static func invalidateFingerprintsIfEnvironmentFailure(
+        specURL: URL,
+        obligations: [ProofObligation]
+    ) {
+        let hasEnvFailure = obligations.contains { obl in
+            guard obl.status == .failed || obl.status == .timeout,
+                  let msg = obl.errorMessage else { return false }
+            return msg.range(of: executableNotFoundRegex, options: .regularExpression) != nil
+        }
+        guard hasEnvFailure else { return }
+
+        let stem = specURL.deletingPathExtension().lastPathComponent
+        let fingerprints = specURL.deletingLastPathComponent()
+            .appendingPathComponent(".tlacache")
+            .appendingPathComponent("\(stem).tlaps")
+            .appendingPathComponent("fingerprints")
+
+        guard FileManager.default.fileExists(atPath: fingerprints.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: fingerprints)
+            logger.warning("""
+                Cleared TLAPM fingerprint cache at \(fingerprints.path): an obligation \
+                failed with 'Executable not found', which is a tooling-environment error. \
+                Re-run proof to recheck affected steps.
+                """)
+        } catch {
+            logger.error("Failed to clear stale fingerprints at \(fingerprints.path): \(error.localizedDescription)")
+        }
     }
 
     private var configuredModuleLibraryPaths: [URL] {
@@ -285,11 +378,7 @@ actor TLAPMProcessManager {
 
                 // Log raw output to OutputManager
                 if let str = String(data: data, encoding: .utf8) {
-                    for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                        DispatchQueue.main.async {
-                            OutputManager.shared.logTLAPM(line)
-                        }
-                    }
+                    OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
                 }
 
                 if let update = parser.parse(data) {
@@ -311,11 +400,7 @@ actor TLAPMProcessManager {
 
                 if let str = String(data: data, encoding: .utf8) {
                     // Log to OutputManager
-                    for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                        DispatchQueue.main.async {
-                            OutputManager.shared.logTLAPM(line, isError: false)
-                        }
-                    }
+                    OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
                 }
 
                 // Parse stderr - TLAPM outputs proof results to stderr
@@ -331,11 +416,17 @@ actor TLAPMProcessManager {
         }
 
         // Start process
+        let exitObserver = ProcessExitObserver()
+        process.terminationHandler = { terminatedProcess in
+            exitObserver.complete(status: terminatedProcess.terminationStatus)
+        }
+
         do {
             try process.run()
             processStarted = true
             ProcessRegistry.shared.register(process, for: sessionId)
         } catch {
+            process.terminationHandler = nil
             activeProcesses.removeValue(forKey: sessionId)
             parsers.removeValue(forKey: sessionId)
             streamStates.removeValue(forKey: sessionId)?.finish()
@@ -363,11 +454,8 @@ actor TLAPMProcessManager {
         progressTasks[sessionId] = progressTask
 
         // Wait for completion using async termination handler
-        let exitStatus = await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
-            process.terminationHandler = { terminatedProcess in
-                continuation.resume(returning: terminatedProcess.terminationStatus)
-            }
-        }
+        let exitStatus = await exitObserver.wait(for: process)
+        process.terminationHandler = nil
 
         // Drain any remaining buffered data before clearing handlers.
         // readabilityHandler may not fire for data already in the pipe buffer
@@ -375,11 +463,7 @@ actor TLAPMProcessManager {
         let lastStdout = stdoutHandle.availableData
         if !lastStdout.isEmpty {
             if let str = String(data: lastStdout, encoding: .utf8) {
-                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                    DispatchQueue.main.async {
-                        OutputManager.shared.logTLAPM(line)
-                    }
-                }
+                OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
             }
             if let update = parser.parse(lastStdout) {
                 streamState.yield(update)
@@ -388,11 +472,7 @@ actor TLAPMProcessManager {
         let lastStderr = stderrHandle.availableData
         if !lastStderr.isEmpty {
             if let str = String(data: lastStderr, encoding: .utf8) {
-                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                    DispatchQueue.main.async {
-                        OutputManager.shared.logTLAPM(line, isError: false)
-                    }
-                }
+                OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
             }
             if let update = parser.parse(lastStderr) {
                 streamState.yield(update)
@@ -418,6 +498,15 @@ actor TLAPMProcessManager {
         let duration = Date().timeIntervalSince(startTime)
         let trivialCount = parser.getTrivialCount()  // Get before finalResult
         let result = parser.finalResult(exitCode: exitStatus, duration: duration)
+
+        // Drop TLAPM's fingerprint cache if any obligation failed with a tooling-environment
+        // error (e.g. "Executable 'ls4' not found"). TLAPM stores the reason in the cache
+        // and replays it with @!!already:true next run, so even after the tool is installed
+        // the old failure persists until the cache is cleared.
+        Self.invalidateFingerprintsIfEnvironmentFailure(
+            specURL: specURL,
+            obligations: result.obligations
+        )
 
         parsers.removeValue(forKey: sessionId)
 
@@ -547,11 +636,7 @@ actor TLAPMProcessManager {
                 outputAccumulator?.appendStderr(data)
                 // Log to output manager
                 if let str = String(data: data, encoding: .utf8) {
-                    for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                        DispatchQueue.main.async {
-                            OutputManager.shared.logTLAPM(line)
-                        }
-                    }
+                    OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
                 }
             }
         }
@@ -611,6 +696,11 @@ actor TLAPMProcessManager {
 
         let duration = Date().timeIntervalSince(startTime)
         let obligations = parser.getAllObligations()
+
+        Self.invalidateFingerprintsIfEnvironmentFailure(
+            specURL: specURL,
+            obligations: obligations
+        )
 
         // Find the obligation matching our line
         if let obligation = obligations.first(where: { obl in
@@ -728,16 +818,13 @@ actor TLAPMProcessManager {
             }
         }
 
-        // Add backend prover paths to PATH for TLAPM discovery. We check the SPM module
-        // bundle (`Bundle.module`) explicitly because for a raw executable launch
-        // `Bundle.main.resourcePath` is the enclosing directory, not the resource bundle.
+        // Add backend prover paths to PATH for TLAPM discovery. Both old
+        // (`lib/tlapm/backends/bin`) and new (`bin`) layouts are supported so we don't
+        // break users on either build. `Provers/` is the historical prover dir.
         var pathComponents: [String] = discoveredDirs
-        let bundleRoots = [Bundle.module.resourcePath, Bundle.main.resourcePath].compactMap { $0 }
-        for root in bundleRoots {
-            // Both old (`lib/tlapm/backends/bin`) and new (`bin`) layouts are supported so
-            // we don't break users on either build. `Provers/` is the historical prover dir.
+        for root in Self.bundleResourceRoots() {
             for subdir in ["bin", "Provers", "lib/tlapm/backends/bin"] {
-                let candidate = URL(fileURLWithPath: root).appendingPathComponent(subdir).path
+                let candidate = root.appendingPathComponent(subdir).path
                 if FileManager.default.fileExists(atPath: candidate),
                    !pathComponents.contains(candidate) {
                     pathComponents.append(candidate)

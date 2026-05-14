@@ -319,20 +319,21 @@ public final class TLASyntaxHighlighter {
         lastHighlightedVisibleRange = highlightRange
         lastHighlightedContentHash = contentHash
 
-        // Get highlights for this range (prefer tree-sitter, fallback to regex)
-        var highlights = highlightWithTreeSitter(rangeText) ?? highlightWithRegex(rangeText)
-
-        // Adjust ranges to absolute positions
-        highlights = highlights.map { highlight in
-            HighlightRange(
-                range: NSRange(
-                    location: highlight.range.location + highlightRange.location,
-                    length: highlight.range.length
-                ),
-                color: highlight.color,
-                style: highlight.style
-            )
-        }
+        // Get highlights for this range. Tree-sitter providers operate on the full
+        // source so cached absolute ranges can be reused for visible highlighting.
+        let highlights = highlightWithTreeSitter(currentText, restrictingTo: highlightRange) ?? {
+            let regexHighlights = highlightWithRegex(rangeText)
+            return regexHighlights.map { highlight in
+                HighlightRange(
+                    range: NSRange(
+                        location: highlight.range.location + highlightRange.location,
+                        length: highlight.range.length
+                    ),
+                    color: highlight.color,
+                    style: highlight.style
+                )
+            }
+        }()
 
         // Apply highlights
         textStorage.beginEditing()
@@ -377,7 +378,7 @@ public final class TLASyntaxHighlighter {
 
     /// Attempt to highlight using tree-sitter tokens from the provider.
     /// Returns nil if no provider is set or it returns empty results.
-    private func highlightWithTreeSitter(_ text: String) -> [HighlightRange]? {
+    private func highlightWithTreeSitter(_ text: String, restrictingTo visibleRange: NSRange? = nil) -> [HighlightRange]? {
         guard let provider = treeSitterHighlightProvider else { return nil }
         let tokens = provider(text)
         guard !tokens.isEmpty else { return nil }
@@ -386,9 +387,18 @@ public final class TLASyntaxHighlighter {
         for (range, captureName) in tokens {
             // Look up the capture name in our token color map
             if let colorKeyPath = tokenColorMap[captureName] {
+                let effectiveRange: NSRange
+                if let visibleRange {
+                    let intersection = NSIntersectionRange(range, visibleRange)
+                    guard intersection.length > 0 else { continue }
+                    effectiveRange = intersection
+                } else {
+                    effectiveRange = range
+                }
+
                 let color = theme[keyPath: colorKeyPath]
                 let style: HighlightRange.Style = captureName.hasPrefix("keyword") ? .bold : .plain
-                highlights.append(HighlightRange(range: range, color: color, style: style))
+                highlights.append(HighlightRange(range: effectiveRange, color: color, style: style))
             }
         }
         return highlights.isEmpty ? nil : highlights
@@ -512,6 +522,7 @@ extension TLASyntaxHighlighter {
         // Reset the cached visible range and content hash to force re-highlighting
         lastHighlightedVisibleRange = NSRange(location: 0, length: 0)
         lastHighlightedContentHash = 0
+        needsFullReset = true
         scheduleHighlighting()
     }
 

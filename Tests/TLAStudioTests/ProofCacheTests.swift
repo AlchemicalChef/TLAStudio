@@ -212,6 +212,26 @@ final class ProofCacheTests: TempDirectoryTestCase {
         XCTAssertNil(result)
     }
 
+    func testUnsafeFingerprintIsNotCached() async throws {
+        let cache = try await ProofCache(directory: tempDirectory)
+        let outsideURL = tempDirectory.deletingLastPathComponent().appendingPathComponent("escaped-proof-cache.json")
+        try? FileManager.default.removeItem(at: outsideURL)
+
+        await cache.cacheEntry(
+            fingerprint: "../escaped-proof-cache",
+            status: .proved,
+            backend: .auto,
+            duration: 0.1
+        )
+
+        let result = await cache.getCachedResult(fingerprint: "../escaped-proof-cache")
+        let fingerprints = await cache.cachedFingerprints
+
+        XCTAssertNil(result)
+        XCTAssertTrue(fingerprints.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outsideURL.path))
+    }
+
     func testHasCachedResult() async throws {
         let cache = try await ProofCache(directory: tempDirectory)
 

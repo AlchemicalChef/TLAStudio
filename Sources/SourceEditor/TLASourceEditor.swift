@@ -476,7 +476,7 @@ public class LineNumberRulerView: NSRulerView {
 
 // MARK: - Syntax Theme
 
-public struct SyntaxTheme {
+public struct SyntaxTheme: @unchecked Sendable {
     public var keyword: NSColor
     public var operator_: NSColor
     public var string: NSColor

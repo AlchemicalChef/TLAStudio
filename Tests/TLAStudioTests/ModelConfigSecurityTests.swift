@@ -7,6 +7,19 @@ import XCTest
 /// prevents injection of additional TLC directives through user-supplied values.
 final class ModelConfigSecurityTests: XCTestCase {
 
+    // MARK: - Header Comment Injection
+
+    func testModelNameCannotInjectConfigDirective() {
+        let config = TestFactories.makeModelConfig(
+            name: "Safe\nINIT Injected"
+        )
+        let content = config.generateConfigFile()
+
+        XCTAssertFalse(content.contains("\nINIT Injected"),
+                       "Newline in model name should stay inside the generated comment")
+        XCTAssertTrue(content.contains("\\* Model: Safe INIT Injected"))
+    }
+
     // MARK: - Init/Next Predicate Injection
 
     func testInitPredicateRejectsNewline() {

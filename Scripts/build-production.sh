@@ -29,10 +29,10 @@ NC='\033[0m' # No Color
 # Script configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="$PROJECT_DIR/.build/arm64-apple-macosx/release"
+BUILD_DIR=""
 DEPS_DIR="$PROJECT_DIR/.deps"
 APP_NAME="TLA+ Studio"
-APP_DIR="$BUILD_DIR/$APP_NAME.app"
+APP_DIR=""
 VERSION="1.0.0"
 
 # Parse arguments
@@ -435,6 +435,8 @@ build_swift_app() {
     # Build release version
     log_info "Compiling TLA+ Studio..."
     swift build -c release
+    BUILD_DIR="$(swift build -c release --show-bin-path)"
+    APP_DIR="$BUILD_DIR/$APP_NAME.app"
 
     log_success "Swift app built"
 }

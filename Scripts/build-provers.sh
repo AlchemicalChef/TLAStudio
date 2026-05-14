@@ -176,12 +176,26 @@ else
     echo "SPASS: not installed (optional)"
 fi
 
-# LS4 - temporal logic prover (optional, used by some TLAPM proofs)
+# LS4 - temporal logic prover (required for proofs using PTL)
 echo ""
-echo "=== LS4 (optional) ==="
+echo "=== LS4 ==="
 if [ ! -f "ls4" ]; then
-    # LS4 may need to be built from source
-    echo "LS4: skipped (build from source if needed)"
+    # Prefer a copy already produced by the TLAPM dune build, since we ship the
+    # TLAPM source tree under .deps/tlapm and it already compiles ls4 there.
+    for candidate in \
+        "$PROJECT_DIR/.deps/tlapm/_build/default/deps/ls4/ls4" \
+        "$PROJECT_DIR/Scripts/tlapm/_build/default/deps/ls4/ls4"
+    do
+        if [ -x "$candidate" ]; then
+            cp "$candidate" .
+            chmod +x ls4
+            echo "LS4: copied from $candidate"
+            break
+        fi
+    done
+    if [ ! -f "ls4" ]; then
+        echo "LS4: not built (run Scripts/build-tlapm.sh to produce .deps/tlapm/_build/.../ls4)"
+    fi
 fi
 
 echo ""

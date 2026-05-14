@@ -364,6 +364,14 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         let theme = EditorColorScheme(rawValue: savedColorScheme)?.syntaxTheme ?? .default
 
         coordinator.highlighter = TLASyntaxHighlighter(textView: textView, theme: theme)
+        coordinator.highlighter?.treeSitterHighlightProvider = { [weak coordinator] source in
+            guard let coordinator,
+                  source == coordinator.cachedHighlightText else {
+                return []
+            }
+            return coordinator.cachedHighlightTokens
+        }
+        coordinator.updateTreeSitterHighlights(for: textView.string)
         coordinator.highlighter?.highlightImmediately()
         textView.backgroundColor = theme.background
         textView.insertionPointColor = theme.cursor
@@ -431,6 +439,16 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             name: NSTextView.didChangeSelectionNotification,
             object: textView
         )
+
+        if let contentView = textView.enclosingScrollView?.contentView {
+            contentView.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(
+                coordinator,
+                selector: #selector(Coordinator.scrollViewDidScroll(_:)),
+                name: NSView.boundsDidChangeNotification,
+                object: contentView
+            )
+        }
     }
 
     private func focus(_ textView: NSTextView) {
@@ -498,6 +516,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             object: textView
         )
 
+        coordinator.updateTreeSitterHighlights(for: text)
         coordinator.highlighter?.highlightImmediately()
 
         if !coordinator.lastKnownDiagnostics.isEmpty {
@@ -579,6 +598,11 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         private var notificationObservers: [NSObjectProtocol] = []
         private var diagnosticsTask: Task<Void, Never>?
         private var foldingTask: Task<Void, Never>?
+        private var highlightTask: Task<Void, Never>?
+
+        /// Cached tree-sitter highlight tokens as absolute NSRange values.
+        var cachedHighlightTokens: [(NSRange, String)] = []
+        var cachedHighlightText: String = ""
 
         init(_ parent: TLAEditorViewWithFindReplace) {
             self.parent = parent
@@ -612,6 +636,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             // Cancel any pending tasks
             diagnosticsTask?.cancel()
             foldingTask?.cancel()
+            highlightTask?.cancel()
             NotificationCenter.default.removeObserver(self)
             // Remove notification observers
             for observer in notificationObservers {
@@ -712,6 +737,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             parent.onTextChange?(newText)
             isUpdating = false
 
+            updateTreeSitterHighlights(for: newText)
             highlighter?.scheduleHighlighting()
 
             // Cancel any pending tasks before starting new ones
@@ -736,6 +762,126 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
 
         @objc func scrollViewDidScroll(_ notification: Notification) {
             gutterView?.needsDisplay = true
+            highlighter?.scrollPositionChanged()
+        }
+
+        /// Asynchronously compute tree-sitter highlights and cache absolute AppKit ranges.
+        func updateTreeSitterHighlights(for text: String) {
+            highlightTask?.cancel()
+            highlightTask = Task { @MainActor [weak self] in
+                guard let self, !Task.isCancelled else { return }
+
+                do {
+                    let parseResult = try await TLACoreWrapper.shared.parse(text)
+                    guard !Task.isCancelled else { return }
+
+                    let tokens = await TLACoreWrapper.shared.getAllHighlights(from: parseResult)
+                    guard !Task.isCancelled else { return }
+
+                    self.cachedHighlightTokens = Self.convertHighlightTokens(tokens, in: text)
+                    self.cachedHighlightText = text
+                    self.highlighter?.highlightImmediately()
+                } catch {
+                    self.cachedHighlightTokens = []
+                    self.cachedHighlightText = ""
+                }
+            }
+        }
+
+        private static func convertHighlightTokens(
+            _ tokens: [TLAHighlightToken],
+            in text: String
+        ) -> [(NSRange, String)] {
+            let utf8 = text.utf8
+            let nsText = text as NSString
+
+            var lineStartsUTF8: [Int] = [0]
+            var lineStartsUTF16: [Int] = [0]
+            var utf16Offset = 0
+
+            for (byteIndex, byte) in utf8.enumerated() {
+                if byte == 0x0A {
+                    utf16Offset += 1
+                    lineStartsUTF8.append(byteIndex + 1)
+                    lineStartsUTF16.append(utf16Offset)
+                } else if byte & 0xC0 != 0x80 {
+                    utf16Offset += byte < 0xF0 ? 1 : 2
+                }
+            }
+
+            func utf16OffsetForTreeSitterPoint(line: Int, byteColumn: Int) -> Int? {
+                guard line >= 0,
+                      line < lineStartsUTF8.count,
+                      line < lineStartsUTF16.count else {
+                    return nil
+                }
+
+                let lineByteStart = lineStartsUTF8[line]
+                let lineUTF16Start = lineStartsUTF16[line]
+                guard let startIndex = utf8.index(
+                    utf8.startIndex,
+                    offsetBy: lineByteStart,
+                    limitedBy: utf8.endIndex
+                ) else {
+                    return nil
+                }
+
+                var bytesConsumed = 0
+                var utf16Count = 0
+                var index = startIndex
+
+                while bytesConsumed < byteColumn && index < utf8.endIndex {
+                    let byte = utf8[index]
+                    if byte == 0x0A { break }
+
+                    let characterByteLength: Int
+                    let characterUTF16Length: Int
+                    if byte < 0x80 {
+                        characterByteLength = 1
+                        characterUTF16Length = 1
+                    } else if byte < 0xE0 {
+                        characterByteLength = 2
+                        characterUTF16Length = 1
+                    } else if byte < 0xF0 {
+                        characterByteLength = 3
+                        characterUTF16Length = 1
+                    } else {
+                        characterByteLength = 4
+                        characterUTF16Length = 2
+                    }
+
+                    bytesConsumed += characterByteLength
+                    utf16Count += characterUTF16Length
+                    index = utf8.index(index, offsetBy: characterByteLength, limitedBy: utf8.endIndex) ?? utf8.endIndex
+                }
+
+                return lineUTF16Start + utf16Count
+            }
+
+            var converted: [(NSRange, String)] = []
+            converted.reserveCapacity(tokens.count)
+
+            for token in tokens {
+                let startLine = Int(token.range.start.line)
+                let startColumn = Int(token.range.start.column)
+                let endLine = Int(token.range.end.line)
+                let endColumn = Int(token.range.end.column)
+
+                guard let start = utf16OffsetForTreeSitterPoint(line: startLine, byteColumn: startColumn),
+                      let end = utf16OffsetForTreeSitterPoint(line: endLine, byteColumn: endColumn),
+                      start <= nsText.length,
+                      end <= nsText.length,
+                      end > start else {
+                    continue
+                }
+
+                converted.append((
+                    NSRange(location: start, length: end - start),
+                    token.tokenType
+                ))
+            }
+
+            return converted
         }
 
         // MARK: - IntelliSense Support

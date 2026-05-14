@@ -115,6 +115,41 @@ final class SafeArchiveExtractorTests: TempDirectoryTestCase {
         }
     }
 
+    func testExtractsPlainTarArchive() throws {
+        let sourceDir = tempDirectory.appendingPathComponent("plain-source", isDirectory: true)
+        let nestedDir = sourceDir.appendingPathComponent("dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedDir, withIntermediateDirectories: true)
+        try "contents".write(to: nestedDir.appendingPathComponent("file.txt"), atomically: true, encoding: .utf8)
+
+        let archiveURL = tempDirectory.appendingPathComponent("plain.tar")
+        try runTar(arguments: ["-cf", archiveURL.path, "-C", sourceDir.path, "."])
+
+        let targetDir = tempDirectory.appendingPathComponent("plain-target", isDirectory: true)
+        try SafeArchiveExtractor.extract(from: archiveURL, to: targetDir)
+
+        let extracted = targetDir.appendingPathComponent("dir/file.txt")
+        XCTAssertEqual(try String(contentsOf: extracted), "contents")
+    }
+
+    func testRejectsAbsoluteSymlinkBeforeMove() throws {
+        let sourceDir = tempDirectory.appendingPathComponent("symlink-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+        let linkURL = sourceDir.appendingPathComponent("escape")
+        try FileManager.default.createSymbolicLink(at: linkURL, withDestinationURL: URL(fileURLWithPath: "/tmp"))
+
+        let archiveURL = tempDirectory.appendingPathComponent("symlink.tar")
+        try runTar(arguments: ["-cf", archiveURL.path, "-C", sourceDir.path, "."])
+
+        let targetDir = tempDirectory.appendingPathComponent("symlink-target", isDirectory: true)
+        XCTAssertThrowsError(try SafeArchiveExtractor.extract(from: archiveURL, to: targetDir)) { error in
+            guard case SafeArchiveExtractor.Error.symlinkEscapeDetected = error else {
+                XCTFail("Expected symlinkEscapeDetected, got \(error)")
+                return
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: targetDir.path))
+    }
+
     // MARK: - Error Types Tests
 
     func testErrorDescriptions() {
@@ -305,6 +340,24 @@ final class SafeArchiveExtractorTests: TempDirectoryTestCase {
             }
 
             XCTAssertEqual(hasTraversal, shouldDetectTraversal, "Path '\(path)' traversal detection mismatch")
+        }
+    }
+
+    private func runTar(arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        process.arguments = arguments
+        let stderr = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            let data = stderr.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8) ?? "tar failed"
+            XCTFail(message)
+            throw NSError(domain: "SafeArchiveExtractorTests", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: message
+            ])
         }
     }
 }

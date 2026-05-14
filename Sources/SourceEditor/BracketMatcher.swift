@@ -8,7 +8,7 @@ public final class BracketMatcher {
     // MARK: - Types
 
     /// A bracket pair definition
-    public struct BracketPair {
+    public struct BracketPair: Sendable {
         let open: String
         let close: String
 

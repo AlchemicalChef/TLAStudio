@@ -1194,7 +1194,7 @@ impl TLACore {
                     })
                     .cloned());
                 // Also add user-defined symbols for top-level references
-                completions.extend(self.symbols_to_completions(&symbols, 20));
+                completions.extend(Self::symbols_to_completions(&symbols, 20));
                 // Add top-level snippets
                 completions.extend(SNIPPET_COMPLETIONS.iter()
                     .filter(|s| {
@@ -1661,7 +1661,7 @@ impl TLACore {
         }
 
         // Add user-defined symbols
-        completions.extend(self.symbols_to_completions(symbols, 15));
+        completions.extend(Self::symbols_to_completions(symbols, 15));
 
         // Add snippet completions
         completions.extend(SNIPPET_COMPLETIONS.clone());
@@ -1677,7 +1677,7 @@ impl TLACore {
     }
 
     /// Convert parsed symbols to completion items
-    fn symbols_to_completions(&self, symbols: &[Symbol], base_priority: u32) -> Vec<DetailedCompletionItem> {
+    fn symbols_to_completions(symbols: &[Symbol], base_priority: u32) -> Vec<DetailedCompletionItem> {
         let mut completions = Vec::new();
 
         for symbol in symbols {
@@ -1711,7 +1711,7 @@ impl TLACore {
             });
 
             // Recurse into children
-            completions.extend(self.symbols_to_completions(&symbol.children, base_priority));
+            completions.extend(Self::symbols_to_completions(&symbol.children, base_priority));
         }
 
         completions
@@ -1802,11 +1802,11 @@ impl TLACore {
         }
 
         // Check user-defined symbols
-        self.find_user_signature(name, user_symbols)
+        Self::find_user_signature(name, user_symbols)
     }
 
     /// Search user-defined symbols for signature info
-    fn find_user_signature(&self, name: &str, symbols: &[Symbol]) -> Option<SignatureInfo> {
+    fn find_user_signature(name: &str, symbols: &[Symbol]) -> Option<SignatureInfo> {
         for symbol in symbols {
             if symbol.name == name && !symbol.parameters.is_empty() {
                 let param_list = symbol.parameters.join(", ");
@@ -1823,7 +1823,7 @@ impl TLACore {
                 });
             }
             // Recurse into children
-            if let Some(found) = self.find_user_signature(name, &symbol.children) {
+            if let Some(found) = Self::find_user_signature(name, &symbol.children) {
                 return Some(found);
             }
         }

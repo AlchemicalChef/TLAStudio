@@ -53,13 +53,25 @@ public struct CacheEntry: Codable, Sendable {
 
     /// Returns the sharded directory prefix (first 2 characters of fingerprint).
     var shardPrefix: String {
-        guard fingerprint.count >= 2 else { return "00" }
+        guard Self.isSafeFingerprint(fingerprint), fingerprint.count >= 2 else { return "00" }
         return String(fingerprint.prefix(2))
     }
 
     /// Returns the filename for this cache entry.
     var filename: String {
         "\(fingerprint).json"
+    }
+
+    /// Fingerprints are external tool output and must be safe as path components.
+    static func isSafeFingerprint(_ fingerprint: String) -> Bool {
+        guard !fingerprint.isEmpty, fingerprint.count <= 256 else { return false }
+        return fingerprint.unicodeScalars.allSatisfy { scalar in
+            (65...90).contains(scalar.value)
+                || (97...122).contains(scalar.value)
+                || (48...57).contains(scalar.value)
+                || scalar.value == 95
+                || scalar.value == 45
+        }
     }
 
     /// Checks if this entry has expired based on the given max age.
@@ -312,12 +324,21 @@ public actor ProofCache {
             return nil
         }
 
+        guard CacheEntry.isSafeFingerprint(fingerprint) else {
+            _cacheMisses += 1
+            return nil
+        }
+
         guard let indexEntry = index.entries[fingerprint] else {
             _cacheMisses += 1
             return nil
         }
 
-        let entryURL = cacheDirectory.appendingPathComponent(indexEntry.relativePath)
+        guard let entryURL = cacheFileURL(forRelativePath: indexEntry.relativePath) else {
+            index.removeEntry(fingerprint: fingerprint)
+            _cacheMisses += 1
+            return nil
+        }
 
         guard let data = try? Data(contentsOf: entryURL),
               let entry = try? decoder.decode(CacheEntry.self, from: data) else {
@@ -410,6 +431,10 @@ public actor ProofCache {
         specPath: String? = nil
     ) async {
         guard configuration.isEnabled else { return }
+        guard CacheEntry.isSafeFingerprint(fingerprint) else {
+            logger.warning("Skipping cache write for unsafe fingerprint")
+            return
+        }
 
         let entry = CacheEntry(
             fingerprint: fingerprint,
@@ -516,7 +541,10 @@ public actor ProofCache {
         for (fingerprint, indexEntry) in sortedEntries {
             guard freedSize < targetFreed else { break }
 
-            let entryURL = cacheDirectory.appendingPathComponent(indexEntry.relativePath)
+            guard let entryURL = cacheFileURL(forRelativePath: indexEntry.relativePath) else {
+                await removeEntry(fingerprint: fingerprint)
+                continue
+            }
             if let attrs = try? FileManager.default.attributesOfItem(atPath: entryURL.path),
                let fileSize = attrs[.size] as? Int64 {
                 freedSize += fileSize
@@ -572,6 +600,9 @@ public actor ProofCache {
     /// Writes a cache entry to disk.
     private func writeEntry(_ entry: CacheEntry) async throws {
         let fileManager = FileManager.default
+        guard CacheEntry.isSafeFingerprint(entry.fingerprint) else {
+            throw CacheError.writeError(entry.fingerprint, CocoaError(.fileWriteInvalidFileName))
+        }
 
         // Create shard directory if needed
         let shardDir = cacheDirectory.appendingPathComponent(entry.shardPrefix, isDirectory: true)
@@ -607,7 +638,10 @@ public actor ProofCache {
     private func removeEntry(fingerprint: String) async {
         guard let indexEntry = index.entries[fingerprint] else { return }
 
-        let entryURL = cacheDirectory.appendingPathComponent(indexEntry.relativePath)
+        guard let entryURL = cacheFileURL(forRelativePath: indexEntry.relativePath) else {
+            index.removeEntry(fingerprint: fingerprint)
+            return
+        }
         try? FileManager.default.removeItem(at: entryURL)
 
         index.removeEntry(fingerprint: fingerprint)
@@ -669,7 +703,11 @@ public actor ProofCache {
         let fileManager = FileManager.default
 
         for (fingerprint, indexEntry) in index.entries {
-            let entryURL = cacheDirectory.appendingPathComponent(indexEntry.relativePath)
+            guard CacheEntry.isSafeFingerprint(fingerprint),
+                  let entryURL = cacheFileURL(forRelativePath: indexEntry.relativePath) else {
+                invalidFingerprints.append(fingerprint)
+                continue
+            }
             if !fileManager.fileExists(atPath: entryURL.path) {
                 invalidFingerprints.append(fingerprint)
             }
@@ -700,7 +738,7 @@ public actor ProofCache {
         for item in contents {
             // Check if this is a shard directory (2-character name)
             let shardName = item.lastPathComponent
-            guard shardName.count == 2 else { continue }
+            guard shardName.count == 2, CacheEntry.isSafeFingerprint(shardName) else { continue }
 
             // Check if it's a directory
             var isDirectory: ObjCBool = false
@@ -723,6 +761,11 @@ public actor ProofCache {
                 do {
                     let data = try Data(contentsOf: entryFile)
                     let entry = try decoder.decode(CacheEntry.self, from: data)
+                    guard CacheEntry.isSafeFingerprint(entry.fingerprint),
+                          entryFile.lastPathComponent == entry.filename else {
+                        logger.warning("Skipping cache file with unsafe fingerprint: \(entryFile.path)")
+                        continue
+                    }
 
                     let relativePath = "\(shardName)/\(entryFile.lastPathComponent)"
                     index.addEntry(
@@ -747,7 +790,9 @@ public actor ProofCache {
         var totalSize: Int64 = 0
 
         for indexEntry in index.entries.values {
-            let entryURL = cacheDirectory.appendingPathComponent(indexEntry.relativePath)
+            guard let entryURL = cacheFileURL(forRelativePath: indexEntry.relativePath) else {
+                continue
+            }
             if let attrs = try? fileManager.attributesOfItem(atPath: entryURL.path),
                let fileSize = attrs[.size] as? Int64 {
                 totalSize += fileSize
@@ -761,6 +806,27 @@ public actor ProofCache {
         }
 
         return totalSize
+    }
+
+    /// Resolves an indexed cache path only if it is exactly `<safe shard>/<safe filename>.json`.
+    private func cacheFileURL(forRelativePath relativePath: String) -> URL? {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard components.count == 2 else { return nil }
+
+        let shard = components[0]
+        let filename = components[1]
+        guard shard.count == 2,
+              CacheEntry.isSafeFingerprint(shard),
+              filename.hasSuffix(".json") else {
+            return nil
+        }
+
+        let fingerprint = String(filename.dropLast(5))
+        guard CacheEntry.isSafeFingerprint(fingerprint) else { return nil }
+
+        return cacheDirectory
+            .appendingPathComponent(shard, isDirectory: true)
+            .appendingPathComponent(filename, isDirectory: false)
     }
 }
 

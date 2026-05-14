@@ -92,14 +92,6 @@ actor PlusCalTranslator {
         drain(handle: stdoutPipe.fileHandleForReading, into: stdoutAccumulator)
         drain(handle: stderrPipe.fileHandleForReading, into: stderrAccumulator)
 
-        do {
-            try process.run()
-        } catch {
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            throw error
-        }
-
         // Observe termination via the process's handler rather than polling. Resumption is
         // gated by `Atomic` semantics on the continuation so a concurrent timeout can't
         // resume twice.
@@ -109,6 +101,17 @@ actor PlusCalTranslator {
             process.terminationHandler = { finished in
                 guard didResume.tryConsume() else { return }
                 cont.resume(returning: finished.terminationStatus)
+            }
+
+            do {
+                try process.run()
+            } catch {
+                stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                stderrPipe.fileHandleForReading.readabilityHandler = nil
+                process.terminationHandler = nil
+                guard didResume.tryConsume() else { return }
+                cont.resume(throwing: error)
+                return
             }
 
             guard let timeout else { return }
@@ -127,6 +130,7 @@ actor PlusCalTranslator {
                 ))
             }
         }
+        process.terminationHandler = nil
 
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil

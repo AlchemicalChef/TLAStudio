@@ -108,6 +108,10 @@ actor TraceStorageManager {
 
     /// Load a page of states
     func loadPage(sessionId: UUID, pageIndex: Int) async throws -> [TraceState] {
+        guard pageIndex >= 0 else {
+            throw TraceStorageError.stateNotFound(pageIndex * pageSize)
+        }
+
         let key = PageKey(sessionId: sessionId, pageIndex: pageIndex)
 
         // Check cache
@@ -130,6 +134,10 @@ actor TraceStorageManager {
 
     /// Load a single state by index
     func loadState(sessionId: UUID, index: Int) async throws -> TraceState {
+        guard index >= 0 else {
+            throw TraceStorageError.stateNotFound(index)
+        }
+
         let pageIndex = index / pageSize
         let offsetInPage = index % pageSize
 
@@ -279,6 +287,10 @@ final class LazyErrorTrace: @unchecked Sendable {
 
     /// Load a state by index
     func loadState(at index: Int) async throws -> TraceState {
+        guard index >= 0 else {
+            throw TraceStorageError.stateNotFound(index)
+        }
+
         // Use in-memory states if available
         if let states = inMemoryStates {
             guard index < states.count else {
@@ -296,9 +308,11 @@ final class LazyErrorTrace: @unchecked Sendable {
 
     /// Load a range of states
     func loadStates(range: Swift.Range<Int>) async throws -> [TraceState] {
+        let safeRange = max(range.lowerBound, 0)..<max(range.upperBound, 0)
+
         // Use in-memory states if available
         if let states = inMemoryStates {
-            return Array(states[range.clamped(to: 0..<states.count)])
+            return Array(states[safeRange.clamped(to: 0..<states.count)])
         }
 
         guard let manager = manager else {
@@ -306,7 +320,7 @@ final class LazyErrorTrace: @unchecked Sendable {
         }
 
         var result: [TraceState] = []
-        for index in range {
+        for index in safeRange {
             if index >= stateCount { break }
             let state = try await manager.loadState(sessionId: sessionId, index: index)
             result.append(state)
@@ -442,7 +456,7 @@ private final class TraceFileHandle {
         var states: [TraceState] = []
 
         // Guard against out-of-bounds start index
-        guard startIndex < stateOffsets.count else {
+        guard startIndex >= 0, count > 0, startIndex < stateOffsets.count else {
             return states
         }
 
@@ -458,7 +472,7 @@ private final class TraceFileHandle {
     }
 
     func readState(at index: Int) throws -> TraceState {
-        guard index < stateOffsets.count else {
+        guard index >= 0, index < stateOffsets.count else {
             throw TraceStorageError.stateNotFound(index)
         }
 
@@ -470,7 +484,7 @@ private final class TraceFileHandle {
             throw TraceStorageError.corruptedFile
         }
 
-        let length = lengthData.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+        let length = try lengthData.readLittleEndianUInt32()
 
         // Read state data
         guard let stateData = try fileHandle.read(upToCount: Int(length)), stateData.count == length else {
@@ -521,7 +535,7 @@ private final class TraceFileHandle {
         guard let indexStartData = try fileHandle.read(upToCount: 8), indexStartData.count == 8 else {
             throw TraceStorageError.corruptedFile
         }
-        let indexStart = indexStartData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+        let indexStart = try indexStartData.readLittleEndianUInt64()
 
         // Seek to index start and read marker
         try fileHandle.seek(toOffset: indexStart)
@@ -534,7 +548,7 @@ private final class TraceFileHandle {
         guard let countData = try fileHandle.read(upToCount: 4), countData.count == 4 else {
             throw TraceStorageError.corruptedFile
         }
-        stateCount = Int(countData.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian })
+        stateCount = Int(try countData.readLittleEndianUInt32())
 
         // Read offsets
         stateOffsets.reserveCapacity(stateCount)
@@ -542,7 +556,7 @@ private final class TraceFileHandle {
             guard let offData = try fileHandle.read(upToCount: 8), offData.count == 8 else {
                 throw TraceStorageError.corruptedFile
             }
-            let offset = offData.withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+            let offset = try offData.readLittleEndianUInt64()
             stateOffsets.append(offset)
         }
     }
@@ -553,6 +567,31 @@ private final class TraceFileHandle {
 
     deinit {
         close()
+    }
+}
+
+private extension Data {
+    func readLittleEndianUInt32() throws -> UInt32 {
+        guard count == 4 else {
+            throw TraceStorageError.corruptedFile
+        }
+
+        return UInt32(self[startIndex])
+            | UInt32(self[index(startIndex, offsetBy: 1)]) << 8
+            | UInt32(self[index(startIndex, offsetBy: 2)]) << 16
+            | UInt32(self[index(startIndex, offsetBy: 3)]) << 24
+    }
+
+    func readLittleEndianUInt64() throws -> UInt64 {
+        guard count == 8 else {
+            throw TraceStorageError.corruptedFile
+        }
+
+        var value: UInt64 = 0
+        for offset in 0..<8 {
+            value |= UInt64(self[index(startIndex, offsetBy: offset)]) << (offset * 8)
+        }
+        return value
     }
 }
 

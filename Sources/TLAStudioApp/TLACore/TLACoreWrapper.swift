@@ -1280,59 +1280,88 @@ final class RustTLACore: TLACoreProtocol, @unchecked Sendable {
     }
 
     func getCompletions(from result: TLAParseResult, at position: TLAPosition) async -> [TLACompletionItem] {
+        let rustPosition = rustPosition(from: position, in: result.source)
         guard let parseResult = getCachedParseResult(for: result) else {
             // Re-parse if cache miss
             guard let newResult = try? core.parse(source: result.source) else {
                 return []
             }
-            let rustPosition = Position(line: position.line, column: position.column)
             return core.getCompletions(result: newResult, position: rustPosition).map { convertCompletionItem($0) }
         }
 
-        let rustPosition = Position(line: position.line, column: position.column)
         return core.getCompletions(result: parseResult, position: rustPosition).map { convertCompletionItem($0) }
     }
 
     func analyzeContext(from result: TLAParseResult, at position: TLAPosition) async -> TLACompletionContext {
+        let rustPosition = rustPosition(from: position, in: result.source)
         guard let parseResult = getCachedParseResult(for: result) else {
             guard let newResult = try? core.parse(source: result.source) else {
                 return .unknown
             }
-            let rustPosition = Position(line: position.line, column: position.column)
             return convertCompletionContext(core.analyzeContext(result: newResult, position: rustPosition))
         }
 
-        let rustPosition = Position(line: position.line, column: position.column)
         return convertCompletionContext(core.analyzeContext(result: parseResult, position: rustPosition))
     }
 
     func getDetailedCompletions(from result: TLAParseResult, at position: TLAPosition) async -> [TLADetailedCompletionItem] {
+        let rustPosition = rustPosition(from: position, in: result.source)
         guard let parseResult = getCachedParseResult(for: result) else {
             guard let newResult = try? core.parse(source: result.source) else {
                 return []
             }
-            let rustPosition = Position(line: position.line, column: position.column)
             return core.getDetailedCompletions(result: newResult, position: rustPosition).map { convertDetailedCompletionItem($0) }
         }
 
-        let rustPosition = Position(line: position.line, column: position.column)
         return core.getDetailedCompletions(result: parseResult, position: rustPosition).map { convertDetailedCompletionItem($0) }
     }
 
     func getSignatureHelp(from result: TLAParseResult, at position: TLAPosition) async -> TLASignatureHelp? {
+        let rustPosition = rustPosition(from: position, in: result.source)
         guard let parseResult = getCachedParseResult(for: result) else {
             guard let newResult = try? core.parse(source: result.source) else {
                 return nil
             }
-            let rustPosition = Position(line: position.line, column: position.column)
             return core.getSignatureHelp(result: newResult, position: rustPosition).map { convertSignatureHelp($0) }
         }
 
-        let rustPosition = Position(line: position.line, column: position.column)
         return core.getSignatureHelp(result: parseResult, position: rustPosition).map { convertSignatureHelp($0) }
     }
 
     // MARK: - Private Helpers
+
+    /// The Swift app uses user-visible character columns, while tree-sitter uses UTF-8 byte columns.
+    private func rustPosition(from position: TLAPosition, in source: String) -> Position {
+        let targetLine = Int(position.line)
+        guard targetLine >= 0 else {
+            return Position(line: position.line, column: 0)
+        }
+
+        var currentLine = 0
+        var lineStart = source.startIndex
+
+        while currentLine < targetLine {
+            guard let newlineIndex = source[lineStart...].firstIndex(of: "\n") else {
+                return Position(line: position.line, column: 0)
+            }
+            lineStart = source.index(after: newlineIndex)
+            currentLine += 1
+        }
+
+        let targetColumn = Int(position.column)
+        var column = 0
+        var cursor = lineStart
+
+        while cursor < source.endIndex,
+              source[cursor] != "\n",
+              column < targetColumn {
+            cursor = source.index(after: cursor)
+            column += 1
+        }
+
+        let byteColumn = source[lineStart..<cursor].utf8.count
+        return Position(line: position.line, column: UInt32(byteColumn))
+    }
 
     private func getCachedParseResult(for tlaResult: TLAParseResult) -> ParseResult? {
         let key = ObjectIdentifier(tlaResult)

@@ -21,11 +21,24 @@ final class OutputManager: ObservableObject {
         let source: OutputSource
         let message: String
         let isError: Bool
+        let formattedTimestamp: String
 
-        var formattedTimestamp: String {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm:ss"
-            return formatter.string(from: timestamp)
+        init(timestamp: Date, source: OutputSource, message: String, isError: Bool) {
+            self.timestamp = timestamp
+            self.source = source
+            self.message = message
+            self.isError = isError
+            self.formattedTimestamp = Self.formatTimestamp(timestamp)
+        }
+
+        private static func formatTimestamp(_ timestamp: Date) -> String {
+            let components = Calendar.current.dateComponents([.hour, .minute, .second], from: timestamp)
+            return String(
+                format: "%02d:%02d:%02d",
+                components.hour ?? 0,
+                components.minute ?? 0,
+                components.second ?? 0
+            )
         }
     }
 
@@ -107,12 +120,24 @@ final class OutputManager: ObservableObject {
 
     /// Clear all entries
     func clear() {
-        entries.removeAll()
+        queue.async { [weak self] in
+            self?.pendingEntries.removeAll(keepingCapacity: true)
+        }
+
+        updateEntries { entries in
+            entries.removeAll()
+        }
     }
 
     /// Clear entries from a specific source
     func clear(source: OutputSource) {
-        entries.removeAll { $0.source == source }
+        queue.async { [weak self] in
+            self?.pendingEntries.removeAll { $0.source == source }
+        }
+
+        updateEntries { entries in
+            entries.removeAll { $0.source == source }
+        }
     }
 
     // MARK: - Private Methods
@@ -166,12 +191,14 @@ final class OutputManager: ObservableObject {
         }
     }
 
-    private func addEntry(_ entry: OutputEntry) {
-        entries.append(entry)
-
-        // Trim old entries if needed
-        if entries.count > maxEntries {
-            entries.removeFirst(entries.count - maxEntries)
+    private func updateEntries(_ update: @escaping (inout [OutputEntry]) -> Void) {
+        if Thread.isMainThread {
+            update(&entries)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                update(&self.entries)
+            }
         }
     }
 }

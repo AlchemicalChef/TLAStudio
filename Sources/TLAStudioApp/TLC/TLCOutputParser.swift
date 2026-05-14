@@ -46,8 +46,14 @@ class TLCOutputParser {
     private var currentPhase: ModelCheckProgress.Phase = .parsing
     private var startTime: Date?
     private var currentTraceStates: [TraceState] = []
+    private var pendingTraceState: TraceState?
+    private var traceWriterStartTask: Task<TraceWriter, Error>?
+    private var traceWriteTask: Task<Void, Error>?
+    private var streamedTraceCount = 0
     private var isParsingTrace = false
     private var errorMessage: String?
+    private var traceLoopStart: Int?
+    private var traceViolatedProperty: String?
 
     // Cached coverage array to avoid repeated map transformations
     private var cachedCoverageArray: [ActionCoverage]?
@@ -134,6 +140,7 @@ class TLCOutputParser {
     func finalResult(exitCode: Int32, duration: TimeInterval) -> ModelCheckResult {
         lock.lock()
         defer { lock.unlock() }
+        flushPendingTraceStateLocked()
         return ModelCheckResult(
             sessionId: sessionId,
             success: exitCode == 0 && errorTrace == nil && !detectedOOM,
@@ -151,16 +158,67 @@ class TLCOutputParser {
     /// Get final result with storage support for large traces (thread-safe)
     func finalResultWithStorage(exitCode: Int32, duration: TimeInterval) async -> ModelCheckResult {
         let (traceCount, capturedStates, capturedSessionId, capturedErrorType, capturedErrorMessage,
-             capturedLoopStart, capturedViolatedProperty, capturedStatesFound, capturedDistinct, capturedCoverage) = lock.withLock {
-            (currentTraceStates.count, currentTraceStates, sessionId, errorType, errorMessage,
-             errorTrace?.loopStart, errorTrace?.violatedProperty, states, distinct, coverage)
+             capturedLoopStart, capturedViolatedProperty, capturedStatesFound, capturedDistinct,
+             capturedCoverage, capturedOOM, writerStartTask, writeTask) = lock.withLock {
+            flushPendingTraceStateLocked()
+            return (
+                currentTraceStates.count + streamedTraceCount,
+                currentTraceStates,
+                sessionId,
+                errorType,
+                errorMessage,
+                traceLoopStart ?? errorTrace?.loopStart,
+                traceViolatedProperty ?? errorTrace?.violatedProperty,
+                states,
+                distinct,
+                coverage,
+                detectedOOM,
+                traceWriterStartTask,
+                traceWriteTask
+            )
         }
 
-        if traceCount <= Self.largeTraceThreshold {
+        if let writerStartTask {
+            logger.info("Finalizing streamed trace with \(traceCount) states")
+
+            do {
+                _ = try await writerStartTask.value
+                try await writeTask?.value
+
+                let lazyTrace = try await TraceStorageManager.shared.finalizeTrace(
+                    sessionId: capturedSessionId,
+                    type: capturedErrorType ?? .evaluationError,
+                    message: capturedErrorMessage ?? "Error found",
+                    loopStart: capturedLoopStart,
+                    violatedProperty: capturedViolatedProperty
+                )
+
+                let hasErrorTrace = traceCount > 0 || capturedErrorType != nil || capturedErrorMessage != nil
+
+                return ModelCheckResult(
+                    sessionId: capturedSessionId,
+                    success: exitCode == 0 && !hasErrorTrace && !capturedOOM,
+                    statesFound: capturedStatesFound,
+                    distinctStates: capturedDistinct,
+                    duration: duration,
+                    coverage: capturedCoverage.map { ActionCoverage(actionName: $0.key, count: $0.value.count, distinctStates: $0.value.states) },
+                    errorTrace: nil,
+                    message: capturedOOM ? (capturedErrorMessage ?? "Out of memory") : capturedErrorMessage,
+                    lazyErrorTrace: lazyTrace,
+                    outOfMemory: capturedOOM,
+                    suggestJVMRetry: capturedOOM
+                )
+            } catch {
+                logger.error("Failed to finalize streamed trace: \(error.localizedDescription)")
+                return finalResult(exitCode: exitCode, duration: duration)
+            }
+        }
+
+        guard traceCount > Self.largeTraceThreshold else {
             return finalResult(exitCode: exitCode, duration: duration)
         }
 
-        logger.info("Large trace detected (\(traceCount) states), streaming to disk")
+        logger.info("Large trace detected at finalization (\(traceCount) states), writing to disk")
 
         do {
             let traceWriter = try await TraceStorageManager.shared.beginTrace(sessionId: capturedSessionId)
@@ -179,11 +237,11 @@ class TLCOutputParser {
 
             logger.info("Trace stored successfully for session \(capturedSessionId.uuidString)")
 
-            let capturedOOM = lock.withLock { detectedOOM }
+            let hasErrorTrace = traceCount > 0 || capturedErrorType != nil || capturedErrorMessage != nil
 
             return ModelCheckResult(
                 sessionId: capturedSessionId,
-                success: exitCode == 0 && !capturedOOM,
+                success: exitCode == 0 && !hasErrorTrace && !capturedOOM,
                 statesFound: capturedStatesFound,
                 distinctStates: capturedDistinct,
                 duration: duration,
@@ -201,10 +259,73 @@ class TLCOutputParser {
         }
     }
 
+    private func appendCompletedTraceStateLocked(_ state: TraceState) {
+        if traceWriterStartTask != nil {
+            enqueueTraceWriteLocked(state)
+            return
+        }
+
+        currentTraceStates.append(state)
+        if currentTraceStates.count > Self.largeTraceThreshold {
+            startTraceStreamingLocked()
+        }
+    }
+
+    private func flushPendingTraceStateLocked() {
+        guard let pendingTraceState else {
+            return
+        }
+        self.pendingTraceState = nil
+        appendCompletedTraceStateLocked(pendingTraceState)
+    }
+
+    private func startTraceStreamingLocked() {
+        guard traceWriterStartTask == nil else {
+            return
+        }
+
+        let capturedSessionId = sessionId
+        let statesToStream = currentTraceStates
+        currentTraceStates.removeAll(keepingCapacity: false)
+
+        let startTask = Task<TraceWriter, Error> {
+            try await TraceStorageManager.shared.beginTrace(sessionId: capturedSessionId)
+        }
+        traceWriterStartTask = startTask
+
+        for state in statesToStream {
+            enqueueTraceWriteLocked(state)
+        }
+    }
+
+    private func enqueueTraceWriteLocked(_ state: TraceState) {
+        guard let startTask = traceWriterStartTask else {
+            currentTraceStates.append(state)
+            return
+        }
+
+        let previousTask = traceWriteTask
+        traceWriteTask = Task<Void, Error> {
+            if let previousTask {
+                try await previousTask.value
+            }
+
+            let writer = try await startTask.value
+            try await writer.append(state)
+        }
+        streamedTraceCount += 1
+    }
+
+    private func traceStateCountLocked() -> Int {
+        streamedTraceCount + currentTraceStates.count + (pendingTraceState == nil ? 0 : 1)
+    }
+
     /// Reset parser state for a new run (thread-safe)
     func reset() {
         lock.lock()
         defer { lock.unlock() }
+        traceWriterStartTask?.cancel()
+        traceWriteTask?.cancel()
         lineBuffer.reset()
         states = 0
         distinct = 0
@@ -216,9 +337,15 @@ class TLCOutputParser {
         currentPhase = .parsing
         startTime = nil
         currentTraceStates = []
+        pendingTraceState = nil
+        traceWriterStartTask = nil
+        traceWriteTask = nil
+        streamedTraceCount = 0
         isParsingTrace = false
         errorMessage = nil
         errorType = nil
+        traceLoopStart = nil
+        traceViolatedProperty = nil
         sessionId = UUID()
         detectedOOM = false
     }
@@ -322,9 +449,15 @@ class TLCOutputParser {
 
         errorMessage = message
         errorType = type
+        traceLoopStart = json["loopStart"] as? Int
+        traceViolatedProperty = json["property"] as? String
 
         if let traceData = json["trace"] as? [[String: Any]] {
-            var traceStates: [TraceState] = []
+            if traceWriterStartTask == nil && streamedTraceCount == 0 {
+                pendingTraceState = nil
+                currentTraceStates.removeAll(keepingCapacity: true)
+            }
+
             for (index, stateData) in traceData.enumerated() {
                 let action = stateData["action"] as? String
                 var variables: [String: StateValue] = [:]
@@ -346,7 +479,7 @@ class TLCOutputParser {
                     )
                 }
 
-                traceStates.append(TraceState(
+                appendCompletedTraceStateLocked(TraceState(
                     id: index,
                     action: action,
                     variables: variables,
@@ -354,13 +487,17 @@ class TLCOutputParser {
                 ))
             }
 
-            errorTrace = ErrorTrace(
-                type: type,
-                message: message,
-                states: traceStates,
-                loopStart: json["loopStart"] as? Int,
-                violatedProperty: json["property"] as? String
-            )
+            if traceWriterStartTask == nil {
+                errorTrace = ErrorTrace(
+                    type: type,
+                    message: message,
+                    states: currentTraceStates,
+                    loopStart: traceLoopStart,
+                    violatedProperty: traceViolatedProperty
+                )
+            } else {
+                errorTrace = nil
+            }
         }
     }
 
@@ -377,7 +514,7 @@ class TLCOutputParser {
     }
 
     private func parseStateJSON(_ json: [String: Any]) {
-        let id = json["id"] as? Int ?? currentTraceStates.count
+        let id = json["id"] as? Int ?? traceStateCountLocked()
         let action = json["action"] as? String
         var variables: [String: StateValue] = [:]
 
@@ -389,7 +526,7 @@ class TLCOutputParser {
             }
         }
 
-        currentTraceStates.append(TraceState(
+        appendCompletedTraceStateLocked(TraceState(
             id: id,
             action: action,
             variables: variables,
@@ -562,22 +699,24 @@ class TLCOutputParser {
         if match.numberOfRanges >= 3,
            let idRange = Swift.Range(match.range(at: 1), in: line),
            let actionRange = Swift.Range(match.range(at: 2), in: line) {
-            let id = Int(line[idRange]) ?? currentTraceStates.count
+            flushPendingTraceStateLocked()
+
+            let id = Int(line[idRange]) ?? traceStateCountLocked()
             let action = String(line[actionRange])
 
-            currentTraceStates.append(TraceState(
+            pendingTraceState = TraceState(
                 id: id,
                 action: action,
                 variables: [:],
                 location: nil
-            ))
+            )
         }
     }
 
     private func parseVariableLine(_ line: String) {
         // /\ variable = value
         guard let match = TLCRegex.variable.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
-              !currentTraceStates.isEmpty else {
+              let lastState = pendingTraceState else {
             return
         }
 
@@ -588,15 +727,14 @@ class TLCOutputParser {
             let valueStr = String(line[valueRange])
 
             if let value = parseTextValue(valueStr) {
-                let lastState = currentTraceStates.removeLast()
                 var variables = lastState.variables
                 variables[name] = value
-                currentTraceStates.append(TraceState(
+                pendingTraceState = TraceState(
                     id: lastState.id,
                     action: lastState.action,
                     variables: variables,
                     location: lastState.location
-                ))
+                )
             }
         }
     }
@@ -709,13 +847,14 @@ class TLCOutputParser {
     func finalizeErrorTrace() {
         lock.lock()
         defer { lock.unlock() }
-        if !currentTraceStates.isEmpty, let type = errorType {
+        flushPendingTraceStateLocked()
+        if traceWriterStartTask == nil, !currentTraceStates.isEmpty, let type = errorType {
             errorTrace = ErrorTrace(
                 type: type,
                 message: errorMessage ?? "Error found",
                 states: currentTraceStates,
-                loopStart: nil,
-                violatedProperty: nil
+                loopStart: traceLoopStart,
+                violatedProperty: traceViolatedProperty
             )
         }
     }

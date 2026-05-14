@@ -3,6 +3,12 @@ import os
 
 private let logger = Log.logger(category: "TLC")
 
+private extension String {
+    var nonEmptyOutputLines: [String] {
+        components(separatedBy: .newlines).filter { !$0.isEmpty }
+    }
+}
+
 // MARK: - TLC Process Manager
 
 /// Actor that manages TLC model checking processes
@@ -439,11 +445,7 @@ actor TLCProcessManager {
 
                 // Log raw output to OutputManager
                 if let str = String(data: data, encoding: .utf8) {
-                    for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                        DispatchQueue.main.async {
-                            OutputManager.shared.logTLC(line)
-                        }
-                    }
+                    OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlc)
                 }
 
                 // Guard against yielding after stream is finished
@@ -463,13 +465,12 @@ actor TLCProcessManager {
                 if let str = String(data: data, encoding: .utf8) {
                     logger.error("TLC stderr: \(str)")
                     // Log errors to OutputManager and check for OOM
-                    for line in str.components(separatedBy: .newlines) where !line.isEmpty {
+                    let lines = str.nonEmptyOutputLines
+                    for line in lines {
                         // Check for OOM in stderr
                         parser?.parseStderr(line)
-                        DispatchQueue.main.async {
-                            OutputManager.shared.logTLC(line, isError: true)
-                        }
                     }
+                    OutputManager.shared.logLines(lines, source: .tlc, isError: true)
                 }
             }
 
@@ -480,12 +481,17 @@ actor TLCProcessManager {
         }
 
         streamStates[sessionId] = streamState
+        let exitObserver = ProcessExitObserver()
+        process.terminationHandler = { terminatedProcess in
+            exitObserver.complete(status: terminatedProcess.terminationStatus)
+        }
 
         do {
             try process.run()
             processStarted = true
             ProcessRegistry.shared.register(process, for: sessionId)
         } catch {
+            process.terminationHandler = nil
             activeProcesses.removeValue(forKey: sessionId)
             parsers.removeValue(forKey: sessionId)
             streamStates.removeValue(forKey: sessionId)
@@ -502,11 +508,8 @@ actor TLCProcessManager {
         }
         progressTasks[sessionId] = progressTask
 
-        let exitStatus = await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
-            process.terminationHandler = { terminatedProcess in
-                continuation.resume(returning: terminatedProcess.terminationStatus)
-            }
-        }
+        let exitStatus = await exitObserver.wait(for: process)
+        process.terminationHandler = nil
 
         // Drain any remaining buffered data before clearing handlers.
         // readabilityHandler may not fire for data already in the pipe buffer
@@ -514,9 +517,7 @@ actor TLCProcessManager {
         let lastStdout = stdoutHandle.availableData
         if !lastStdout.isEmpty {
             if let str = String(data: lastStdout, encoding: .utf8) {
-                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
-                    OutputManager.shared.logTLC(line)
-                }
+                OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlc)
             }
             if let update = parser.parseThreadSafe(lastStdout) {
                 streamState.yield(update)
@@ -525,10 +526,11 @@ actor TLCProcessManager {
         let lastStderr = stderrHandle.availableData
         if !lastStderr.isEmpty {
             if let str = String(data: lastStderr, encoding: .utf8) {
-                for line in str.components(separatedBy: .newlines) where !line.isEmpty {
+                let lines = str.nonEmptyOutputLines
+                for line in lines {
                     parser.parseStderr(line)
-                    OutputManager.shared.logTLC(line, isError: true)
                 }
+                OutputManager.shared.logLines(lines, source: .tlc, isError: true)
             }
         }
 

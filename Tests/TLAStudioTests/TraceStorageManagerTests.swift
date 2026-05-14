@@ -332,6 +332,33 @@ final class TraceStorageManagerTests: XCTestCase {
         await manager.cleanup(sessionId: sessionId)
     }
 
+    func testNegativeStateIndexReturnsError() async throws {
+        let sessionId = UUID()
+        let writer = try await manager.beginTrace(sessionId: sessionId)
+        try await writer.append(TraceState(id: 0, action: "Init", variables: [:]))
+
+        _ = try await manager.finalizeTrace(
+            sessionId: sessionId,
+            type: .invariantViolation,
+            message: "Test",
+            loopStart: nil,
+            violatedProperty: nil
+        )
+
+        do {
+            _ = try await manager.loadState(sessionId: sessionId, index: -1)
+            XCTFail("Expected stateNotFound error")
+        } catch let error as TraceStorageError {
+            if case .stateNotFound(let index) = error {
+                XCTAssertEqual(index, -1)
+            } else {
+                XCTFail("Expected stateNotFound error")
+            }
+        }
+
+        await manager.cleanup(sessionId: sessionId)
+    }
+
     func testAppendToNonexistentSession() async throws {
         let fakeSessionId = UUID()
 
@@ -506,6 +533,27 @@ final class LazyErrorTraceTests: XCTestCase {
         } catch let error as TraceStorageError {
             if case .stateNotFound(let index) = error {
                 XCTAssertEqual(index, 5)
+            } else {
+                XCTFail("Expected stateNotFound error")
+            }
+        }
+    }
+
+    func testInMemoryLoadStateNegativeIndex() async throws {
+        let lazyTrace = LazyErrorTrace(
+            type: .invariantViolation,
+            message: "Test",
+            states: [TraceState(id: 0, action: "Init", variables: [:])],
+            loopStart: nil,
+            violatedProperty: nil
+        )
+
+        do {
+            _ = try await lazyTrace.loadState(at: -1)
+            XCTFail("Expected stateNotFound error")
+        } catch let error as TraceStorageError {
+            if case .stateNotFound(let index) = error {
+                XCTAssertEqual(index, -1)
             } else {
                 XCTFail("Expected stateNotFound error")
             }

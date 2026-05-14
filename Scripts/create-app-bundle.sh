@@ -3,7 +3,12 @@
 
 set -e
 
-BUILD_DIR=".build/arm64-apple-macosx/debug"
+BUILD_CONFIG="${BUILD_CONFIG:-debug}"
+if [ "$1" = "release" ] || { [ "$1" = "-c" ] && [ "$2" = "release" ]; }; then
+    BUILD_CONFIG="release"
+fi
+
+BUILD_DIR="$(swift build -c "$BUILD_CONFIG" --show-bin-path)"
 APP_NAME="TLAStudio"
 BUNDLE_DIR="$BUILD_DIR/$APP_NAME.app"
 TLACORE_DIR="Sources/TLACore"

@@ -55,7 +55,12 @@ enum SafeArchiveExtractor {
     ) throws {
         let fileManager = FileManager.default
 
-        // Step 1: Create a secure staging directory for extraction
+        // Step 1: Validate archive metadata before tar is allowed to write anything.
+        let entries = try listArchiveEntries(archiveURL)
+        try validatePaths(entries.map(\.path))
+        try validateLinkTargets(entries, stripComponents: stripComponents)
+
+        // Step 2: Create a secure staging directory for extraction
         let stagingDir = fileManager.temporaryDirectory
             .appendingPathComponent("SafeArchiveExtractor-\(UUID().uuidString)")
         do {
@@ -69,17 +74,17 @@ enum SafeArchiveExtractor {
             try? fileManager.removeItem(at: stagingDir)
         }
 
-        // Step 2: Extract to staging directory
+        // Step 3: Extract to staging directory
         try performExtraction(from: archiveURL, to: stagingDir, stripComponents: stripComponents)
 
-        // Step 3: Validate extracted contents in staging directory
-        // Now there is no TOCTOU window — we validate the actual extracted files
+        // Step 4: Validate extracted contents in staging directory
+        // The preflight prevents unsafe writes; this verifies the actual extracted tree.
         try validateNoEscapingSymlinks(in: stagingDir)
         try validateExtractedPaths(in: stagingDir)
 
         logger.info("Validated extracted contents in staging directory")
 
-        // Step 4: Create target directory if needed
+        // Step 5: Create target directory if needed
         if !fileManager.fileExists(atPath: targetDirectory.path) {
             do {
                 try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
@@ -88,7 +93,7 @@ enum SafeArchiveExtractor {
             }
         }
 
-        // Step 5: Move validated contents from staging to target
+        // Step 6: Move validated contents from staging to target
         let contents = try fileManager.contentsOfDirectory(at: stagingDir,
                                                             includingPropertiesForKeys: nil)
         for item in contents {
@@ -105,11 +110,52 @@ enum SafeArchiveExtractor {
 
     // MARK: - Private Helpers
 
-    /// Lists all file paths in the archive without extracting.
-    private static func listArchiveContents(_ archiveURL: URL) throws -> [String] {
+    private enum ArchiveEntryType {
+        case regular
+        case symlink
+        case hardlink
+    }
+
+    private struct ArchiveEntry {
+        let path: String
+        let type: ArchiveEntryType
+        let linkTarget: String?
+    }
+
+    /// Lists all archive entries without extracting.
+    private static func listArchiveEntries(_ archiveURL: URL) throws -> [ArchiveEntry] {
+        let pathsOutput = try runTarList(archiveURL, verbose: false)
+        let verboseOutput = try runTarList(archiveURL, verbose: true)
+        let paths = pathsOutput.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        let verboseLines = verboseOutput.components(separatedBy: .newlines).filter { !$0.isEmpty }
+
+        return paths.enumerated().map { index, path in
+            let verboseLine = index < verboseLines.count ? verboseLines[index] : ""
+            let entryType: ArchiveEntryType
+            let linkTarget: String?
+
+            if verboseLine.hasPrefix("l") {
+                entryType = .symlink
+                linkTarget = verboseLine.range(of: " -> ")
+                    .map { String(verboseLine[$0.upperBound...]) }
+            } else if verboseLine.hasPrefix("h") {
+                entryType = .hardlink
+                linkTarget = verboseLine.range(of: " link to ")
+                    .map { String(verboseLine[$0.upperBound...]) }
+            } else {
+                entryType = .regular
+                linkTarget = nil
+            }
+
+            return ArchiveEntry(path: path, type: entryType, linkTarget: linkTarget)
+        }
+    }
+
+    /// Lists archive contents using libarchive-backed bsdtar. `-f` auto-detects gzip/plain tar.
+    private static func runTarList(_ archiveURL: URL, verbose: Bool) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        process.arguments = ["-tzf", archiveURL.path]
+        process.arguments = [verbose ? "-tvf" : "-tf", archiveURL.path]
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -134,7 +180,7 @@ enum SafeArchiveExtractor {
             throw Error.listingFailed("Failed to decode archive listing")
         }
 
-        return output.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        return output
     }
 
     /// Validates that no paths escape the target directory.
@@ -168,6 +214,59 @@ enum SafeArchiveExtractor {
         }
     }
 
+    /// Validates archive symlink and hardlink targets before extraction.
+    private static func validateLinkTargets(_ entries: [ArchiveEntry], stripComponents: Int) throws {
+        for entry in entries {
+            guard let target = entry.linkTarget, !target.isEmpty else { continue }
+
+            switch entry.type {
+            case .symlink:
+                if target.hasPrefix("/") {
+                    throw Error.symlinkEscapeDetected("\(entry.path) -> \(target)")
+                }
+                try validateRelativeLinkTarget(path: entry.path, target: target, stripComponents: stripComponents)
+
+            case .hardlink:
+                try validatePaths([target])
+
+            case .regular:
+                continue
+            }
+        }
+    }
+
+    private static func validateRelativeLinkTarget(
+        path: String,
+        target: String,
+        stripComponents: Int
+    ) throws {
+        guard let linkComponents = strippedComponents(for: path, stripComponents: stripComponents),
+              !linkComponents.isEmpty else {
+            return
+        }
+
+        var targetComponents = Array(linkComponents.dropLast())
+        for component in target.components(separatedBy: "/") {
+            if component.isEmpty || component == "." {
+                continue
+            }
+            if component == ".." {
+                guard !targetComponents.isEmpty else {
+                    throw Error.symlinkEscapeDetected("\(path) -> \(target)")
+                }
+                targetComponents.removeLast()
+            } else {
+                targetComponents.append(component)
+            }
+        }
+    }
+
+    private static func strippedComponents(for path: String, stripComponents: Int) -> [String]? {
+        let normalized = path.components(separatedBy: "/").filter { !$0.isEmpty && $0 != "." }
+        guard normalized.count > stripComponents else { return nil }
+        return Array(normalized.dropFirst(stripComponents))
+    }
+
     /// Performs the actual extraction using tar.
     private static func performExtraction(
         from archiveURL: URL,
@@ -178,7 +277,7 @@ enum SafeArchiveExtractor {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
 
         var args = [
-            "-xzf", archiveURL.path,
+            "-xf", archiveURL.path,
             "-C", targetDirectory.path,
             "--no-same-owner",        // Don't preserve file ownership
             "--no-same-permissions"   // Use umask instead of archive permissions
@@ -219,13 +318,22 @@ enum SafeArchiveExtractor {
 
         guard let enumerator = fileManager.enumerator(
             at: directory,
-            includingPropertiesForKeys: nil,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
             options: []
         ) else { return }
 
         for case let fileURL as URL in enumerator {
-            // Resolve the actual path and verify it's within the staging directory
-            let resolvedPath = fileURL.resolvingSymlinksInPath().path
+            if (try? fileURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                continue
+            }
+
+            // Resolve the actual path and verify it's within the staging directory.
+            guard let resolvedFileCStr = realpath(fileURL.path, nil) else {
+                throw Error.pathTraversalDetected(fileURL.path)
+            }
+            let resolvedPath = String(cString: resolvedFileCStr)
+            free(resolvedFileCStr)
+
             if !resolvedPath.hasPrefix(resolvedDirPath + "/") &&
                resolvedPath != resolvedDirPath {
                 throw Error.pathTraversalDetected(fileURL.path)

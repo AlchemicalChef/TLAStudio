@@ -8,7 +8,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Support release or debug builds
 BUILD_CONFIG="${BUILD_CONFIG:-debug}"
-if [ "$1" = "release" ] || [ "$1" = "-c" ] && [ "$2" = "release" ]; then
+if [ "$1" = "release" ] || { [ "$1" = "-c" ] && [ "$2" = "release" ]; }; then
     BUILD_CONFIG="release"
 fi
 

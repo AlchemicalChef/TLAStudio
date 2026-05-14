@@ -694,6 +694,26 @@ final class TLCOutputParserTests: XCTestCase {
         XCTAssertNil(result.lazyErrorTrace)
     }
 
+    func testFinalResultWithStorageLargeTraceIsFailureEvenWithZeroExit() async {
+        for i in 0...TLCOutputParser.largeTraceThreshold {
+            let state = #"{"type":"state","id":\#(i),"action":"Step","variables":{"x":\#(i)}}"#
+            _ = parser.parse((state + "\n").data(using: .utf8)!)
+        }
+
+        let errorJson = """
+        {"type":"error","errorType":"invariant","message":"TypeOK violated"}
+        """
+        _ = parser.parse((errorJson + "\n").data(using: .utf8)!)
+
+        let result = await parser.finalResultWithStorage(exitCode: 0, duration: 1.0)
+
+        XCTAssertFalse(result.success)
+        XCTAssertNil(result.errorTrace)
+        XCTAssertNotNil(result.lazyErrorTrace)
+
+        await TraceStorageManager.shared.cleanup(sessionId: result.sessionId)
+    }
+
     // MARK: - JSON State Message Parsing Tests
 
     func testParseJSONStateAccumulation() {
