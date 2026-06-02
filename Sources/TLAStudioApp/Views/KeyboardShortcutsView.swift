@@ -72,7 +72,7 @@ struct KeyboardShortcutsView: View {
 
     private var viewShortcuts: [ShortcutItem] {
         [
-            ShortcutItem(keys: "G", description: "Go to Line..."),
+            ShortcutItem(keys: "L", description: "Go to Line..."),
             ShortcutItem(keys: "K", modifiers: [.option], description: "Fold All"),
             ShortcutItem(keys: "J", modifiers: [.option], description: "Unfold All"),
             ShortcutItem(keys: "[", description: "Toggle Fold"),

@@ -21,8 +21,9 @@ final class CheckpointManagerTests: TempDirectoryTestCase {
         try FileManager.default.createDirectory(at: checkpoint1, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: checkpoint2, withIntermediateDirectories: true)
 
-        // Create a checkpoint file in one
+        // Create checkpoint files
         try "test".write(to: checkpoint1.appendingPathComponent("queue.chkpt"), atomically: true, encoding: .utf8)
+        try "test".write(to: checkpoint2.appendingPathComponent("states.chkpt"), atomically: true, encoding: .utf8)
 
         let checkpoints = try await CheckpointManager.shared.discoverCheckpoints(
             in: tempDirectory,
@@ -62,7 +63,7 @@ final class CheckpointManagerTests: TempDirectoryTestCase {
 
     // MARK: - Validation Tests
 
-    func testValidateExistingCheckpoint() async throws {
+    func testValidateExistingDirectoryWithoutArtifactsIsInvalid() async throws {
         let checkpointDir = tempDirectory.appendingPathComponent("24-01-15-10-30-00")
         try FileManager.default.createDirectory(at: checkpointDir, withIntermediateDirectories: true)
 
@@ -76,7 +77,38 @@ final class CheckpointManagerTests: TempDirectoryTestCase {
         )
 
         let isValid = await CheckpointManager.shared.validateCheckpoint(checkpoint)
+        XCTAssertFalse(isValid)
+    }
+
+    func testValidateCheckpointRequiresCheckpointArtifacts() async throws {
+        let checkpointDir = tempDirectory.appendingPathComponent("24-01-15-10-30-00")
+        try FileManager.default.createDirectory(at: checkpointDir, withIntermediateDirectories: true)
+        try "test".write(to: checkpointDir.appendingPathComponent("queue.chkpt"), atomically: true, encoding: .utf8)
+
+        let checkpoint = CheckpointInfo(
+            id: "24-01-15-10-30-00",
+            directoryURL: checkpointDir,
+            createdAt: Date(),
+            specName: "Test",
+            distinctStates: nil,
+            statesFound: nil
+        )
+
+        let isValid = await CheckpointManager.shared.validateCheckpoint(checkpoint)
         XCTAssertTrue(isValid)
+    }
+
+    func testDiscoverCheckpointsAcceptsMillisecondsTimestamp() async throws {
+        let checkpointDir = tempDirectory.appendingPathComponent("24-01-15-10-30-00.123")
+        try FileManager.default.createDirectory(at: checkpointDir, withIntermediateDirectories: true)
+        try "test".write(to: checkpointDir.appendingPathComponent("states.chkpt"), atomically: true, encoding: .utf8)
+
+        let checkpoints = try await CheckpointManager.shared.discoverCheckpoints(
+            in: tempDirectory,
+            specName: "TestSpec"
+        )
+
+        XCTAssertEqual(checkpoints.map(\.id), ["24-01-15-10-30-00.123"])
     }
 
     func testValidateNonExistentCheckpoint() async throws {
@@ -93,6 +125,33 @@ final class CheckpointManagerTests: TempDirectoryTestCase {
         XCTAssertFalse(isValid)
     }
 
+    func testCheckpointDiskSizeIncludesNestedFiles() throws {
+        let checkpointDir = tempDirectory.appendingPathComponent("24-01-15-10-30-00")
+        let nestedDir = checkpointDir.appendingPathComponent("fingerprints")
+        try FileManager.default.createDirectory(at: nestedDir, withIntermediateDirectories: true)
+        try String(repeating: "a", count: 7).write(
+            to: checkpointDir.appendingPathComponent("queue.chkpt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try String(repeating: "b", count: 11).write(
+            to: nestedDir.appendingPathComponent("states.chkpt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let checkpoint = CheckpointInfo(
+            id: "24-01-15-10-30-00",
+            directoryURL: checkpointDir,
+            createdAt: Date(),
+            specName: "Test",
+            distinctStates: nil,
+            statesFound: nil
+        )
+
+        XCTAssertEqual(checkpoint.diskSize, 18)
+    }
+
     // MARK: - Cleanup Tests
 
     func testCleanupKeepsRecentCheckpoints() async throws {
@@ -100,6 +159,7 @@ final class CheckpointManagerTests: TempDirectoryTestCase {
         for i in 0..<5 {
             let dir = tempDirectory.appendingPathComponent("24-01-\(String(format: "%02d", 10 + i))-10-30-00")
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try "test".write(to: dir.appendingPathComponent("queue.chkpt"), atomically: true, encoding: .utf8)
             // Add a small delay to ensure different modification times
         }
 
@@ -123,6 +183,7 @@ final class CheckpointManagerTests: TempDirectoryTestCase {
         for i in 0..<2 {
             let dir = tempDirectory.appendingPathComponent("24-01-\(String(format: "%02d", 10 + i))-10-30-00")
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try "test".write(to: dir.appendingPathComponent("queue.chkpt"), atomically: true, encoding: .utf8)
         }
 
         let removed = try await CheckpointManager.shared.cleanupOldCheckpoints(

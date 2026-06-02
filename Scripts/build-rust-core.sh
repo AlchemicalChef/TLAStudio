@@ -8,6 +8,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 RUST_DIR="$PROJECT_DIR/Sources/TLACore"
 OUTPUT_DIR="$PROJECT_DIR/build/TLACore"
 SWIFT_BINDINGS_DIR="$PROJECT_DIR/Sources/TLAStudioApp/TLACore"
+SWIFT_FFI_DIR="$PROJECT_DIR/Sources/tla_coreFFI"
 
 echo "=== Building TLACore (Rust) ==="
 
@@ -29,6 +30,8 @@ cd "$RUST_DIR"
 # Build release
 echo "Building release..."
 cargo build --release --target aarch64-apple-darwin
+mkdir -p target/release
+cp target/aarch64-apple-darwin/release/libtla_core.dylib target/release/libtla_core.dylib
 
 # Generate Swift bindings
 echo "Generating UniFFI bindings..."
@@ -52,6 +55,7 @@ cp "$OUTPUT_DIR/swift/tla_coreFFI.h" "$FRAMEWORK_DIR/Headers/"
 
 # Also copy Swift bindings to app source for SwiftPM integration
 cp "$OUTPUT_DIR/swift/tla_core.swift" "$SWIFT_BINDINGS_DIR/TLACoreBindings.swift"
+cp "$OUTPUT_DIR/swift/tla_coreFFI.h" "$SWIFT_FFI_DIR/tla_coreFFI.h"
 
 # Create module map
 cat > "$FRAMEWORK_DIR/Modules/module.modulemap" << 'EOF'

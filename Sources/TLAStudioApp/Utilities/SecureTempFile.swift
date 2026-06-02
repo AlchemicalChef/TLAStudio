@@ -14,6 +14,7 @@ enum SecureTempFile {
     enum Error: Swift.Error, LocalizedError {
         case directoryCreationFailed(Swift.Error)
         case directoryOwnershipMismatch
+        case directoryPermissionsMismatch(actual: UInt16, expected: UInt16)
         case fileCreationFailed(Swift.Error)
         case writeError(Swift.Error)
 
@@ -23,6 +24,11 @@ enum SecureTempFile {
                 return "Failed to create secure temp directory: \(error.localizedDescription)"
             case .directoryOwnershipMismatch:
                 return "Temp directory ownership verification failed"
+            case .directoryPermissionsMismatch(let actual, let expected):
+                return String(
+                    format: "Temp directory has insecure permissions (mode 0o%o, expected 0o%o)",
+                    actual, expected
+                )
             case .fileCreationFailed(let error):
                 return "Failed to create secure temp file: \(error.localizedDescription)"
             case .writeError(let error):
@@ -242,6 +248,29 @@ enum SecureTempFile {
         }
     }
 
+    static func isManagedTemporaryFile(_ url: URL) -> Bool {
+        url.standardized.path.hasPrefix(secureTempDirectory.standardized.path + "/")
+    }
+
+    static func cleanupContainer(for url: URL?) {
+        guard let url else { return }
+        let standardizedDirectory = secureTempDirectory.standardized
+        let parent = url.deletingLastPathComponent().standardized
+
+        guard parent.deletingLastPathComponent().path == standardizedDirectory.path,
+              parent.path.hasPrefix(standardizedDirectory.path + "/") else {
+            cleanup(url)
+            return
+        }
+
+        do {
+            try FileManager.default.removeItem(at: parent)
+            logger.debug("Cleaned up secure temp container: \(parent.path)")
+        } catch {
+            logger.warning("Failed to clean up temp container: \(error.localizedDescription)")
+        }
+    }
+
     /// Cleans up all temp files created by this app.
     static func cleanupAll() {
         let fileManager = FileManager.default
@@ -262,21 +291,34 @@ enum SecureTempFile {
 
     // MARK: - Private Helpers
 
-    /// Ensures the secure temp directory exists with proper ownership.
+    /// Ensures the secure temp directory exists with proper ownership AND permissions.
+    ///
+    /// Both checks are required for defense-in-depth: ownership stops a foreign UID
+    /// from siting an attacker-controlled dir at our path, while the 0o700 mode check
+    /// stops a previously-created dir that has since been chmod'd looser (user error,
+    /// malware artifact, third-party tool) from being silently re-used.
     private static func ensureSecureDirectory() throws {
         let fileManager = FileManager.default
         let directory = secureTempDirectory
         let uid = getuid()
+        let requiredMode: UInt16 = 0o700
 
         if fileManager.fileExists(atPath: directory.path) {
-            // Verify ownership - directory must be owned by current user
+            // Verify ownership AND permissions - existing dir must be ours AND restricted.
             do {
                 let attrs = try fileManager.attributesOfItem(atPath: directory.path)
-                if let ownerID = attrs[.ownerAccountID] as? NSNumber {
-                    if ownerID.uint32Value != uid {
-                        // Directory exists but is owned by someone else - security risk
-                        logger.error("Temp directory owned by UID \(ownerID) instead of \(uid)")
-                        throw Error.directoryOwnershipMismatch
+                if let ownerID = attrs[.ownerAccountID] as? NSNumber,
+                   ownerID.uint32Value != uid {
+                    // Directory exists but is owned by someone else - security risk
+                    logger.error("Temp directory owned by UID \(ownerID) instead of \(uid)")
+                    throw Error.directoryOwnershipMismatch
+                }
+                // POSIX permissions are stored as NSNumber under FileAttributeKey.posixPermissions.
+                if let perms = attrs[.posixPermissions] as? NSNumber {
+                    let actual = perms.uint16Value & 0o777
+                    if actual != requiredMode {
+                        logger.error("Temp directory has mode 0o\(String(actual, radix: 8)) (expected 0o\(String(requiredMode, radix: 8)))")
+                        throw Error.directoryPermissionsMismatch(actual: actual, expected: requiredMode)
                     }
                 }
             } catch let error as Error {

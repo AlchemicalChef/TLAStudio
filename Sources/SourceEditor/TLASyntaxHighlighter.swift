@@ -516,7 +516,11 @@ extension TLASyntaxHighlighter {
 
     /// Called when the scroll position changes - triggers visible-range highlighting for large files
     public func scrollPositionChanged() {
-        guard let textView = textView, textView.string.count > Self.visibleRangeHighlightingThreshold else {
+        // Use NSString.length (O(1) UTF-16 units) rather than String.count (O(N) graphemes).
+        // The threshold semantics are NSRange-compatible. See audit F-S6-editor-perf-002.
+        guard let textView = textView else { return }
+        let length = textView.textStorage?.length ?? (textView.string as NSString).length
+        guard length > Self.visibleRangeHighlightingThreshold else {
             return
         }
         // Reset the cached visible range and content hash to force re-highlighting

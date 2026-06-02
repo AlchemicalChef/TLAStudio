@@ -52,6 +52,10 @@ struct DocumentWindowContent: View {
             guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
             showNavigator.toggle()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleSymbolOutline)) { notification in
+            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+            showNavigator = true
+        }
         .onReceive(NotificationCenter.default.publisher(for: .toggleInspectorSidebar)) { notification in
             guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
             showInspector.toggle()

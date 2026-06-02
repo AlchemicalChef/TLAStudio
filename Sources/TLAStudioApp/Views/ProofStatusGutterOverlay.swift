@@ -11,6 +11,13 @@ final class ProofStatusGutterOverlay: NSView {
     private weak var textView: NSTextView?
     private var trackingArea: NSTrackingArea?
     private var hoveredLine: Int?
+    /// Either the shared per-document line index (preferred) or a self-owned fallback.
+    /// See audit F-S6-editor-perf-006.
+    private let sharedLineIndex: SharedTextLineIndex?
+    private var localLineStartOffsets: [Int] = [0]
+    private var lineStartOffsets: [Int] {
+        sharedLineIndex?.offsets ?? localLineStartOffsets
+    }
 
     /// Annotations indexed by line for efficient lookup during drawing
     private var annotationsByLine: [Int: ProofAnnotation] = [:]
@@ -27,8 +34,9 @@ final class ProofStatusGutterOverlay: NSView {
 
     // MARK: - Initialization
 
-    init(textView: NSTextView) {
+    init(textView: NSTextView, sharedLineIndex: SharedTextLineIndex? = nil) {
         self.textView = textView
+        self.sharedLineIndex = sharedLineIndex
         super.init(frame: .zero)
 
         wantsLayer = true
@@ -36,6 +44,9 @@ final class ProofStatusGutterOverlay: NSView {
         // Clip drawing to the overlay's bounds; prevents dots from rendering over the
         // bottom panel when the editor region shrinks mid-resize.
         layer?.masksToBounds = true
+        if sharedLineIndex == nil {
+            rebuildTextLineIndex()
+        }
 
         // Observe text changes to update dot positions when lines shift
         NotificationCenter.default.addObserver(
@@ -91,6 +102,18 @@ final class ProofStatusGutterOverlay: NSView {
     }
 
     @objc private func textDidChange(_ notification: Notification) {
+        // If a shared index owns recomputation, the owner (EditorContainerView)
+        // invalidates it; we only refresh our local fallback.
+        if sharedLineIndex == nil {
+            rebuildTextLineIndex()
+        }
+        needsDisplay = true
+    }
+
+    func refreshTextLineIndex() {
+        if sharedLineIndex == nil {
+            rebuildTextLineIndex()
+        }
         needsDisplay = true
     }
 
@@ -122,28 +145,29 @@ final class ProofStatusGutterOverlay: NSView {
     private func lineAtPoint(_ point: NSPoint) -> Int? {
         guard let textView = textView,
               let layoutManager = textView.layoutManager,
-              let textContainer = textView.textContainer else {
+              let textContainer = textView.textContainer,
+              layoutManager.numberOfGlyphs > 0,
+              !lineStartOffsets.isEmpty else {
             return nil
         }
 
         let scrollView = textView.enclosingScrollView
         let visibleRect = scrollView?.documentVisibleRect ?? textView.visibleRect
+        let containerOrigin = textView.textContainerOrigin
 
         // Convert point to text view coordinates
         let textPoint = NSPoint(
-            x: 0,
-            y: point.y + visibleRect.minY - textView.textContainerInset.height
+            x: point.x + visibleRect.minX - containerOrigin.x,
+            y: point.y + visibleRect.minY - containerOrigin.y
         )
 
         var fraction: CGFloat = 0
         let glyphIndex = layoutManager.glyphIndex(for: textPoint, in: textContainer, fractionOfDistanceThroughGlyph: &fraction)
-        let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+        guard glyphIndex < layoutManager.numberOfGlyphs else { return nil }
 
-        // Count lines up to charIndex (use NSString for UTF-16 consistency with NSLayoutManager)
-        let text = textView.string as NSString
-        guard text.length > 0 else { return nil }
-        let prefix = text.substring(to: min(charIndex, text.length))
-        return prefix.components(separatedBy: "\n").count
+        let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+        let clampedIndex = max(0, min(charIndex, (textView.string as NSString).length))
+        return TextCoordinateMapper.lineIndex(forUTF16Offset: clampedIndex, in: lineStartOffsets) + 1
     }
 
     // MARK: - Drawing
@@ -162,47 +186,106 @@ final class ProofStatusGutterOverlay: NSView {
 
         let scrollView = textView.enclosingScrollView
         let visibleRect = scrollView?.documentVisibleRect ?? textView.visibleRect
+        let containerOrigin = textView.textContainerOrigin
 
         let text = textView.string as NSString
+        guard !lineStartOffsets.isEmpty, text.length > 0 else { return }
 
         // Get visible glyph range
-        let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
+        let textContainerVisibleRect = NSRect(
+            x: visibleRect.minX - containerOrigin.x,
+            y: visibleRect.minY - containerOrigin.y,
+            width: visibleRect.width,
+            height: visibleRect.height
+        )
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: textContainerVisibleRect, in: textContainer)
+        guard glyphRange.location != NSNotFound else { return }
+
         let charRange = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+        let firstVisibleLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: charRange.location,
+            in: lineStartOffsets
+        )
+        let lastVisibleOffset = max(
+            charRange.location,
+            min(NSMaxRange(charRange), text.length) - 1
+        )
+        let lastVisibleLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: lastVisibleOffset,
+            in: lineStartOffsets
+        )
 
         // Walk visible lines
-        var lineNumber = 1
-        // Count lines before visible range
-        let preText = text.substring(to: min(charRange.location, text.length))
-        lineNumber = preText.components(separatedBy: "\n").count
-
-        // Enumerate visible lines
-        text.enumerateSubstrings(in: charRange, options: [.byLines, .substringNotRequired]) { [weak self] _, substringRange, _, _ in
-            guard let self = self else { return }
+        guard firstVisibleLine <= lastVisibleLine else { return }
+        for lineIndex in firstVisibleLine...lastVisibleLine {
+            let lineNumber = lineIndex + 1
 
             // Check for annotation at this line
-            if let annotation = self.annotationsByLine[lineNumber] {
-                let glyphIdx = layoutManager.glyphIndexForCharacter(at: substringRange.location)
-                let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIdx, effectiveRange: nil)
-                let y = lineRect.minY + textView.textContainerInset.height - visibleRect.minY
+            if let annotation = annotationsByLine[lineNumber],
+               let lineRect = lineRect(
+                forZeroBasedLine: lineIndex,
+                nsText: text,
+                layoutManager: layoutManager,
+                textContainer: textContainer,
+                containerOrigin: containerOrigin,
+                visibleRect: visibleRect
+               ) {
+                let y = lineRect.minY
 
                 // Draw colored dot
-                let dotX = (self.bounds.width - self.dotSize) / 2
-                let dotY = y + (lineRect.height - self.dotSize) / 2
-                let dotRect = NSRect(x: dotX, y: dotY, width: self.dotSize, height: self.dotSize)
+                let dotX = (bounds.width - dotSize) / 2
+                let dotY = y + (lineRect.height - dotSize) / 2
+                let dotRect = NSRect(x: dotX, y: dotY, width: dotSize, height: dotSize)
 
                 let color = annotation.iconColor
                 color.setFill()
                 NSBezierPath(ovalIn: dotRect).fill()
 
                 // Hover highlight
-                if self.hoveredLine == lineNumber {
+                if hoveredLine == lineNumber {
                     color.withAlphaComponent(0.3).setFill()
-                    let hoverRect = NSRect(x: 0, y: y, width: self.bounds.width, height: lineRect.height)
+                    let hoverRect = NSRect(x: 0, y: y, width: bounds.width, height: lineRect.height)
                     hoverRect.fill()
                 }
             }
-
-            lineNumber += 1
         }
+    }
+
+    private func rebuildTextLineIndex() {
+        guard let textView else {
+            localLineStartOffsets = [0]
+            return
+        }
+        localLineStartOffsets = TextCoordinateMapper.lineStartOffsets(in: textView.string)
+    }
+
+    private func lineRect(
+        forZeroBasedLine line: Int,
+        nsText: NSString,
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer,
+        containerOrigin: NSPoint,
+        visibleRect: NSRect
+    ) -> NSRect? {
+        guard line >= 0, line < lineStartOffsets.count else { return nil }
+
+        let lineStart = min(lineStartOffsets[line], nsText.length)
+        guard lineStart < nsText.length else { return nil }
+
+        let lineRange = nsText.lineRange(for: NSRange(location: lineStart, length: 0))
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: lineRange,
+            actualCharacterRange: nil
+        )
+        guard glyphRange.location != NSNotFound,
+              glyphRange.location < layoutManager.numberOfGlyphs else { return nil }
+
+        let rect = layoutManager.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: nil)
+        return NSRect(
+            x: rect.minX + containerOrigin.x - visibleRect.minX,
+            y: rect.minY + containerOrigin.y - visibleRect.minY,
+            width: rect.width,
+            height: rect.height
+        )
     }
 }

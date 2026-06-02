@@ -281,6 +281,25 @@ struct ModelCheckResult {
     /// Whether JVM retry is suggested (true if native image hit 32GB limit and JVM is available)
     let suggestJVMRetry: Bool
 
+    /// Non-fatal warnings collected during TLC output parsing.
+    ///
+    /// Populated from lines that previously dropped into silent branches
+    /// (e.g. `Warning:` text-mode messages, unrecognised JSON `type` values,
+    /// unclassified TLC error tokens). The collection is best-effort: each
+    /// entry is the raw source line so callers can surface or log it without
+    /// the parser having to taxonomise every possible TLC diagnostic.
+    let warnings: [String]
+
+    /// Indicates that the result is partial or that some post-processing step
+    /// failed silently. Set when:
+    /// - the streamed-trace finaliser threw (and the parser fell back to the
+    ///   in-memory `finalResult`),
+    /// - TLC exited with an unclassified non-zero status,
+    /// - the run produced output but was terminated under memory pressure.
+    ///
+    /// Callers should treat statistics as best-effort when this is `true`.
+    let incomplete: Bool
+
     init(
         sessionId: UUID,
         success: Bool,
@@ -292,7 +311,9 @@ struct ModelCheckResult {
         message: String?,
         lazyErrorTrace: LazyErrorTrace? = nil,
         outOfMemory: Bool = false,
-        suggestJVMRetry: Bool = false
+        suggestJVMRetry: Bool = false,
+        warnings: [String] = [],
+        incomplete: Bool = false
     ) {
         self.sessionId = sessionId
         self.success = success
@@ -305,6 +326,8 @@ struct ModelCheckResult {
         self.lazyErrorTrace = lazyErrorTrace
         self.outOfMemory = outOfMemory
         self.suggestJVMRetry = suggestJVMRetry
+        self.warnings = warnings
+        self.incomplete = incomplete
     }
 
     /// Check if there's any error trace (lazy or in-memory)
@@ -332,7 +355,9 @@ struct ModelCheckResult {
             message: message,
             lazyErrorTrace: lazyErrorTrace,
             outOfMemory: outOfMemory,
-            suggestJVMRetry: suggestJVMRetry
+            suggestJVMRetry: suggestJVMRetry,
+            warnings: warnings,
+            incomplete: incomplete
         )
     }
 }

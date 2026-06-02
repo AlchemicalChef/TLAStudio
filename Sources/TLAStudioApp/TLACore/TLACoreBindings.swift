@@ -651,7 +651,8 @@ public protocol TlaCoreProtocol : AnyObject {
     
     /**
      * Get syntax highlights for a range.
-     * Uses a reusable QueryCursor and pre-interned capture names for performance.
+     * Uses pre-interned capture names for performance. A per-call `QueryCursor`
+     * avoids the contention and cross-call state risk of a shared `Mutex<QueryCursor>`.
      */
     func getHighlights(result: ParseResult, range: Range)  -> [HighlightToken]
     
@@ -782,7 +783,8 @@ open func getDetailedCompletions(result: ParseResult, position: Position) -> [De
     
     /**
      * Get syntax highlights for a range.
-     * Uses a reusable QueryCursor and pre-interned capture names for performance.
+     * Uses pre-interned capture names for performance. A per-call `QueryCursor`
+     * avoids the contention and cross-call state risk of a shared `Mutex<QueryCursor>`.
      */
 open func getHighlights(result: ParseResult, range: Range) -> [HighlightToken] {
     return try!  FfiConverterSequenceTypeHighlightToken.lift(try! rustCall() {
@@ -2747,7 +2749,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_tla_core_checksum_method_tlacore_get_detailed_completions() != 50767) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tla_core_checksum_method_tlacore_get_highlights() != 36699) {
+    if (uniffi_tla_core_checksum_method_tlacore_get_highlights() != 5661) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tla_core_checksum_method_tlacore_get_signature_help() != 22666) {

@@ -180,6 +180,86 @@ final class TLAPMOutputParserTests: XCTestCase {
         XCTAssertEqual(obligations.first?.errorMessage, "Could not find proof")
     }
 
+    func testParseObligationBlockWithMultilineReasonAndText() {
+        let data = """
+        @!!BEGIN
+        @!!type:obligation
+        @!!id:1
+        @!!status:failed
+        @!!reason:Could not find proof
+        backend returned counterexample detail
+        @!!obl:
+        ASSUME x \\in Nat
+        PROVE x >= 0
+        @!!END
+
+        """.data(using: .utf8)!
+
+        _ = parser.parse(data)
+
+        let obligation = parser.getAllObligations().first
+        XCTAssertEqual(
+            obligation?.errorMessage,
+            "Could not find proof\nbackend returned counterexample detail"
+        )
+        XCTAssertEqual(
+            obligation?.obligationText,
+            "ASSUME x \\in Nat\nPROVE x >= 0"
+        )
+    }
+
+    func testObligationsNumberDoesNotDoubleCountParsedObligations() {
+        let data = """
+        @!!BEGIN
+        @!!type:obligationsnumber
+        @!!count:2
+        @!!END
+        @!!BEGIN
+        @!!type:obligation
+        @!!id:1
+        @!!status:proved
+        @!!END
+        @!!BEGIN
+        @!!type:obligation
+        @!!id:2
+        @!!status:proved
+        @!!END
+
+        """.data(using: .utf8)!
+
+        let progress = parser.parse(data)
+
+        XCTAssertEqual(progress?.totalObligations, 2)
+        XCTAssertEqual(progress?.provedCount, 2)
+        XCTAssertEqual(progress?.phase, .done)
+    }
+
+    func testObligationsNumberPreservesPendingUndiscoveredObligations() {
+        let data = """
+        @!!BEGIN
+        @!!type:obligationsnumber
+        @!!count:5
+        @!!END
+        @!!BEGIN
+        @!!type:obligation
+        @!!id:1
+        @!!status:proved
+        @!!END
+        @!!BEGIN
+        @!!type:obligation
+        @!!id:2
+        @!!status:proved
+        @!!END
+
+        """.data(using: .utf8)!
+
+        let progress = parser.parse(data)
+
+        XCTAssertEqual(progress?.totalObligations, 5)
+        XCTAssertEqual(progress?.provedCount, 2)
+        XCTAssertEqual(progress?.phase, .checking)
+    }
+
     // MARK: - Status Parsing Tests
 
     func testParseStatusProved() {
@@ -217,6 +297,14 @@ final class TLAPMOutputParserTests: XCTestCase {
 
     func testParseStatusPending() {
         let data = makeBlock(type: "obligation", fields: ["id": "1", "status": "pending"])
+        _ = parser.parse(data)
+
+        let obligations = parser.getAllObligations()
+        XCTAssertEqual(obligations.first?.status, .pending)
+    }
+
+    func testParseStatusToBeProved() {
+        let data = makeBlock(type: "obligation", fields: ["id": "1", "status": "to be proved"])
         _ = parser.parse(data)
 
         let obligations = parser.getAllObligations()
@@ -636,6 +724,18 @@ final class TLAPMOutputParserTests: XCTestCase {
 
         // Even if all obligations proved, non-zero exit code means failure
         XCTAssertFalse(result.success)
+    }
+
+    func testFinalResultFailsWhenObligationsRemainUnproved() {
+        _ = parser.parse(makeBlock(type: "obligation", fields: ["id": "1", "status": "proved"]))
+        _ = parser.parse(makeBlock(type: "obligation", fields: ["id": "2", "status": "pending"]))
+        _ = parser.parse(makeBlock(type: "obligation", fields: ["id": "3", "status": "omitted"]))
+
+        let result = parser.finalResult(exitCode: 0, duration: 1.0)
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.failedCount, 0)
+        XCTAssertEqual(result.obligations.count, 3)
     }
 
     // MARK: - Progress Phase Tests

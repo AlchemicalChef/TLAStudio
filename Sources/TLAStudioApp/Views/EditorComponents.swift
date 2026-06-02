@@ -5,15 +5,24 @@ import SwiftUI
 
 class LineNumberGutterView: NSView {
     private weak var textView: NSTextView?
-    private var lineStartOffsets: [Int] = [0]
+    /// Either the shared per-document line index (preferred) or a self-owned fallback.
+    /// See audit F-S6-editor-perf-006.
+    private let sharedLineIndex: SharedTextLineIndex?
+    private var localLineStartOffsets: [Int] = [0]
+    private var lineStartOffsets: [Int] {
+        sharedLineIndex?.offsets ?? localLineStartOffsets
+    }
     let gutterWidth: CGFloat = 44
 
     override var isFlipped: Bool { true }
 
-    init(textView: NSTextView) {
+    init(textView: NSTextView, sharedLineIndex: SharedTextLineIndex? = nil) {
         self.textView = textView
+        self.sharedLineIndex = sharedLineIndex
         super.init(frame: NSRect(x: 0, y: 0, width: gutterWidth, height: 100))
-        rebuildLineIndex()
+        if sharedLineIndex == nil {
+            rebuildLineIndex()
+        }
 
         // Observe text changes
         NotificationCenter.default.addObserver(
@@ -36,17 +45,28 @@ class LineNumberGutterView: NSView {
         needsDisplay = true
     }
 
+    func refreshTextIndex() {
+        if sharedLineIndex == nil {
+            rebuildLineIndex()
+        }
+        needsDisplay = true
+    }
+
     @objc private func textDidChange(_ notification: Notification) {
-        rebuildLineIndex()
+        // Owner (EditorContainerView) invalidates the shared cache before the
+        // first overlay reads it; we only refresh our local fallback.
+        if sharedLineIndex == nil {
+            rebuildLineIndex()
+        }
         needsDisplay = true
     }
 
     private func rebuildLineIndex() {
         guard let textView else {
-            lineStartOffsets = [0]
+            localLineStartOffsets = [0]
             return
         }
-        lineStartOffsets = TextCoordinateMapper.lineStartOffsets(in: textView.string)
+        localLineStartOffsets = TextCoordinateMapper.lineStartOffsets(in: textView.string)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -155,7 +175,12 @@ class EditorContainerView: NSView {
     var foldingGutterView: FoldingGutterOverlay?
     var proofGutterView: ProofStatusGutterOverlay?
     let scrollView: NSScrollView
+    /// Per-document line-start cache shared across all gutter overlays so the
+    /// text is walked once per change instead of once per overlay.
+    /// See audit F-S6-editor-perf-006.
+    private let sharedLineIndex: SharedTextLineIndex
     private var scrollObserver: NSObjectProtocol?
+    private var textChangeObserver: NSObjectProtocol?
 
     private let foldingGutterWidth: CGFloat = 14
     private let proofGutterWidth: CGFloat = 14
@@ -164,7 +189,9 @@ class EditorContainerView: NSView {
 
     init(scrollView: NSScrollView, textView: NSTextView, showLineNumbers: Bool, foldingManager: CodeFoldingManager? = nil) {
         self.scrollView = scrollView
-        self.gutterView = LineNumberGutterView(textView: textView)
+        let shared = SharedTextLineIndex(textView: textView)
+        self.sharedLineIndex = shared
+        self.gutterView = LineNumberGutterView(textView: textView, sharedLineIndex: shared)
         super.init(frame: .zero)
 
         if showLineNumbers {
@@ -173,17 +200,29 @@ class EditorContainerView: NSView {
 
         // Add folding gutter if manager provided
         if let manager = foldingManager {
-            let foldingView = FoldingGutterOverlay(textView: textView, foldingManager: manager)
+            let foldingView = FoldingGutterOverlay(textView: textView, foldingManager: manager, sharedLineIndex: shared)
             self.foldingGutterView = foldingView
             addSubview(foldingView)
         }
 
         // Add proof status gutter overlay
-        let proofView = ProofStatusGutterOverlay(textView: textView)
+        let proofView = ProofStatusGutterOverlay(textView: textView, sharedLineIndex: shared)
         self.proofGutterView = proofView
         addSubview(proofView)
 
         addSubview(scrollView)
+
+        // Invalidate shared line index on text change. Posted to the same
+        // notification center as the per-overlay observers; ordering between
+        // observers is not guaranteed by AppKit, so the shared index also
+        // re-validates against textStorage.length on read as belt-and-braces.
+        textChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSText.didChangeNotification,
+            object: textView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.sharedLineIndex.invalidate()
+        }
 
         // Observe scroll changes
         scrollObserver = NotificationCenter.default.addObserver(
@@ -205,6 +244,27 @@ class EditorContainerView: NSView {
         if let observer = scrollObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        if let observer = textChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    func setLineNumbersVisible(_ visible: Bool) {
+        if visible, gutterView.superview == nil {
+            addSubview(gutterView, positioned: .below, relativeTo: foldingGutterView ?? proofGutterView ?? scrollView)
+        } else if !visible, gutterView.superview != nil {
+            gutterView.removeFromSuperview()
+        }
+        needsLayout = true
+    }
+
+    func refreshTextDependentGutters() {
+        // Invalidate the shared cache once; per-overlay refresh calls then
+        // redisplay using the freshly recomputed offsets.
+        sharedLineIndex.invalidate()
+        gutterView.refreshTextIndex()
+        foldingGutterView?.refreshTextLineIndex()
+        proofGutterView?.refreshTextLineIndex()
     }
 
     override func layout() {

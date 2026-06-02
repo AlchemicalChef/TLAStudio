@@ -24,7 +24,7 @@ struct CheckpointInfo: Codable, Identifiable, Equatable {
 
     /// Whether this checkpoint appears valid
     var isValid: Bool {
-        FileManager.default.fileExists(atPath: directoryURL.path)
+        Self.containsCheckpointArtifacts(in: directoryURL)
     }
 
     /// Human-readable description of the checkpoint
@@ -46,13 +46,15 @@ struct CheckpointInfo: Codable, Identifiable, Equatable {
     var diskSize: UInt64? {
         do {
             var totalSize: UInt64 = 0
-            let contents = try FileManager.default.contentsOfDirectory(
+            let enumerator = FileManager.default.enumerator(
                 at: directoryURL,
-                includingPropertiesForKeys: [.fileSizeKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
                 options: [.skipsHiddenFiles]
             )
-            for fileURL in contents {
-                let resourceValues = try fileURL.resourceValues(forKeys: [.fileSizeKey])
+
+            while let fileURL = enumerator?.nextObject() as? URL {
+                let resourceValues = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                guard resourceValues.isRegularFile == true else { continue }
                 totalSize += UInt64(resourceValues.fileSize ?? 0)
             }
             return totalSize
@@ -109,8 +111,9 @@ enum CheckpointStatus: Equatable {
 // MARK: - Checkpoint Directory Parsing
 
 extension CheckpointInfo {
-    /// TLC checkpoint directories are named with format: YY-MM-DD-HH-MM-SS
+    /// TLC checkpoint directories are named with format: YY-MM-DD-HH-MM-SS[.SSS]
     static let directoryDateFormat = "yy-MM-dd-HH-mm-ss"
+    static let directoryDateFormatWithMilliseconds = "yy-MM-dd-HH-mm-ss.SSS"
 
     /// Create a CheckpointInfo from a checkpoint directory URL
     /// - Parameters:
@@ -120,12 +123,8 @@ extension CheckpointInfo {
     static func from(directoryURL: URL, specName: String) -> CheckpointInfo? {
         let dirName = directoryURL.lastPathComponent
 
-        // Try to parse the directory name as a date
-        let formatter = DateFormatter()
-        formatter.dateFormat = directoryDateFormat
-
         let createdAt: Date
-        if let date = formatter.date(from: dirName) {
+        if let date = parseCheckpointDate(from: dirName) {
             createdAt = date
         } else {
             // Fall back to directory modification date
@@ -137,19 +136,7 @@ extension CheckpointInfo {
             }
         }
 
-        // Check if directory contains checkpoint files
-        let checkpointFiles = ["queue.chkpt", "states.chkpt"]
-        var hasCheckpointFiles = false
-        for file in checkpointFiles {
-            if FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent(file).path) {
-                hasCheckpointFiles = true
-                break
-            }
-        }
-
-        // Also accept directories that look like TLC checkpoint directories
-        // even if we can't verify the files
-        if !hasCheckpointFiles && formatter.date(from: dirName) == nil {
+        guard containsCheckpointArtifacts(in: directoryURL) else {
             return nil
         }
 
@@ -161,5 +148,48 @@ extension CheckpointInfo {
             distinctStates: nil,
             statesFound: nil
         )
+    }
+
+    static func parseCheckpointDate(from directoryName: String) -> Date? {
+        for format in [directoryDateFormatWithMilliseconds, directoryDateFormat] {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = format
+            formatter.isLenient = false
+            if let date = formatter.date(from: directoryName) {
+                return date
+            }
+        }
+        return nil
+    }
+
+    static func containsCheckpointArtifacts(in directoryURL: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directoryURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return false
+        }
+
+        let expectedFiles = ["queue.chkpt", "states.chkpt"]
+        if expectedFiles.contains(where: { fileName in
+            FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent(fileName).path)
+        }) {
+            return true
+        }
+
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        return contents.contains { url in
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                return false
+            }
+            return url.lastPathComponent.hasSuffix(".chkpt")
+        }
     }
 }

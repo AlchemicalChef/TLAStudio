@@ -61,6 +61,10 @@ struct NavigatorSidebar: View {
                 EmptyView()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleSymbolOutline)) { notification in
+            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+            selectedTab = 1
+        }
     }
 
     private func countSymbols(_ symbols: [TLASymbol]) -> Int {

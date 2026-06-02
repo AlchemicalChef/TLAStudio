@@ -9,6 +9,8 @@ private let logger = Log.logger(category: "BinaryDiscovery")
 /// TLAPMProcessManager, and GraphvizProcessManager into a single utility.
 enum BinaryDiscovery {
 
+    private static let spmBundleName = "TLAStudio_TLAStudioApp.bundle"
+
     private static var developmentProjectRoot: URL? {
         let fileURL = URL(fileURLWithPath: #filePath)
         let root = fileURL
@@ -43,6 +45,64 @@ enum BinaryDiscovery {
             return nil
         }
         return paths.joined(separator: ":")
+    }
+
+    static func fullResourceName(for name: String, extension ext: String?) -> String {
+        ext != nil ? "\(name).\(ext!)" : name
+    }
+
+    static func requiresExecutablePermission(extension ext: String?) -> Bool {
+        ext?.lowercased() != "jar"
+    }
+
+    static func isUsableDiscoveredFile(_ url: URL, requiresExecutable: Bool) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            return false
+        }
+        if requiresExecutable && !FileManager.default.isExecutableFile(atPath: url.path) {
+            // F-Sdiff-recent-002: a bundled tool exists but lacks the exec bit.
+            // This is almost always a packaging mistake (build-app.sh chmod,
+            // archive-extract umask). Emit a notice so the discovery fallthrough
+            // doesn't look like a generic "not found".
+            logger.notice(
+                "Bundled binary at \(url.path, privacy: .public) is not executable; falling through to PATH search"
+            )
+            return false
+        }
+        return true
+    }
+
+    static func findUsableFileInResourceRoot(
+        _ root: URL,
+        fullName: String,
+        bundleSubdirectories: [String],
+        checkNestedBundle: Bool,
+        requiresExecutable: Bool
+    ) -> URL? {
+        var roots = [root]
+        if checkNestedBundle {
+            roots.append(root.appendingPathComponent(spmBundleName))
+        }
+
+        for root in roots {
+            let directPath = root.appendingPathComponent(fullName)
+            if isUsableDiscoveredFile(directPath, requiresExecutable: requiresExecutable) {
+                return directPath
+            }
+
+            for subdir in bundleSubdirectories {
+                let subdirPath = root
+                    .appendingPathComponent(subdir)
+                    .appendingPathComponent(fullName)
+                if isUsableDiscoveredFile(subdirPath, requiresExecutable: requiresExecutable) {
+                    return subdirPath
+                }
+            }
+        }
+
+        return nil
     }
 
     /// Options controlling where to search for binaries.
@@ -96,105 +156,96 @@ enum BinaryDiscovery {
         extension ext: String? = nil,
         options: SearchOptions = SearchOptions()
     ) -> URL? {
+        let fullName = fullResourceName(for: name, extension: ext)
+        let requiresExecutable = requiresExecutablePermission(extension: ext)
+
         if options.searchBundles {
             // 1. Bundle.module with subdirectories
             for subdir in options.bundleSubdirectories {
-                if let url = Bundle.module.url(forResource: name, withExtension: ext, subdirectory: subdir) {
+                if let url = Bundle.module.url(forResource: name, withExtension: ext, subdirectory: subdir),
+                   isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
                     logger.debug("Found \(name) in Bundle.module/\(subdir): \(url.path)")
                     return url
                 }
             }
 
             // Bundle.module at root
-            if let url = Bundle.module.url(forResource: name, withExtension: ext) {
+            if let url = Bundle.module.url(forResource: name, withExtension: ext),
+               isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
                 logger.debug("Found \(name) in Bundle.module: \(url.path)")
                 return url
             }
 
             // 2. Bundle.main with subdirectories
             for subdir in options.bundleSubdirectories {
-                if let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: subdir) {
+                if let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: subdir),
+                   isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
                     logger.debug("Found \(name) in Bundle.main/\(subdir): \(url.path)")
                     return url
                 }
             }
 
             // Bundle.main at root
-            if let url = Bundle.main.url(forResource: name, withExtension: ext) {
+            if let url = Bundle.main.url(forResource: name, withExtension: ext),
+               isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
                 logger.debug("Found \(name) in Bundle.main: \(url.path)")
                 return url
             }
 
             // 3. App bundle Resources directory (direct filesystem check)
             if let resourcePath = Bundle.main.resourcePath {
-                let fullName = ext != nil ? "\(name).\(ext!)" : name
-
-                // Direct in Resources
-                let directPath = URL(fileURLWithPath: resourcePath).appendingPathComponent(fullName)
-                if FileManager.default.fileExists(atPath: directPath.path) {
-                    logger.debug("Found \(name) in Resources directly: \(directPath.path)")
-                    return directPath
-                }
-
-                // Check subdirectories within Resources
-                for subdir in options.bundleSubdirectories {
-                    let subdirPath = URL(fileURLWithPath: resourcePath)
-                        .appendingPathComponent(subdir)
-                        .appendingPathComponent(fullName)
-                    if FileManager.default.fileExists(atPath: subdirPath.path) {
-                        logger.debug("Found \(name) in Resources/\(subdir): \(subdirPath.path)")
-                        return subdirPath
-                    }
-                }
-
-                // Nested SPM bundle
-                if options.checkNestedBundle {
-                    let nestedPath = URL(fileURLWithPath: resourcePath)
-                        .appendingPathComponent("TLAStudio_TLAStudioApp.bundle")
-                        .appendingPathComponent(fullName)
-                    if FileManager.default.fileExists(atPath: nestedPath.path) {
-                        logger.debug("Found \(name) in nested bundle: \(nestedPath.path)")
-                        return nestedPath
-                    }
+                let root = URL(fileURLWithPath: resourcePath)
+                if let found = findUsableFileInResourceRoot(
+                    root,
+                    fullName: fullName,
+                    bundleSubdirectories: options.bundleSubdirectories,
+                    checkNestedBundle: options.checkNestedBundle,
+                    requiresExecutable: requiresExecutable
+                ) {
+                    logger.debug("Found \(name) in resource filesystem: \(found.path)")
+                    return found
                 }
             }
 
             // 4. SPM debug bundle (next to executable)
             if options.checkNestedBundle {
-                let fullName = ext != nil ? "\(name).\(ext!)" : name
-                if let debugBundlePath = Bundle.main.executableURL?.deletingLastPathComponent()
-                    .appendingPathComponent("TLAStudio_TLAStudioApp.bundle")
-                    .appendingPathComponent(fullName) {
-                    if FileManager.default.fileExists(atPath: debugBundlePath.path) {
-                        logger.debug("Found \(name) in debug bundle: \(debugBundlePath.path)")
-                        return debugBundlePath
-                    }
+                if let debugBundleRoot = Bundle.main.executableURL?.deletingLastPathComponent()
+                    .appendingPathComponent(spmBundleName),
+                   let found = findUsableFileInResourceRoot(
+                    debugBundleRoot,
+                    fullName: fullName,
+                    bundleSubdirectories: options.bundleSubdirectories,
+                    checkNestedBundle: false,
+                    requiresExecutable: requiresExecutable
+                   ) {
+                    logger.debug("Found \(name) in debug bundle: \(found.path)")
+                    return found
                 }
             }
 
             // 5. Bundle.module.resourcePath direct filesystem check
             if let modulePath = Bundle.module.resourcePath {
-                let fullName = ext != nil ? "\(name).\(ext!)" : name
-                for subdir in options.bundleSubdirectories {
-                    let path = URL(fileURLWithPath: modulePath)
-                        .appendingPathComponent(subdir)
-                        .appendingPathComponent(fullName)
-                    if FileManager.default.fileExists(atPath: path.path) {
-                        logger.debug("Found \(name) in module resourcePath/\(subdir): \(path.path)")
-                        return path
-                    }
+                let root = URL(fileURLWithPath: modulePath)
+                if let found = findUsableFileInResourceRoot(
+                    root,
+                    fullName: fullName,
+                    bundleSubdirectories: options.bundleSubdirectories,
+                    checkNestedBundle: false,
+                    requiresExecutable: requiresExecutable
+                ) {
+                    logger.debug("Found \(name) in module resourcePath: \(found.path)")
+                    return found
                 }
             }
         }
 
-        let fullName = ext != nil ? "\(name).\(ext!)" : name
-
         // 6. System paths
         for systemPath in options.systemPaths {
             let fullPath = "\(systemPath)/\(fullName)"
-            if FileManager.default.fileExists(atPath: fullPath) {
+            let url = URL(fileURLWithPath: fullPath)
+            if isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
                 logger.debug("Found \(name) at system path: \(fullPath)")
-                return URL(fileURLWithPath: fullPath)
+                return url
             }
         }
 
@@ -202,7 +253,7 @@ enum BinaryDiscovery {
         let home = FileManager.default.homeDirectoryForCurrentUser
         for homePath in options.homeRelativePaths {
             let fullPath = home.appendingPathComponent(homePath).appendingPathComponent(fullName)
-            if FileManager.default.fileExists(atPath: fullPath.path) {
+            if isUsableDiscoveredFile(fullPath, requiresExecutable: requiresExecutable) {
                 logger.debug("Found \(name) at home path: \(fullPath.path)")
                 return fullPath
             }

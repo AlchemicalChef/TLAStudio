@@ -59,25 +59,7 @@ actor CheckpointManager {
     /// - Parameter checkpoint: The checkpoint to validate
     /// - Returns: True if the checkpoint appears valid
     func validateCheckpoint(_ checkpoint: CheckpointInfo) -> Bool {
-        let fileManager = FileManager.default
-
-        // Check directory exists
-        guard fileManager.fileExists(atPath: checkpoint.directoryURL.path) else {
-            return false
-        }
-
-        // Check for expected checkpoint files
-        let expectedFiles = ["queue.chkpt", "states.chkpt"]
-        for fileName in expectedFiles {
-            let filePath = checkpoint.directoryURL.appendingPathComponent(fileName).path
-            if fileManager.fileExists(atPath: filePath) {
-                return true  // At least one checkpoint file exists
-            }
-        }
-
-        // If we got here, directory exists but no checkpoint files found
-        // The directory might still be a valid checkpoint from an older TLC version
-        return true
+        CheckpointInfo.containsCheckpointArtifacts(in: checkpoint.directoryURL)
     }
 
     // MARK: - Cleanup

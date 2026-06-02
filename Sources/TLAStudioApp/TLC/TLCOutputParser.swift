@@ -8,12 +8,12 @@ import os
 private enum TLCRegex {
     /// Progress line: "X states generated, Y distinct states, Z states left"
     static let progressLine = try! NSRegularExpression(
-        pattern: #"(\d+) states generated.*?(\d+) distinct states.*?(\d+) states left"#
+        pattern: #"([0-9][0-9,]*) states generated.*?([0-9][0-9,]*) distinct states.*?([0-9][0-9,]*) states left"#
     )
 
     /// State count: "X distinct states"
     static let stateCount = try! NSRegularExpression(
-        pattern: #"(\d+) distinct states"#
+        pattern: #"([0-9][0-9,]*) distinct states"#
     )
 
     /// Trace state: "State N: <Action>"
@@ -28,7 +28,7 @@ private enum TLCRegex {
 
     /// Coverage line: "<ActionName ...>: count"
     static let coverage = try! NSRegularExpression(
-        pattern: #"<(\w+)[^>]+>:\s*(\d+)"#
+        pattern: #"<(\w+)[^>]+>:\s*([0-9][0-9,]*)"#
     )
 }
 
@@ -49,6 +49,7 @@ class TLCOutputParser {
     private var pendingTraceState: TraceState?
     private var traceWriterStartTask: Task<TraceWriter, Error>?
     private var traceWriteTask: Task<Void, Error>?
+    private var streamingFallbackStates: [TraceState] = []
     private var streamedTraceCount = 0
     private var isParsingTrace = false
     private var errorMessage: String?
@@ -63,6 +64,14 @@ class TLCOutputParser {
     /// Whether an OutOfMemoryError was detected during parsing
     private(set) var detectedOOM = false
 
+    /// Non-fatal warnings/diagnostics that were observed but not surfaced as
+    /// hard errors. Includes:
+    /// - text-mode lines starting with `Warning:`,
+    /// - JSON envelopes with an unrecognised `type` field,
+    /// - text-mode lines that match `Error:` but no known classification.
+    /// Lock-protected; flushed into `ModelCheckResult.warnings` at finalisation.
+    private var collectedWarnings: [String] = []
+
     /// Lock for thread-safe access from readability handlers
     private let lock = NSLock()
 
@@ -70,6 +79,16 @@ class TLCOutputParser {
 
     /// Threshold for streaming trace states to disk (above this, use lazy loading)
     static let largeTraceThreshold = 1000
+
+    /// Cap on number of warnings collected to bound memory under runaway output.
+    private static let warningCap = 200
+
+    /// Append a warning under lock, respecting `warningCap`.
+    /// Caller must already hold `lock`.
+    private func appendWarningLocked(_ text: String) {
+        guard collectedWarnings.count < Self.warningCap else { return }
+        collectedWarnings.append(text)
+    }
 
     // Session tracking
     var sessionId: UUID = UUID()
@@ -138,20 +157,38 @@ class TLCOutputParser {
 
     /// Get final result after TLC exits (synchronous version for small traces, thread-safe)
     func finalResult(exitCode: Int32, duration: TimeInterval) -> ModelCheckResult {
+        return finalResult(exitCode: exitCode, duration: duration, incomplete: false)
+    }
+
+    /// Internal entry point allowing callers (notably `finalResultWithStorage`)
+    /// to flag that the result is partial — e.g. trace finalisation failed and
+    /// the in-memory fallback path was taken.
+    func finalResult(exitCode: Int32, duration: TimeInterval, incomplete: Bool) -> ModelCheckResult {
         lock.lock()
         defer { lock.unlock() }
         flushPendingTraceStateLocked()
+        let retainedTraceStates = streamingFallbackStates.isEmpty
+            ? currentTraceStates
+            : streamingFallbackStates + currentTraceStates
+        let retainedErrorTrace = errorTrace ?? makeErrorTrace(from: retainedTraceStates)
+        // Treat any non-zero exit without an OOM signal and without a classified
+        // error trace as `incomplete` — TLC produced output we couldn't fully
+        // explain, and downstream UI should not claim success.
+        let unclassifiedExit = exitCode != 0 && retainedErrorTrace == nil && !detectedOOM
+        let isIncomplete = incomplete || unclassifiedExit
         return ModelCheckResult(
             sessionId: sessionId,
-            success: exitCode == 0 && errorTrace == nil && !detectedOOM,
+            success: exitCode == 0 && retainedErrorTrace == nil && !detectedOOM,
             statesFound: states,
             distinctStates: distinct,
             duration: duration,
             coverage: getCoverageArray(),
-            errorTrace: errorTrace,
+            errorTrace: retainedErrorTrace,
             message: detectedOOM ? (errorMessage ?? "Out of memory") : errorMessage,
             outOfMemory: detectedOOM,
-            suggestJVMRetry: detectedOOM
+            suggestJVMRetry: detectedOOM,
+            warnings: collectedWarnings,
+            incomplete: isIncomplete
         )
     }
 
@@ -159,7 +196,7 @@ class TLCOutputParser {
     func finalResultWithStorage(exitCode: Int32, duration: TimeInterval) async -> ModelCheckResult {
         let (traceCount, capturedStates, capturedSessionId, capturedErrorType, capturedErrorMessage,
              capturedLoopStart, capturedViolatedProperty, capturedStatesFound, capturedDistinct,
-             capturedCoverage, capturedOOM, writerStartTask, writeTask) = lock.withLock {
+             capturedCoverage, capturedOOM, capturedWarnings, writerStartTask, writeTask) = lock.withLock {
             flushPendingTraceStateLocked()
             return (
                 currentTraceStates.count + streamedTraceCount,
@@ -173,6 +210,7 @@ class TLCOutputParser {
                 distinct,
                 coverage,
                 detectedOOM,
+                collectedWarnings,
                 traceWriterStartTask,
                 traceWriteTask
             )
@@ -206,11 +244,17 @@ class TLCOutputParser {
                     message: capturedOOM ? (capturedErrorMessage ?? "Out of memory") : capturedErrorMessage,
                     lazyErrorTrace: lazyTrace,
                     outOfMemory: capturedOOM,
-                    suggestJVMRetry: capturedOOM
+                    suggestJVMRetry: capturedOOM,
+                    warnings: capturedWarnings,
+                    // Unclassified non-zero exit with no error trace signals partial output.
+                    incomplete: exitCode != 0 && !hasErrorTrace && !capturedOOM
                 )
             } catch {
+                // F-S7-error-prop-007: trace finaliser failed; we fall back to
+                // the in-memory `finalResult` path but flag the result as
+                // incomplete so callers don't claim success on partial data.
                 logger.error("Failed to finalize streamed trace: \(error.localizedDescription)")
-                return finalResult(exitCode: exitCode, duration: duration)
+                return finalResult(exitCode: exitCode, duration: duration, incomplete: true)
             }
         }
 
@@ -250,18 +294,26 @@ class TLCOutputParser {
                 message: capturedOOM ? (capturedErrorMessage ?? "Out of memory") : capturedErrorMessage,
                 lazyErrorTrace: lazyTrace,
                 outOfMemory: capturedOOM,
-                suggestJVMRetry: capturedOOM
+                suggestJVMRetry: capturedOOM,
+                warnings: capturedWarnings,
+                incomplete: exitCode != 0 && !hasErrorTrace && !capturedOOM
             )
         } catch {
+            // F-S7-error-prop-007: storing the large trace failed; we degrade
+            // to the in-memory fallback but flag the result as incomplete.
             logger.error("Failed to store large trace: \(error.localizedDescription)")
-            // Fall back to in-memory (may cause memory pressure)
-            return finalResult(exitCode: exitCode, duration: duration)
+            return finalResult(exitCode: exitCode, duration: duration, incomplete: true)
         }
     }
 
     private func appendCompletedTraceStateLocked(_ state: TraceState) {
         if traceWriterStartTask != nil {
-            enqueueTraceWriteLocked(state)
+            // Once streaming-to-disk is active, post-bootstrap states go to disk only.
+            // `streamingFallbackStates` retains only the pre-threshold snapshot seeded
+            // by `startTraceStreamingLocked` so the synchronous-fallback path can still
+            // emit a partial trace if the writer fails. Retaining every streamed state
+            // here would defeat the OOM mitigation entirely.
+            enqueueTraceWriteLocked(state, retainForFallback: false)
             return
         }
 
@@ -286,6 +338,7 @@ class TLCOutputParser {
 
         let capturedSessionId = sessionId
         let statesToStream = currentTraceStates
+        streamingFallbackStates = statesToStream
         currentTraceStates.removeAll(keepingCapacity: false)
 
         let startTask = Task<TraceWriter, Error> {
@@ -294,14 +347,18 @@ class TLCOutputParser {
         traceWriterStartTask = startTask
 
         for state in statesToStream {
-            enqueueTraceWriteLocked(state)
+            enqueueTraceWriteLocked(state, retainForFallback: false)
         }
     }
 
-    private func enqueueTraceWriteLocked(_ state: TraceState) {
+    private func enqueueTraceWriteLocked(_ state: TraceState, retainForFallback: Bool = true) {
         guard let startTask = traceWriterStartTask else {
             currentTraceStates.append(state)
             return
+        }
+
+        if retainForFallback {
+            streamingFallbackStates.append(state)
         }
 
         let previousTask = traceWriteTask
@@ -318,6 +375,19 @@ class TLCOutputParser {
 
     private func traceStateCountLocked() -> Int {
         streamedTraceCount + currentTraceStates.count + (pendingTraceState == nil ? 0 : 1)
+    }
+
+    private func makeErrorTrace(from states: [TraceState]) -> ErrorTrace? {
+        guard !states.isEmpty, errorType != nil || errorMessage != nil else {
+            return nil
+        }
+        return ErrorTrace(
+            type: errorType ?? .evaluationError,
+            message: errorMessage ?? "Error found",
+            states: states,
+            loopStart: traceLoopStart,
+            violatedProperty: traceViolatedProperty
+        )
     }
 
     /// Reset parser state for a new run (thread-safe)
@@ -338,6 +408,7 @@ class TLCOutputParser {
         startTime = nil
         currentTraceStates = []
         pendingTraceState = nil
+        streamingFallbackStates = []
         traceWriterStartTask = nil
         traceWriteTask = nil
         streamedTraceCount = 0
@@ -348,6 +419,7 @@ class TLCOutputParser {
         traceViolatedProperty = nil
         sessionId = UUID()
         detectedOOM = false
+        collectedWarnings = []
     }
 
     // MARK: - JSON Parsing
@@ -392,20 +464,31 @@ class TLCOutputParser {
                 coverage: getCoverageArray()
             )
 
+        case "warning":
+            // F-S7-error-prop-001: surface warnings rather than dropping them.
+            let message = (json["message"] as? String) ?? "Unknown TLC warning"
+            logger.notice("TLC warning: \(message, privacy: .public)")
+            appendWarningLocked("TLC warning: \(message)")
+            return nil
+
         default:
+            // F-S7-error-prop-001: unknown JSON envelope kind — record raw line
+            // so it surfaces in `ModelCheckResult.warnings` instead of vanishing.
+            logger.notice("Unhandled TLC JSON message type: \(type, privacy: .public)")
+            appendWarningLocked("Unhandled TLC JSON message type: \(type) — \(line)")
             return nil
         }
     }
 
     private func parseProgressJSON(_ json: [String: Any]) -> ModelCheckProgress {
-        states = json["states"] as? UInt64 ?? states
-        distinct = json["distinct"] as? UInt64 ?? distinct
-        statesLeft = json["queue"] as? UInt64 ?? statesLeft
+        states = parseUInt64JSONValue(json["states"]) ?? states
+        distinct = parseUInt64JSONValue(json["distinct"]) ?? distinct
+        statesLeft = parseUInt64JSONValue(json["queue"]) ?? statesLeft
 
-        let duration = json["time"] as? TimeInterval ?? 0
-        let sps = json["sps"] as? Double ?? 0
+        let duration = parseDoubleJSONValue(json["time"]) ?? 0
+        let sps = parseDoubleJSONValue(json["sps"]) ?? 0
         let action = json["action"] as? String
-        let memory = json["memory"] as? UInt64 ?? 0
+        let memory = parseUInt64JSONValue(json["memory"]) ?? 0
 
         if let phase = json["phase"] as? String {
             currentPhase = ModelCheckProgress.Phase(rawValue: phase) ?? .computing
@@ -449,7 +532,7 @@ class TLCOutputParser {
 
         errorMessage = message
         errorType = type
-        traceLoopStart = json["loopStart"] as? Int
+        traceLoopStart = parseIntJSONValue(json["loopStart"])
         traceViolatedProperty = json["property"] as? String
 
         if let traceData = json["trace"] as? [[String: Any]] {
@@ -474,8 +557,8 @@ class TLCOutputParser {
                 if let loc = stateData["location"] as? [String: Any] {
                     location = SourceLocation(
                         file: loc["file"] as? String,
-                        line: loc["line"] as? Int ?? 0,
-                        column: loc["column"] as? Int ?? 0
+                        line: parseIntJSONValue(loc["line"]) ?? 0,
+                        column: parseIntJSONValue(loc["column"]) ?? 0
                     )
                 }
 
@@ -502,11 +585,12 @@ class TLCOutputParser {
     }
 
     private func parseCoverageJSON(_ json: [String: Any]) {
-        if let actions = json["actions"] as? [String: [String: UInt64]] {
+        if let actions = json["actions"] as? [String: Any] {
             for (name, data) in actions {
+                guard let data = data as? [String: Any] else { continue }
                 coverage[name] = (
-                    count: data["count"] ?? 0,
-                    states: data["states"] ?? 0
+                    count: parseUInt64JSONValue(data["count"]) ?? 0,
+                    states: parseUInt64JSONValue(data["states"]) ?? 0
                 )
             }
             markCoverageDirty()
@@ -514,7 +598,7 @@ class TLCOutputParser {
     }
 
     private func parseStateJSON(_ json: [String: Any]) {
-        let id = json["id"] as? Int ?? traceStateCountLocked()
+        let id = parseIntJSONValue(json["id"]) ?? traceStateCountLocked()
         let action = json["action"] as? String
         var variables: [String: StateValue] = [:]
 
@@ -535,7 +619,16 @@ class TLCOutputParser {
     }
 
     private func parseStateValue(_ value: Any) -> StateValue? {
-        if let intValue = value as? Int {
+        if let numberValue = value as? NSNumber {
+            if isJSONBoolean(numberValue) {
+                return .bool(numberValue.boolValue)
+            }
+            if let intValue = parseIntJSONValue(numberValue) {
+                return .int(intValue)
+            }
+        } else if let boolValue = value as? Bool {
+            return .bool(boolValue)
+        } else if let intValue = parseIntJSONValue(value) {
             return .int(intValue)
         } else if let stringValue = value as? String {
             // Check for boolean
@@ -545,8 +638,6 @@ class TLCOutputParser {
                 return .bool(false)
             }
             return .string(stringValue)
-        } else if let boolValue = value as? Bool {
-            return .bool(boolValue)
         } else if let arrayValue = value as? [Any] {
             // Could be set, sequence, or tuple
             let elements = arrayValue.compactMap { parseStateValue($0) }
@@ -562,6 +653,66 @@ class TLCOutputParser {
             return .record(record)
         }
         return nil
+    }
+
+    private func parseUInt64JSONValue(_ value: Any?) -> UInt64? {
+        if let value = value as? UInt64 {
+            return value
+        } else if let value = value as? UInt {
+            return UInt64(value)
+        } else if let value = value as? Int, value >= 0 {
+            return UInt64(value)
+        } else if let value = value as? Int64, value >= 0 {
+            return UInt64(value)
+        } else if let value = value as? NSNumber, !isJSONBoolean(value) {
+            let doubleValue = value.doubleValue
+            guard doubleValue.isFinite,
+                  doubleValue >= 0,
+                  doubleValue.rounded(.towardZero) == doubleValue else { return nil }
+            return value.uint64Value
+        } else if let value = value as? String {
+            return UInt64(value.replacingOccurrences(of: ",", with: ""))
+        }
+        return nil
+    }
+
+    private func parseIntJSONValue(_ value: Any?) -> Int? {
+        if let value = value as? Int {
+            return value
+        } else if let value = value as? Int64 {
+            return Int(value)
+        } else if let value = value as? UInt64, value <= UInt64(Int.max) {
+            return Int(value)
+        } else if let value = value as? NSNumber, !isJSONBoolean(value) {
+            let doubleValue = value.doubleValue
+            guard doubleValue.isFinite,
+                  doubleValue >= Double(Int.min),
+                  doubleValue <= Double(Int.max),
+                  doubleValue.rounded(.towardZero) == doubleValue else { return nil }
+            return value.intValue
+        } else if let value = value as? String {
+            return Int(value.replacingOccurrences(of: ",", with: ""))
+        }
+        return nil
+    }
+
+    private func parseDoubleJSONValue(_ value: Any?) -> Double? {
+        if let value = value as? Double {
+            return value
+        } else if let value = value as? Int {
+            return Double(value)
+        } else if let value = value as? UInt64 {
+            return Double(value)
+        } else if let value = value as? NSNumber, !isJSONBoolean(value) {
+            return value.doubleValue
+        } else if let value = value as? String {
+            return Double(value.replacingOccurrences(of: ",", with: ""))
+        }
+        return nil
+    }
+
+    private func isJSONBoolean(_ value: NSNumber) -> Bool {
+        CFGetTypeID(value) == CFBooleanGetTypeID()
     }
 
     // MARK: - Text Parsing
@@ -593,13 +744,26 @@ class TLCOutputParser {
             return parseStateCountLine(trimmed)
         }
 
-        // Error line
-        if trimmed.hasPrefix("Error:") || trimmed.contains("Invariant") && trimmed.contains("violated") {
+        // Warning line — collect for surfacing via ModelCheckResult.warnings
+        // rather than silently dropping (F-S7-error-prop-001).
+        if trimmed.hasPrefix("Warning:") {
+            logger.notice("TLC warning: \(trimmed, privacy: .public)")
+            appendWarningLocked(trimmed)
+            return nil
+        }
+
+        // Error line — text-mode classification.
+        // F-S7-error-prop-006: cover more TLC error tokens (TLC2272 parse,
+        // TLC2273 config, OOM, assertion, liveness, temporal).
+        if trimmed.hasPrefix("Error:")
+            || (trimmed.contains("Invariant") && trimmed.contains("violated"))
+            || trimmed.contains("TLC2272")
+            || trimmed.contains("TLC2273")
+            || trimmed.contains("java.lang.OutOfMemoryError") {
             errorMessage = trimmed
-            if trimmed.contains("Invariant") {
-                errorType = .invariantViolation
-            } else if trimmed.contains("Deadlock") {
-                errorType = .deadlock
+            errorType = classifyTextModeError(trimmed)
+            if errorType == .evaluationError && trimmed.contains("java.lang.OutOfMemoryError") {
+                detectedOOM = true
             }
             currentPhase = .error
             return ModelCheckProgress(
@@ -651,13 +815,13 @@ class TLCOutputParser {
 
         if match.numberOfRanges >= 4 {
             if let range1 = Swift.Range(match.range(at: 1), in: line) {
-                states = UInt64(line[range1]) ?? states
+                states = parseTLCUInt(line[range1]) ?? states
             }
             if let range2 = Swift.Range(match.range(at: 2), in: line) {
-                distinct = UInt64(line[range2]) ?? distinct
+                distinct = parseTLCUInt(line[range2]) ?? distinct
             }
             if let range3 = Swift.Range(match.range(at: 3), in: line) {
-                statesLeft = UInt64(line[range3]) ?? statesLeft
+                statesLeft = parseTLCUInt(line[range3]) ?? statesLeft
             }
         }
 
@@ -679,7 +843,7 @@ class TLCOutputParser {
             return nil
         }
 
-        distinct = UInt64(line[range]) ?? distinct
+        distinct = parseTLCUInt(line[range]) ?? distinct
 
         return ModelCheckProgress(
             sessionId: sessionId,
@@ -701,7 +865,7 @@ class TLCOutputParser {
            let actionRange = Swift.Range(match.range(at: 2), in: line) {
             flushPendingTraceStateLocked()
 
-            let id = Int(line[idRange]) ?? traceStateCountLocked()
+            let id = Int(line[idRange]).map { max(0, $0 - 1) } ?? traceStateCountLocked()
             let action = String(line[actionRange])
 
             pendingTraceState = TraceState(
@@ -796,12 +960,44 @@ class TLCOutputParser {
            let nameRange = Swift.Range(match.range(at: 1), in: line),
            let countRange = Swift.Range(match.range(at: 2), in: line) {
             let name = String(line[nameRange])
-            let count = UInt64(line[countRange]) ?? 0
+            let count = parseTLCUInt(line[countRange]) ?? 0
 
             let existing = coverage[name] ?? (count: 0, states: 0)
             coverage[name] = (count: count, states: existing.states)
             markCoverageDirty()
         }
+    }
+
+    private func parseTLCUInt<S: StringProtocol>(_ value: S) -> UInt64? {
+        UInt64(value.replacingOccurrences(of: ",", with: ""))
+    }
+
+    /// Classify a text-mode TLC error line into an `ErrorTrace.ErrorType`.
+    ///
+    /// Extends the previous coverage (which only recognised "Invariant" /
+    /// "Deadlock") to assertion, liveness, temporal, OOM and the TLC2272/2273
+    /// parse/config family. See F-S7-error-prop-006 in the May-2026 audit.
+    private func classifyTextModeError(_ line: String) -> ErrorTrace.ErrorType {
+        if line.contains("Invariant") && line.contains("violated") {
+            return .invariantViolation
+        }
+        if line.contains("Deadlock") || line.contains("deadlock") {
+            return .deadlock
+        }
+        if line.contains("Assertion") || line.contains("assertion") {
+            return .assertionFailure
+        }
+        if line.contains("liveness") || line.contains("Liveness") || line.contains("stuttering") {
+            return .livenessViolation
+        }
+        if line.contains("Temporal") || line.contains("temporal property") {
+            return .temporal
+        }
+        // TLC2272: parse failures; TLC2273: config-file errors.
+        // OutOfMemory and the GraalVM "unable to allocate" family map to
+        // evaluationError (with `detectedOOM` already set by the caller when
+        // the OOM marker is present).
+        return .evaluationError
     }
 
     // MARK: - OOM Detection

@@ -339,24 +339,7 @@ class ModelCheckViewModel: ObservableObject {
     func resumeFromCheckpoint(_ checkpoint: CheckpointInfo) {
         guard let document = document else { return }
         viewMode = .progress
-
-        let session = TLCSession(
-            specURL: document.fileURL ?? config.specFile,
-            config: config,
-            binaryMode: document.selectedTLCMode
-        )
-        document.tlcSession = session
-        session.resume(from: checkpoint)
-
-        // Watch for completion (fixes missing watch task bug)
-        Task { @MainActor [weak document] in
-            while session.isRunning {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                if Task.isCancelled { return }
-                guard document != nil else { return }
-            }
-            document?.lastTLCResult = session.result
-        }
+        document.resumeModelCheck(from: checkpoint, config: config)
     }
 
     func jumpToSource(_ location: SourceLocation, in document: TLADocument) {
@@ -378,40 +361,21 @@ class ModelCheckViewModel: ObservableObject {
 
     /// Retry with JVM mode after OOM
     func retryWithJVM() {
-        guard lastResult?.outOfMemory == true else { return }
+        guard lastResult?.outOfMemory == true, let document = document else { return }
 
-        if let session = session {
-            viewMode = .progress
-            session.retryWithJVM()
-        } else if let document = document {
-            viewMode = .progress
-            let newSession = TLCSession(
-                specURL: document.fileURL ?? config.specFile,
-                config: config,
-                binaryMode: .jvm
-            )
-            document.tlcSession = newSession
-            newSession.start()
-        }
+        viewMode = .progress
+        document.runModelCheck(config: document.activeModelConfig ?? config, binaryMode: .jvm)
     }
 
     /// Retry with disk storage after OOM
     func retryWithDiskStorage() {
-        guard lastResult?.outOfMemory == true else { return }
+        guard lastResult?.outOfMemory == true, let document = document else { return }
 
-        if let session = session {
-            viewMode = .progress
-            session.retryWithDiskStorage()
-        } else if let document = document {
-            viewMode = .progress
-            config.useDiskStorage = true
-            let newSession = TLCSession(
-                specURL: document.fileURL ?? config.specFile,
-                config: config
-            )
-            document.tlcSession = newSession
-            newSession.start()
-        }
+        viewMode = .progress
+        var retryConfig = document.activeModelConfig ?? config
+        retryConfig.useDiskStorage = true
+        config = retryConfig
+        document.runModelCheck(config: retryConfig)
     }
 
     // MARK: - Detection

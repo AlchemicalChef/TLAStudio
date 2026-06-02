@@ -19,6 +19,7 @@ struct EditorArea: View {
     @AppStorage(UserSettings.Keys.lineHeight) private var lineHeightMultiplier: Double = 1.4
     @AppStorage(UserSettings.Keys.showLineNumbers) private var showLineNumbers = true
     @AppStorage(UserSettings.Keys.showMinimap) private var showMinimap = false
+    @AppStorage(UserSettings.Keys.insertSpacesForTabs) private var insertSpacesForTabs = true
 
     /// Resolved font from settings with fallback
     private var resolvedFont: NSFont {
@@ -96,6 +97,7 @@ struct EditorArea: View {
                     )
                     .editorFont(resolvedFont)
                     .tabWidth(tabWidth)
+                    .insertSpacesForTabs(insertSpacesForTabs)
                     .lineHeight(CGFloat(lineHeightMultiplier))
                     .showLineNumbers(showLineNumbers)
                     .proofAnnotations(document.proofAnnotationManager.annotations)

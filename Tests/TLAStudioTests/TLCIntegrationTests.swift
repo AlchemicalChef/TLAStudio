@@ -587,18 +587,13 @@ final class TLCIntegrationTests: XCTestCase {
     }
 
     func testCheckpointInfoInvalidFormat() {
-        // Test that the validation pattern works
-        let validPattern = #"^[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$"#
-        let regex = try! NSRegularExpression(pattern: validPattern)
-
         let validId = "26-01-20-14-30-45"
+        let validMillisecondsId = "26-01-20-14-30-45.123"
         let invalidId = "invalid-checkpoint-id"
 
-        let validRange = NSRange(validId.startIndex..., in: validId)
-        let invalidRange = NSRange(invalidId.startIndex..., in: invalidId)
-
-        XCTAssertNotNil(regex.firstMatch(in: validId, range: validRange))
-        XCTAssertNil(regex.firstMatch(in: invalidId, range: invalidRange))
+        XCTAssertNotNil(CheckpointInfo.parseCheckpointDate(from: validId))
+        XCTAssertNotNil(CheckpointInfo.parseCheckpointDate(from: validMillisecondsId))
+        XCTAssertNil(CheckpointInfo.parseCheckpointDate(from: invalidId))
     }
 
     // MARK: - Config Disk Storage Tests

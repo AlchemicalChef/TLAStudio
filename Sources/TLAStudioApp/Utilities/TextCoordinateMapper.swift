@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Converts between AppKit UTF-16 offsets and logical line/column positions.
@@ -144,5 +145,54 @@ enum TextCoordinateMapper {
         }
 
         return textLength
+    }
+}
+
+// MARK: - SharedTextLineIndex
+
+/// Reference-type cache of a text view's line-start UTF-16 offsets, shared
+/// across overlay views (line-number gutter, folding gutter, proof gutter, …)
+/// so they perform a single combined walk of the text per change instead of
+/// one walk per overlay. See audit F-S6-editor-perf-006.
+///
+/// The owner (`EditorContainerView`) invalidates the cache when text changes;
+/// individual overlays then read `offsets` lazily on their next draw. Overlays
+/// must not mutate the cache directly.
+///
+/// This class is intentionally not thread-safe — all access happens on the main
+/// thread alongside `NSTextView` updates.
+final class SharedTextLineIndex {
+    private weak var textView: NSTextView?
+    private var cachedOffsets: [Int]?
+    private var cachedLength: Int = -1
+
+    init(textView: NSTextView) {
+        self.textView = textView
+    }
+
+    /// Force a recompute on the next `offsets` access.
+    /// Call this when the underlying text changes (or may have changed).
+    func invalidate() {
+        cachedOffsets = nil
+        cachedLength = -1
+    }
+
+    /// UTF-16 offsets of the start of each line in the current text.
+    /// Returns `[0]` when the text view is nil.
+    var offsets: [Int] {
+        guard let textView = textView else {
+            return [0]
+        }
+        // Length check is a cheap belt-and-braces fallback in case some caller
+        // forgot to call `invalidate()`; the canonical invalidation channel is
+        // the explicit `invalidate()` call.
+        let length = textView.textStorage?.length ?? (textView.string as NSString).length
+        if let cached = cachedOffsets, cachedLength == length {
+            return cached
+        }
+        let computed = TextCoordinateMapper.lineStartOffsets(in: textView.string)
+        cachedOffsets = computed
+        cachedLength = length
+        return computed
     }
 }

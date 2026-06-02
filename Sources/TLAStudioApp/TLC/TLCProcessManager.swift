@@ -284,6 +284,7 @@ actor TLCProcessManager {
         sessionId: UUID = UUID(),
         binaryMode: TLCBinaryMode = .auto,
         recoverFrom checkpoint: CheckpointInfo? = nil,
+        additionalLibraryPaths: [URL] = [],
         progress: @escaping @Sendable (ModelCheckProgress) -> Void
     ) async throws -> ModelCheckResult {
         let isJVMMode = binaryMode == .jvm
@@ -314,10 +315,6 @@ actor TLCProcessManager {
             executableURL = tlcPath
             logger.info("Using TLC at: \(tlcPath.path)")
         }
-        let parser = TLCOutputParser()
-        parser.sessionId = sessionId
-        parsers[sessionId] = parser
-
         // Write config file next to spec with matching name (TLC native requires this)
         let specName = specURL.deletingPathExtension().lastPathComponent
         let specDir = specURL.deletingLastPathComponent()
@@ -338,10 +335,26 @@ actor TLCProcessManager {
             throw TLCError.invalidConfig("Config file path is outside spec directory")
         }
 
+        var launchConfig = config
+        let recoverCheckpointPath: String?
+        if let checkpoint = checkpoint {
+            guard await CheckpointManager.shared.validateCheckpoint(checkpoint) else {
+                logger.error("Checkpoint directory is invalid: \(checkpoint.directoryURL.path)")
+                throw TLCError.invalidConfig("Checkpoint directory is invalid or missing checkpoint files")
+            }
+            launchConfig.checkpointDir = checkpoint.directoryURL.deletingLastPathComponent()
+            recoverCheckpointPath = checkpoint.directoryURL.path
+        } else {
+            recoverCheckpointPath = nil
+            if launchConfig.checkpointEnabled && launchConfig.checkpointDir == nil {
+                launchConfig.checkpointDir = try await CheckpointManager.shared.ensureMetadir(for: specURL)
+            }
+        }
+
         // Always materialize the resolved model configuration before launching TLC.
         // TLC reads model semantics from the cfg file, not from CLI flags, so
         // preserving a stale on-disk cfg can execute different semantics than the UI shows.
-        let configContent = config.generateConfigFile()
+        let configContent = launchConfig.generateConfigFile()
 
         do {
             try configContent.write(to: configURL, atomically: true, encoding: .utf8)
@@ -350,7 +363,9 @@ actor TLCProcessManager {
         }
 
         var arguments: [String] = []
-        let libraryArgument = BinaryDiscovery.configuredTLALibraryPropertyValue().map { "-DTLA-Library=\($0)" }
+        let libraryArgument = tlaLibraryPropertyValue(additionalPaths: additionalLibraryPaths).map {
+            "-DTLA-Library=\($0)"
+        }
 
         if isJVMMode {
             if let libraryArgument {
@@ -366,34 +381,28 @@ actor TLCProcessManager {
             // Use captured jar path to avoid TOCTOU race (Issue #2)
             arguments.append(capturedJarPath!.path)
             // Add TLC arguments after -jar
-            arguments.append(contentsOf: buildArguments(for: config, configURL: configURL, isJVM: true))
+            arguments.append(contentsOf: buildArguments(for: launchConfig, configURL: configURL, isJVM: true))
         } else {
-            arguments = buildArguments(for: config, configURL: configURL, isJVM: false)
+            arguments = buildArguments(for: launchConfig, configURL: configURL, isJVM: false)
             if let libraryArgument {
                 arguments.insert(libraryArgument, at: 0)
             }
         }
 
-        // Add recover argument if resuming from checkpoint (Issue #4: validate checkpoint ID)
-        if let checkpoint = checkpoint {
-            // Validate checkpoint ID format to prevent command injection
-            // TLC checkpoint IDs are timestamps: YY-MM-DD-HH-MM-SS (e.g., "26-01-20-14-30-45")
-            let validCheckpointPattern = try! NSRegularExpression(
-                pattern: #"^[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$"#
-            )
-            let idRange = NSRange(checkpoint.id.startIndex..., in: checkpoint.id)
-            guard validCheckpointPattern.firstMatch(in: checkpoint.id, range: idRange) != nil else {
-                logger.error("Invalid checkpoint ID format: \(checkpoint.id)")
-                throw TLCError.invalidConfig("Invalid checkpoint ID format: expected YY-MM-DD-HH-MM-SS")
-            }
+        // Add recover argument if resuming from checkpoint
+        if let recoverCheckpointPath {
             arguments.append("-recover")
-            arguments.append(checkpoint.id)
+            arguments.append(recoverCheckpointPath)
         }
 
         arguments.append(specURL.path)
 
         logger.info("TLC arguments: \(arguments.joined(separator: " "))")
         OutputManager.shared.log("TLC command: \(arguments.joined(separator: " "))", source: .system)
+
+        let parser = TLCOutputParser()
+        parser.sessionId = sessionId
+        parsers[sessionId] = parser
 
         let process = Process()
         process.executableURL = executableURL
@@ -669,6 +678,23 @@ actor TLCProcessManager {
 
         return args
     }
+
+    private func tlaLibraryPropertyValue(additionalPaths: [URL]) -> String? {
+        var paths: [String] = []
+        var seen = Set<String>()
+
+        for url in BinaryDiscovery.configuredModuleLibraryDirectories() + additionalPaths {
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let standardizedPath = url.standardizedFileURL.path
+            guard seen.insert(standardizedPath).inserted else { continue }
+            paths.append(url.path)
+        }
+
+        guard !paths.isEmpty else {
+            return nil
+        }
+        return paths.joined(separator: ":")
+    }
 }
 
 // MARK: - TLC Errors
@@ -735,6 +761,7 @@ class TLCSession: ObservableObject {
     let id: UUID
     let specURL: URL
     var config: ModelConfig
+    var additionalLibraryPaths: [URL]
 
     @Published var isRunning = false
     @Published var progress: ModelCheckProgress?
@@ -754,11 +781,17 @@ class TLCSession: ObservableObject {
     /// Start time of the current model check run
     private var runStartTime: Date?
 
-    init(specURL: URL, config: ModelConfig, binaryMode: TLCProcessManager.TLCBinaryMode = .auto) {
+    init(
+        specURL: URL,
+        config: ModelConfig,
+        binaryMode: TLCProcessManager.TLCBinaryMode = .auto,
+        additionalLibraryPaths: [URL] = []
+    ) {
         self.id = UUID()
         self.specURL = specURL
         self.config = config
         self.binaryMode = binaryMode
+        self.additionalLibraryPaths = additionalLibraryPaths
     }
 
     func start() {
@@ -777,6 +810,7 @@ class TLCSession: ObservableObject {
         let capturedSessionId = id
         let capturedBinaryMode = binaryMode
         let capturedRecoveringFrom = recoveringFrom
+        let capturedAdditionalLibraryPaths = additionalLibraryPaths
         let capturedStartTime = runStartTime!
 
         task = Task { @MainActor [weak self] in
@@ -786,7 +820,8 @@ class TLCSession: ObservableObject {
                     config: capturedConfig,
                     sessionId: capturedSessionId,
                     binaryMode: capturedBinaryMode,
-                    recoverFrom: capturedRecoveringFrom
+                    recoverFrom: capturedRecoveringFrom,
+                    additionalLibraryPaths: capturedAdditionalLibraryPaths
                 ) { [weak self] progressUpdate in
                     Task { @MainActor in
                         guard let self else { return }
@@ -891,12 +926,81 @@ class TLCSession: ObservableObject {
 
     /// Stop the model check gracefully, triggering a checkpoint save
     func stopWithCheckpoint() {
-        checkpointStatus = .saving
-        Task {
-            await TLCProcessManager.shared.stopGracefully(sessionId: id)
+        guard isRunning else {
+            checkpointStatus = .failed("No active TLC run to checkpoint.")
+            return
         }
-        // Note: The process will exit after saving checkpoint
-        // We'll update status when we detect the checkpoint file
+
+        checkpointStatus = .saving
+        let sessionId = id
+        let specURL = specURL
+        let checkpointDir = config.checkpointDir
+
+        Task { @MainActor [weak self] in
+            let checkpointStartedAt = Date()
+            let existingCheckpointIDs = Set(
+                (try? await Self.discoverCheckpoints(for: specURL, checkpointDir: checkpointDir).map(\.id)) ?? []
+            )
+
+            await TLCProcessManager.shared.stopGracefully(sessionId: sessionId)
+            guard let self else { return }
+
+            let deadline = Date().addingTimeInterval(10)
+            var lastDiscoveryError: Error?
+
+            while Date() < deadline {
+                do {
+                    let checkpoints = try await Self.discoverCheckpoints(
+                        for: specURL,
+                        checkpointDir: checkpointDir
+                    )
+                    if let checkpoint = checkpoints.first(where: { checkpoint in
+                        // F-Sdiff-recent-003: require BOTH conditions. With an
+                        // empty `existingCheckpointIDs` baseline (e.g. baseline
+                        // discovery threw and was swallowed by `try?`), the
+                        // previous `||` would report a stale pre-existing
+                        // checkpoint as freshly "saved". Demanding the timestamp
+                        // guard as well ensures we only accept checkpoints that
+                        // were actually produced by this stop request.
+                        !existingCheckpointIDs.contains(checkpoint.id) &&
+                        checkpoint.createdAt >= checkpointStartedAt
+                    }) {
+                        self.checkpointStatus = .saved(checkpoint)
+                        return
+                    }
+                } catch {
+                    lastDiscoveryError = error
+                }
+
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                // `id` and `sessionId` are by construction equal (sessionId is captured
+                // from self.id at line 935), so the old `self.id == sessionId` guard
+                // was dead. Honor cooperative cancellation instead.
+                if Task.isCancelled { return }
+            }
+
+            await TLCProcessManager.shared.stop(sessionId: sessionId)
+            self.isRunning = false
+            self.checkpointStatus = .failed(
+                lastDiscoveryError?.localizedDescription ??
+                "No new checkpoint was found before TLC had to be stopped."
+            )
+        }
+    }
+
+    private static func discoverCheckpoints(
+        for specURL: URL,
+        checkpointDir: URL?
+    ) async throws -> [CheckpointInfo] {
+        if let checkpointDir {
+            let specName = specURL.deletingPathExtension().lastPathComponent
+            return try await CheckpointManager.shared.discoverCheckpoints(
+                in: checkpointDir,
+                specName: specName
+            )
+        }
+
+        return try await CheckpointManager.shared.discoverCheckpoints(forSpec: specURL)
     }
 
     /// Retry with JVM mode after OOM

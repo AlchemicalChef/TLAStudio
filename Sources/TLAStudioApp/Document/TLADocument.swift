@@ -98,6 +98,8 @@ final class TLADocument: NSDocument, ObservableObject {
     private var tlcWatchTask: Task<Void, Never>?
     private var proofWatchTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
+    private var tlcToolingSpecURL: URL?
+    private var proofToolingSpecURL: URL?
 
     /// Set by `close()` to make subsequent operations no-ops. Guards against
     /// late-arriving work running against a deallocated document.
@@ -341,19 +343,6 @@ final class TLADocument: NSDocument, ObservableObject {
         addWindowController(windowController)
     }
 
-    // MARK: - Close Handling
-
-    override func canClose(
-        withDelegate delegate: Any,
-        shouldClose shouldCloseSelector: Selector?,
-        contextInfo: UnsafeMutableRawPointer?
-    ) {
-        cancelActiveOperations()
-        super.canClose(withDelegate: delegate,
-                       shouldClose: shouldCloseSelector,
-                       contextInfo: contextInfo)
-    }
-
     override func close() {
         guard !isClosed else { return }
         isClosed = true
@@ -374,9 +363,13 @@ final class TLADocument: NSDocument, ObservableObject {
         // Capture sessions and nil immediately so any re-entrant access sees clean state.
         let tlcSessionToStop = tlcSession
         let proofSessionToStop = proofSession
+        let tlcToolingSpecURLToCleanup = tlcToolingSpecURL
+        let proofToolingSpecURLToCleanup = proofToolingSpecURL
 
         tlcSession = nil
         proofSession = nil
+        tlcToolingSpecURL = nil
+        proofToolingSpecURL = nil
 
         // Terminate subprocesses asynchronously: ProcessRegistry.terminate can block
         // up to ~1s (SIGTERM → SIGKILL escalation) and we don't want a UI hang on Cmd-W.
@@ -386,7 +379,12 @@ final class TLADocument: NSDocument, ObservableObject {
             Task { @MainActor in
                 await tlcSessionToStop?.stopAsync()
                 await proofSessionToStop?.stopAsync()
+                SecureTempFile.cleanupContainer(for: tlcToolingSpecURLToCleanup)
+                SecureTempFile.cleanupContainer(for: proofToolingSpecURLToCleanup)
             }
+        } else {
+            SecureTempFile.cleanupContainer(for: tlcToolingSpecURLToCleanup)
+            SecureTempFile.cleanupContainer(for: proofToolingSpecURLToCleanup)
         }
 
         // Clear all Combine subscriptions before clearing state
@@ -403,6 +401,7 @@ final class TLADocument: NSDocument, ObservableObject {
         activeModelConfig = nil
 
         delegate = nil
+        NotificationCenter.default.post(name: .documentWillClose, object: self)
 
         super.close()
     }
@@ -425,7 +424,7 @@ final class TLADocument: NSDocument, ObservableObject {
     @MainActor
     private func parseContent() async {
         do {
-            let result = try await TLACoreWrapper.shared.parse(content)
+            let result = try await TLACoreWrapper.shared.parse(content, previous: parseResult)
             self.parseResult = result
             self.diagnostics = result.diagnostics
 
@@ -532,14 +531,58 @@ final class TLADocument: NSDocument, ObservableObject {
             return
         }
 
-        let config = resolvedModelConfig(for: specURL, override: overrideConfig)
+        var config = resolvedModelConfig(for: fileURL ?? specURL, override: overrideConfig)
         activeModelConfig = config
+        config.specFile = specURL
         lastTLCResult = nil
 
         // Create and start session with specified mode
-        let session = TLCSession(specURL: specURL, config: config, binaryMode: mode)
+        let session = TLCSession(
+            specURL: specURL,
+            config: config,
+            binaryMode: mode,
+            additionalLibraryPaths: originalDirectoryLibraryPaths(forToolingSpecURL: specURL)
+        )
+        let toolingSpecURL = SecureTempFile.isManagedTemporaryFile(specURL) ? specURL : nil
         replaceModelCheckSession(with: session)
+        tlcToolingSpecURL = toolingSpecURL
         session.start()
+        watchModelCheckSession(session)
+    }
+
+    /// Resume TLC model checking from a checkpoint using the same document-owned
+    /// lifecycle as a normal run.
+    @MainActor
+    func resumeModelCheck(
+        from checkpoint: CheckpointInfo,
+        config overrideConfig: ModelConfig? = nil,
+        binaryMode: TLCProcessManager.TLCBinaryMode? = nil
+    ) {
+        let mode = binaryMode ?? selectedTLCMode
+        let specURL: URL
+        do {
+            specURL = try specURLForTooling()
+        } catch {
+            logger.error("Unable to prepare spec for TLC checkpoint recovery: \(error.localizedDescription)")
+            return
+        }
+
+        var config = resolvedModelConfig(for: fileURL ?? specURL, override: overrideConfig)
+        config.checkpointDir = checkpoint.directoryURL.deletingLastPathComponent()
+        activeModelConfig = config
+        config.specFile = specURL
+        lastTLCResult = nil
+
+        let session = TLCSession(
+            specURL: specURL,
+            config: config,
+            binaryMode: mode,
+            additionalLibraryPaths: originalDirectoryLibraryPaths(forToolingSpecURL: specURL)
+        )
+        let toolingSpecURL = SecureTempFile.isManagedTemporaryFile(specURL) ? specURL : nil
+        replaceModelCheckSession(with: session)
+        tlcToolingSpecURL = toolingSpecURL
+        session.resume(from: checkpoint)
         watchModelCheckSession(session)
     }
 
@@ -571,9 +614,14 @@ final class TLADocument: NSDocument, ObservableObject {
         lastProofResult = nil
         proofAnnotationManager.updateAnnotations(for: [])
 
+        var options = currentProofCheckOptions()
+        options.additionalLibraryPaths = originalDirectoryLibraryPaths(forToolingSpecURL: specURL)
+
         // Create and start session
-        let session = ProofSession(specURL: specURL, options: currentProofCheckOptions())
+        let session = ProofSession(specURL: specURL, options: options)
+        let toolingSpecURL = SecureTempFile.isManagedTemporaryFile(specURL) ? specURL : nil
         replaceProofSession(with: session)
+        proofToolingSpecURL = toolingSpecURL
         session.start()
         watchProofSession(session)
     }
@@ -581,10 +629,6 @@ final class TLADocument: NSDocument, ObservableObject {
     /// Check a single proof step at the current editor selection
     @MainActor
     func checkSelectionProofStep() {
-        guard let fileURL = self.fileURL else {
-            return
-        }
-
         let location = selectedRange.location
         guard location != NSNotFound else {
             logger.debug("checkSelectionProofStep: Selection unavailable")
@@ -594,14 +638,35 @@ final class TLADocument: NSDocument, ObservableObject {
         let (line, column) = lineAndColumn(for: location)
         logger.debug("checkSelectionProofStep: selection at line=\(line + 1), column=\(column + 1)")
 
-        // Create or reuse session
-        let session = proofSession ?? ProofSession(specURL: fileURL, options: currentProofCheckOptions())
-        if proofSession == nil {
-            self.proofSession = session
+        let specURL: URL
+        do {
+            specURL = try specURLForTooling()
+        } catch {
+            logger.error("Unable to prepare spec for TLAPS step check: \(error.localizedDescription)")
+            return
         }
-        session.options = currentProofCheckOptions()
+
+        // Create or reuse session
+        let currentSession = proofSession
+        let session: ProofSession
+        let toolingSpecURL = SecureTempFile.isManagedTemporaryFile(specURL) ? specURL : nil
+        if let currentSession, currentSession.specURL == specURL {
+            guard !currentSession.isRunning else { return }
+            session = currentSession
+        } else {
+            var options = currentProofCheckOptions()
+            options.additionalLibraryPaths = originalDirectoryLibraryPaths(forToolingSpecURL: specURL)
+            session = ProofSession(specURL: specURL, options: options)
+            replaceProofSession(with: session)
+            self.proofToolingSpecURL = toolingSpecURL
+        }
+        var options = currentProofCheckOptions()
+        options.additionalLibraryPaths = originalDirectoryLibraryPaths(forToolingSpecURL: specURL)
+        session.options = options
+        lastProofResult = nil
 
         session.checkStep(line: line + 1, column: column + 1) // Convert to 1-based
+        watchProofSession(session)
     }
 
     /// Stop the current proof checking session synchronously
@@ -714,7 +779,7 @@ final class TLADocument: NSDocument, ObservableObject {
     }
 
     private func specURLForTooling() throws -> URL {
-        if let fileURL {
+        if let fileURL, !isDocumentEdited {
             return fileURL
         }
 
@@ -727,24 +792,63 @@ final class TLADocument: NSDocument, ObservableObject {
         )
     }
 
+    private func originalDirectoryLibraryPaths(forToolingSpecURL toolingSpecURL: URL) -> [URL] {
+        guard SecureTempFile.isManagedTemporaryFile(toolingSpecURL),
+              let fileURL else {
+            return []
+        }
+        return [fileURL.deletingLastPathComponent()]
+    }
+
     @MainActor
     private func replaceModelCheckSession(with session: TLCSession) {
         tlcWatchTask?.cancel()
         tlcWatchTask = nil
-        tlcSession?.stop()
+
+        // Defer subprocess termination off the MainActor: ProcessRegistry.terminate
+        // blocks up to ~1s (SIGTERM → SIGKILL escalation), which would stall the UI
+        // every time the user presses Run while a previous run is still alive.
+        // Mirrors the `close()` pattern hardened on 2026-04-16.
+        let tlcSessionToStop = tlcSession
+        let toolingSpecURLToCleanup = tlcToolingSpecURL
         tlcSession = session
+        tlcToolingSpecURL = nil
+
+        if tlcSessionToStop != nil {
+            Task.detached {
+                await tlcSessionToStop?.stopAsync()
+                SecureTempFile.cleanupContainer(for: toolingSpecURLToCleanup)
+            }
+        } else {
+            SecureTempFile.cleanupContainer(for: toolingSpecURLToCleanup)
+        }
     }
 
     @MainActor
     private func replaceProofSession(with session: ProofSession) {
         proofWatchTask?.cancel()
         proofWatchTask = nil
-        proofSession?.stop()
+
+        // Defer subprocess termination off the MainActor — see comment in
+        // `replaceModelCheckSession` for rationale.
+        let proofSessionToStop = proofSession
+        let toolingSpecURLToCleanup = proofToolingSpecURL
         proofSession = session
+        proofToolingSpecURL = nil
+
+        if proofSessionToStop != nil {
+            Task.detached {
+                await proofSessionToStop?.stopAsync()
+                SecureTempFile.cleanupContainer(for: toolingSpecURLToCleanup)
+            }
+        } else {
+            SecureTempFile.cleanupContainer(for: toolingSpecURLToCleanup)
+        }
     }
 
     @MainActor
     private func watchModelCheckSession(_ session: TLCSession) {
+        tlcWatchTask?.cancel()
         tlcWatchTask = Task { @MainActor [weak self] in
             while session.isRunning {
                 try? await Task.sleep(nanoseconds: 100_000_000)
@@ -758,11 +862,14 @@ final class TLADocument: NSDocument, ObservableObject {
                   let self,
                   self.tlcSession === session else { return }
             self.lastTLCResult = session.result
+            SecureTempFile.cleanupContainer(for: self.tlcToolingSpecURL)
+            self.tlcToolingSpecURL = nil
         }
     }
 
     @MainActor
     private func watchProofSession(_ session: ProofSession) {
+        proofWatchTask?.cancel()
         proofWatchTask = Task { @MainActor [weak self] in
             while session.isRunning {
                 try? await Task.sleep(nanoseconds: 100_000_000)
@@ -775,6 +882,8 @@ final class TLADocument: NSDocument, ObservableObject {
                   self.proofSession === session else { return }
             self.lastProofResult = session.result
             self.proofAnnotationManager.updateAnnotations(for: session.obligations)
+            SecureTempFile.cleanupContainer(for: self.proofToolingSpecURL)
+            self.proofToolingSpecURL = nil
         }
     }
 
@@ -791,21 +900,6 @@ final class TLADocument: NSDocument, ObservableObject {
         } else {
             alert.runModal()
         }
-    }
-
-    private func cancelActiveOperations() {
-        // Cancel parse task
-        parseTask?.cancel()
-
-        // Cancel watch tasks
-        tlcWatchTask?.cancel()
-        proofWatchTask?.cancel()
-
-        // Stop any running sessions (synchronous via ProcessRegistry)
-        tlcSession?.stop()
-        proofSession?.stop()
-
-        NotificationCenter.default.post(name: .documentWillClose, object: self)
     }
 
     // MARK: - Public API

@@ -265,17 +265,11 @@ public final class FindReplaceManager: ObservableObject {
         // Use custom replacer if provided
         if let replacer = textReplacer {
             replacer(range, replaceQuery)
-        } else if let textView = textView,
-                  let textStorage = textView.textStorage {
-            // Verify the range is still valid
-            guard range.location + range.length <= textStorage.length else {
+        } else if let textView = textView {
+            guard replace(range, in: textView, with: replaceQuery) else {
                 performSearch()
                 return
             }
-
-            textStorage.beginEditing()
-            textStorage.replaceCharacters(in: range, with: replaceQuery)
-            textStorage.endEditing()
         }
 
         // Add to replacement history
@@ -307,7 +301,7 @@ public final class FindReplaceManager: ObservableObject {
     public func replaceAll() -> Int {
         guard totalMatches > 0 else { return 0 }
 
-        let replacementCount = matches.count
+        var replacementCount = 0
 
         // Replace from end to start to preserve range validity
         let sortedMatches = matches.sorted { $0.location > $1.location }
@@ -315,17 +309,14 @@ public final class FindReplaceManager: ObservableObject {
         if let replacer = textReplacer {
             for range in sortedMatches {
                 replacer(range, replaceQuery)
+                replacementCount += 1
             }
-        } else if let textView = textView,
-                  let textStorage = textView.textStorage {
-            textStorage.beginEditing()
+        } else if let textView = textView {
             for range in sortedMatches {
-                guard range.location + range.length <= textStorage.length else {
-                    continue
+                if replace(range, in: textView, with: replaceQuery) {
+                    replacementCount += 1
                 }
-                textStorage.replaceCharacters(in: range, with: replaceQuery)
             }
-            textStorage.endEditing()
         }
 
         // Add to replacement history
@@ -335,6 +326,22 @@ public final class FindReplaceManager: ObservableObject {
         performSearch()
 
         return replacementCount
+    }
+
+    private func replace(_ range: NSRange, in textView: NSTextView, with replacement: String) -> Bool {
+        guard let textStorage = textView.textStorage,
+              range.location >= 0,
+              range.location + range.length <= textStorage.length else {
+            return false
+        }
+
+        guard textView.shouldChangeText(in: range, replacementString: replacement) else {
+            return false
+        }
+
+        textView.replaceCharacters(in: range, with: replacement)
+        textView.didChangeText()
+        return true
     }
 
     // MARK: - Match Calculation
@@ -535,9 +542,11 @@ public final class FindReplaceManager: ObservableObject {
     // MARK: - Private Methods - Highlighting
 
     private func applyHighlights() {
+        // `endEditing` on the text storage already invalidates display for the
+        // attribute ranges that changed, so we no longer need the layout manager
+        // here. See audit F-S6-editor-perf-007.
         guard let textView = textView,
-              let textStorage = textView.textStorage,
-              let layoutManager = textView.layoutManager else {
+              let textStorage = textView.textStorage else {
             return
         }
 
@@ -570,13 +579,6 @@ public final class FindReplaceManager: ObservableObject {
         }
 
         textStorage.endEditing()
-
-        // Invalidate layout for highlighted ranges
-        for range in matches {
-            if range.location + range.length <= textStorage.length {
-                layoutManager.invalidateDisplay(forCharacterRange: range)
-            }
-        }
     }
 
     private func highlightCurrentMatch() {

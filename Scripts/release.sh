@@ -74,16 +74,16 @@ fi
 APP_NAME="TLA+ Studio"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 
-# Run build-app.sh (it handles both debug and release)
-"$SCRIPT_DIR/build-app.sh"
+# Run build-app.sh with the same configuration that was compiled.
+if [ "$BUILD_CONFIG" = "release" ]; then
+    "$SCRIPT_DIR/build-app.sh" release
+else
+    "$SCRIPT_DIR/build-app.sh"
+fi
 
-# For release builds, copy from debug to release if needed
-if [ "$BUILD_CONFIG" = "release" ] && [ ! -d "$APP_DIR" ]; then
-    DEBUG_APP="$PROJECT_DIR/.build/arm64-apple-macosx/debug/$APP_NAME.app"
-    if [ -d "$DEBUG_APP" ]; then
-        mkdir -p "$BUILD_DIR"
-        cp -R "$DEBUG_APP" "$APP_DIR"
-    fi
+if [ ! -d "$APP_DIR" ]; then
+    echo "Error: expected app bundle was not created at $APP_DIR"
+    exit 1
 fi
 
 # Update version in Info.plist

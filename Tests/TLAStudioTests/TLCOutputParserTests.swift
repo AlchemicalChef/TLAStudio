@@ -202,9 +202,6 @@ final class TLCOutputParserTests: XCTestCase {
     }
 
     func testParseJSONBoolValueNative() {
-        // Note: JSON native boolean `true` in JSONSerialization becomes NSNumber
-        // which can be cast to Int first, so it may be parsed as Int(1) instead of Bool
-        // Real TLC output uses string "TRUE"/"FALSE" which is handled correctly
         let json = """
         {"type":"error","errorType":"invariant","message":"Test","trace":[{"action":"Init","variables":{"flag":true}}]}
         """
@@ -214,9 +211,7 @@ final class TLCOutputParserTests: XCTestCase {
         let result = parser.finalResult(exitCode: 1, duration: 1.0)
 
         let variables = result.errorTrace?.states.first?.variables
-        // JSON native bool may be parsed as Int(1) due to NSNumber casting order
-        // This is acceptable since real TLC uses "TRUE"/"FALSE" strings
-        XCTAssertNotNil(variables?["flag"])
+        XCTAssertEqual(variables?["flag"], .bool(true))
     }
 
     func testParseJSONStringValue() {
@@ -334,6 +329,18 @@ final class TLCOutputParserTests: XCTestCase {
         XCTAssertEqual(progress?.phase, .computing)
     }
 
+    func testParseTextProgressLineWithThousandsSeparators() {
+        let line = "Progress(10) at 2024-01-15 10:30:00: 1,234 states generated, 1,000 distinct states found, 25 states left on queue.\n"
+        let data = line.data(using: .utf8)!
+
+        let progress = parser.parse(data)
+
+        XCTAssertNotNil(progress)
+        XCTAssertEqual(progress?.statesFound, 1_234)
+        XCTAssertEqual(progress?.distinctStates, 1_000)
+        XCTAssertEqual(progress?.statesLeft, 25)
+    }
+
     func testParseTextStateCount() {
         let line = "Finished computing initial states: 10 distinct states generated.\n"
         let data = line.data(using: .utf8)!
@@ -342,6 +349,16 @@ final class TLCOutputParserTests: XCTestCase {
 
         XCTAssertNotNil(progress)
         XCTAssertEqual(progress?.distinctStates, 10)
+    }
+
+    func testParseTextStateCountWithThousandsSeparators() {
+        let line = "Finished computing initial states: 10,500 distinct states generated.\n"
+        let data = line.data(using: .utf8)!
+
+        let progress = parser.parse(data)
+
+        XCTAssertNotNil(progress)
+        XCTAssertEqual(progress?.distinctStates, 10_500)
     }
 
     func testParseTextInvariantError() {
@@ -381,7 +398,7 @@ final class TLCOutputParserTests: XCTestCase {
         // Verify the trace was parsed correctly
         XCTAssertNotNil(result.errorTrace)
         XCTAssertEqual(result.errorTrace?.states.count, 1)
-        XCTAssertEqual(result.errorTrace?.states.first?.id, 1)
+        XCTAssertEqual(result.errorTrace?.states.first?.id, 0)
         XCTAssertEqual(result.errorTrace?.states.first?.action, "Init")
         XCTAssertEqual(result.errorTrace?.states.first?.variables["x"], .int(0))
     }
@@ -805,6 +822,7 @@ final class TLCOutputParserTests: XCTestCase {
 
         XCTAssertNotNil(result.errorTrace)
         XCTAssertEqual(result.errorTrace?.states.count, 3)
+        XCTAssertEqual(result.errorTrace?.states.map(\.id), [0, 1, 2])
         XCTAssertEqual(result.errorTrace?.states[0].variables["x"], .int(0))
         XCTAssertEqual(result.errorTrace?.states[1].variables["x"], .int(1))
         XCTAssertEqual(result.errorTrace?.states[2].variables["x"], .int(2))

@@ -198,6 +198,14 @@ final class TLAParseResult: @unchecked Sendable {
     let diagnostics: [TLADiagnostic]
     let source: String
 
+    /// Stable per-instance identity used as a cache key. UUIDs do not collide on
+    /// deallocation (unlike `ObjectIdentifier`, which encodes the raw allocation
+    /// address and can recur after ARC reuses the slot — yielding stale-cache hits
+    /// against an unrelated `ParseResult`). Combined with source-equality
+    /// validation at the lookup site, this defends against both reuse and any
+    /// future UUID-collision misuse.
+    let cacheKey = UUID()
+
     // Lazy-computed and cached line array to avoid repeated splitting
     private var _lines: [String]?
     private let linesLock = NSLock()
@@ -231,12 +239,19 @@ final class TLAParseResult: @unchecked Sendable {
 /// Protocol for TLA+ language services
 protocol TLACoreProtocol: Sendable {
     func parse(_ source: String) async throws -> TLAParseResult
+    func parseIncremental(_ source: String, previous: TLAParseResult) async throws -> TLAParseResult
     func getSymbols(from result: TLAParseResult) async -> [TLASymbol]
     func getHighlights(from result: TLAParseResult, in range: TLARange) async -> [TLAHighlightToken]
     func getCompletions(from result: TLAParseResult, at position: TLAPosition) async -> [TLACompletionItem]
     func analyzeContext(from result: TLAParseResult, at position: TLAPosition) async -> TLACompletionContext
     func getDetailedCompletions(from result: TLAParseResult, at position: TLAPosition) async -> [TLADetailedCompletionItem]
     func getSignatureHelp(from result: TLAParseResult, at position: TLAPosition) async -> TLASignatureHelp?
+}
+
+extension TLACoreProtocol {
+    func parseIncremental(_ source: String, previous: TLAParseResult) async throws -> TLAParseResult {
+        try await parse(source)
+    }
 }
 
 // MARK: - TLACore Error
@@ -255,6 +270,32 @@ enum TLACoreError: Error, LocalizedError {
         case .internalError(let message):
             return "Internal error: \(message)"
         }
+    }
+}
+
+// MARK: - Cache Value Wrappers
+
+/// Wraps cached symbol output with the source it was derived from so the
+/// cache can detect a stale hit (UUID collision or future bug) before returning.
+private struct CachedSymbols {
+    let symbols: [TLASymbol]
+    let source: String
+}
+
+/// Wraps a cached Rust `ParseResult` with the Swift source it was derived from
+/// so the cache can detect a stale hit before handing the underlying tree to
+/// `getSymbols` / `getHighlights` / `getCompletions`.
+///
+/// Holds a strong reference to the Rust `ParseResult` while it is in the cache;
+/// once evicted (LRU drop or `clearCache`) the `ParseResult` deallocates
+/// normally via its UniFFI binding.
+private final class CachedParseResult {
+    let parseResult: ParseResult
+    let source: String
+
+    init(parseResult: ParseResult, source: String) {
+        self.parseResult = parseResult
+        self.source = source
     }
 }
 
@@ -372,7 +413,9 @@ final class TLACoreWrapper: ObservableObject {
     private var parseCache: ParseResultLRUCache
 
     /// Reuses symbol extraction results for cached parse results.
-    private var symbolCache: GenericLRUCache<ObjectIdentifier, [TLASymbol]>
+    /// Keyed by `TLAParseResult.cacheKey` (UUID) + source-equality validation so
+    /// deallocation-then-realloc cannot produce a stale-cache hit.
+    private var symbolCache: GenericLRUCache<UUID, CachedSymbols>
 
     /// Coalesces concurrent parse requests for identical content.
     /// Using the full source as the key avoids content-hash collision edge cases.
@@ -390,7 +433,7 @@ final class TLACoreWrapper: ObservableObject {
     }
 
     /// Parse TLA+ source code
-    func parse(_ content: String) async throws -> TLAParseResult {
+    func parse(_ content: String, previous: TLAParseResult? = nil) async throws -> TLAParseResult {
         // Use content hash as cache key to avoid storing large strings
         let contentHash = content.hashValue
 
@@ -410,15 +453,27 @@ final class TLACoreWrapper: ObservableObject {
         }
 
         let core = self.core
+        let previous = previous?.source == content ? nil : previous
         let parseTask = Task.detached(priority: .userInitiated) {
-            try await core.parse(content)
+            if let previous {
+                return try await core.parseIncremental(content, previous: previous)
+            }
+            return try await core.parse(content)
         }
         inFlightParses[content] = parseTask
 
+        // F-GAP11-002: symmetric cleanup. The previous shape removed the
+        // `inFlightParses` entry on awaiter failure but never `cancel()`-ed
+        // the detached `parseTask`. The Rust parse is currently synchronous so
+        // the cancel is a no-op, but doing this lets `clearCache` (which
+        // iterates `inFlightParses.values` and cancels them) actually mean
+        // something, and makes cooperative cancellation possible once the
+        // Rust side supports it.
         let result: TLAParseResult
         do {
             result = try await parseTask.value
         } catch {
+            parseTask.cancel()
             inFlightParses.removeValue(forKey: content)
             throw error
         }
@@ -433,13 +488,17 @@ final class TLACoreWrapper: ObservableObject {
 
     /// Get symbols from parse result
     func getSymbols(from result: TLAParseResult) async -> [TLASymbol] {
-        let cacheKey = ObjectIdentifier(result)
-        if let cached = symbolCache.get(cacheKey) {
-            return cached
+        // Validate source equality as a belt-and-braces check against a future
+        // UUID-collision misuse path (e.g., two TLAParseResults somehow created
+        // with the same `cacheKey`). UUID collisions are astronomically unlikely
+        // but the validation cost is O(1) string-id compare + only a full compare
+        // on equal hashes.
+        if let cached = symbolCache.get(result.cacheKey), cached.source == result.source {
+            return cached.symbols
         }
 
         let symbols = await core.getSymbols(from: result)
-        symbolCache.set(cacheKey, value: symbols)
+        symbolCache.set(result.cacheKey, value: CachedSymbols(symbols: symbols, source: result.source))
         return symbols
     }
 
@@ -531,10 +590,9 @@ final class TLACoreWrapper: ObservableObject {
 
     /// Get the word at a given position in the source text
     func wordAt(position: TLAPosition, in source: String) -> String? {
-        let lines = source.components(separatedBy: "\n")
-        guard Int(position.line) < lines.count else { return nil }
+        let lineIndex = Int(position.line)
+        guard let line = lineText(at: lineIndex, in: source) else { return nil }
 
-        let line = lines[Int(position.line)]
         let column = Int(position.column)
         guard column <= line.count else { return nil }
 
@@ -557,6 +615,27 @@ final class TLACoreWrapper: ObservableObject {
 
         let word = String(lineChars[start..<end])
         return word.isEmpty ? nil : word
+    }
+
+    private func lineText(at targetLine: Int, in source: String) -> Substring? {
+        guard targetLine >= 0 else { return nil }
+
+        var currentLine = 0
+        var lineStart = source.startIndex
+        var index = source.startIndex
+
+        while index < source.endIndex {
+            if source[index] == "\n" {
+                if currentLine == targetLine {
+                    return source[lineStart..<index]
+                }
+                currentLine += 1
+                lineStart = source.index(after: index)
+            }
+            index = source.index(after: index)
+        }
+
+        return currentLine == targetLine ? source[lineStart..<source.endIndex] : nil
     }
 
     private func isIdentifierChar(_ char: Character) -> Bool {
@@ -879,6 +958,10 @@ final class FallbackTLACore: TLACoreProtocol, Sendable {
             diagnostics: diagnostics,
             source: source
         )
+    }
+
+    func parseIncremental(_ source: String, previous: TLAParseResult) async throws -> TLAParseResult {
+        try await parse(source)
     }
 
     func getSymbols(from result: TLAParseResult) async -> [TLASymbol] {
@@ -1218,9 +1301,11 @@ final class FallbackTLACore: TLACoreProtocol, Sendable {
 /// @unchecked Sendable: TlaCore is thread-safe; parseResultCache uses internal NSLock
 final class RustTLACore: TLACoreProtocol, @unchecked Sendable {
     private let core: TlaCore
-    /// LRU cache for ParseResults with proper O(1) eviction
-    /// Note: GenericLRUCache is thread-safe with internal NSLock
-    private let parseResultCache = GenericLRUCache<ObjectIdentifier, ParseResult>(capacity: 20)
+    /// LRU cache for Rust ParseResults with proper O(1) eviction.
+    /// Keyed by `TLAParseResult.cacheKey` (UUID) instead of `ObjectIdentifier`
+    /// so that ARC-driven address reuse cannot return a stale Rust `ParseResult`.
+    /// Note: GenericLRUCache is thread-safe with internal NSLock.
+    private let parseResultCache = GenericLRUCache<UUID, CachedParseResult>(capacity: 20)
 
     init() throws {
         self.core = try TlaCore()
@@ -1229,23 +1314,121 @@ final class RustTLACore: TLACoreProtocol, @unchecked Sendable {
     func parse(_ source: String) async throws -> TLAParseResult {
         do {
             let result = try core.parse(source: source)
-            let diagnostics = result.getDiagnostics().map { convertDiagnostic($0) }
+            let tlaResult = convertParseResult(result, source: source)
 
-            let tlaResult = TLAParseResult(
-                isValid: result.isValid(),
-                diagnostics: diagnostics,
-                source: source
-            )
-
-            // Cache the ParseResult for later use with getSymbols/getHighlights
+            // Cache the ParseResult keyed by the stable cacheKey of the Swift wrapper.
             // GenericLRUCache is already thread-safe with its own lock
-            let key = ObjectIdentifier(tlaResult)
-            parseResultCache.set(key, value: result)
+            parseResultCache.set(tlaResult.cacheKey, value: CachedParseResult(parseResult: result, source: source))
 
             return tlaResult
         } catch let error as ParseError {
-            throw TLACoreError.parseFailed(error.localizedDescription)
+            throw Self.mapParseError(error)
         }
+    }
+
+    func parseIncremental(_ source: String, previous: TLAParseResult) async throws -> TLAParseResult {
+        guard let oldResult = getCachedParseResult(for: previous),
+              let edit = makeEditInfo(from: previous.source, to: source) else {
+            return try await parse(source)
+        }
+
+        do {
+            let result = try core.parseIncremental(source: source, oldResult: oldResult, edit: edit)
+            let tlaResult = convertParseResult(result, source: source)
+
+            parseResultCache.set(tlaResult.cacheKey, value: CachedParseResult(parseResult: result, source: source))
+
+            return tlaResult
+        } catch let error as ParseError {
+            throw Self.mapParseError(error)
+        }
+    }
+
+    /// Preserves ParseError variant fidelity across the Rust↔Swift boundary instead of
+    /// collapsing every variant to `parseFailed`.
+    private static func mapParseError(_ error: ParseError) -> TLACoreError {
+        switch error {
+        case .ParseFailed(let message):
+            return .parseFailed(message)
+        case .InvalidEncoding:
+            return .invalidEncoding
+        case .Internal(let message):
+            return .internalError(message)
+        }
+    }
+
+    private func convertParseResult(_ result: ParseResult, source: String) -> TLAParseResult {
+        TLAParseResult(
+            isValid: result.isValid(),
+            diagnostics: result.getDiagnostics().map { convertDiagnostic($0) },
+            source: source
+        )
+    }
+
+    private func makeEditInfo(from oldSource: String, to newSource: String) -> EditInfo? {
+        guard oldSource != newSource else { return nil }
+
+        // Walk on UTF-8 byte views: tree-sitter expects byte offsets, so emitting
+        // them directly is both faster (no Character grapheme walk per code point)
+        // and avoids the prior multi-pass Character → byte conversion at the end.
+        // Character boundaries align with UTF-8 codepoint boundaries, so byte-level
+        // equality is a safe substitute for Character equality here.
+        let oldUTF8 = oldSource.utf8
+        let newUTF8 = newSource.utf8
+
+        var oldPrefix = oldUTF8.startIndex
+        var newPrefix = newUTF8.startIndex
+        while oldPrefix < oldUTF8.endIndex,
+              newPrefix < newUTF8.endIndex,
+              oldUTF8[oldPrefix] == newUTF8[newPrefix] {
+            oldPrefix = oldUTF8.index(after: oldPrefix)
+            newPrefix = newUTF8.index(after: newPrefix)
+        }
+
+        var oldSuffix = oldUTF8.endIndex
+        var newSuffix = newUTF8.endIndex
+        while oldSuffix > oldPrefix, newSuffix > newPrefix {
+            let previousOld = oldUTF8.index(before: oldSuffix)
+            let previousNew = newUTF8.index(before: newSuffix)
+            guard oldUTF8[previousOld] == newUTF8[previousNew] else { break }
+            oldSuffix = previousOld
+            newSuffix = previousNew
+        }
+
+        let startByte = oldUTF8.distance(from: oldUTF8.startIndex, to: oldPrefix)
+        let oldEndByte = oldUTF8.distance(from: oldUTF8.startIndex, to: oldSuffix)
+        let newEndByte = newUTF8.distance(from: newUTF8.startIndex, to: newSuffix)
+
+        return EditInfo(
+            startByte: UInt32(clamping: startByte),
+            oldEndByte: UInt32(clamping: oldEndByte),
+            newEndByte: UInt32(clamping: newEndByte),
+            startPosition: treeSitterPositionUTF8(in: oldUTF8, at: oldPrefix),
+            oldEndPosition: treeSitterPositionUTF8(in: oldUTF8, at: oldSuffix),
+            newEndPosition: treeSitterPositionUTF8(in: newUTF8, at: newSuffix)
+        )
+    }
+
+    /// Compute (row, byte-column) for tree-sitter directly from the UTF-8 view.
+    /// Avoids Character/String.Index round-trips. Newlines are LF (0x0A) per
+    /// tree-sitter's contract; CRLF is treated as LF + a CR on the previous row,
+    /// matching the rest of the pipeline.
+    private func treeSitterPositionUTF8(
+        in utf8: String.UTF8View,
+        at target: String.UTF8View.Index
+    ) -> Position {
+        var line: UInt32 = 0
+        var lineStart = utf8.startIndex
+        var current = utf8.startIndex
+        while current < target {
+            if utf8[current] == 0x0A { // '\n'
+                line += 1
+                lineStart = utf8.index(after: current)
+            }
+            current = utf8.index(after: current)
+        }
+        let column = utf8.distance(from: lineStart, to: target)
+        return Position(line: line, column: UInt32(clamping: column))
     }
 
     func getSymbols(from result: TLAParseResult) async -> [TLASymbol] {
@@ -1364,9 +1547,14 @@ final class RustTLACore: TLACoreProtocol, @unchecked Sendable {
     }
 
     private func getCachedParseResult(for tlaResult: TLAParseResult) -> ParseResult? {
-        let key = ObjectIdentifier(tlaResult)
-        // GenericLRUCache is already thread-safe with its own lock
-        return parseResultCache.get(key)
+        // GenericLRUCache is already thread-safe with its own lock.
+        // Validate source equality so a (vanishingly unlikely) UUID collision
+        // cannot return the wrong Rust ParseResult.
+        guard let cached = parseResultCache.get(tlaResult.cacheKey),
+              cached.source == tlaResult.source else {
+            return nil
+        }
+        return cached.parseResult
     }
 
     private func convertDiagnostic(_ d: Diagnostic) -> TLADiagnostic {
@@ -1521,6 +1709,10 @@ struct TLAFoldingRange: Equatable {
 // MARK: - Folding Range Detection Extension
 
 extension TLACoreWrapper {
+    private static let operatorDefinitionRegex = try! NSRegularExpression(
+        pattern: #"^\s*\w+\s*(?:\([^)]*\))?\s*=="#
+    )
+    private static let operatorNameRegex = try! NSRegularExpression(pattern: #"(\w+)"#)
 
     /// Get all foldable regions in the document
     func getFoldingRanges(in source: String) -> [TLAFoldingRange] {
@@ -1577,8 +1769,7 @@ extension TLACoreWrapper {
             }
 
             // Multi-line operator definitions (Op == ...)
-            let operatorPattern = #"^\s*\w+\s*(?:\([^)]*\))?\s*=="#
-            if line.range(of: operatorPattern, options: .regularExpression) != nil {
+            if isOperatorDefinition(line) {
                 // Check if this is a multi-line definition
                 let startIndent = line.prefix(while: { $0 == " " || $0 == "\t" }).count
 
@@ -1595,7 +1786,7 @@ extension TLACoreWrapper {
                     let nextIndent = nextContent.prefix(while: { $0 == " " || $0 == "\t" }).count
 
                     // Another top-level definition starts
-                    if nextIndent <= startIndent && nextContent.range(of: operatorPattern, options: .regularExpression) != nil {
+                    if nextIndent <= startIndent && isOperatorDefinition(nextContent) {
                         // End is the previous non-blank line
                         var endLine = nextLine - 1
                         while endLine > lineNum && lines[endLine].trimmingCharacters(in: .whitespaces).isEmpty {
@@ -1658,18 +1849,29 @@ extension TLACoreWrapper {
     }
 
     private func extractOperatorName(from line: String) -> String? {
-        let pattern = #"^\s*(\w+)\s*(?:\([^)]*\))?\s*=="#
-        guard let range = line.range(of: pattern, options: .regularExpression) else {
+        let fullRange = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard let match = Self.operatorDefinitionRegex.firstMatch(
+            in: line,
+            range: fullRange
+        ) else {
             return nil
         }
 
-        let match = String(line[range])
-        // Extract just the name
-        let namePattern = #"(\w+)"#
-        if let nameRange = match.range(of: namePattern, options: .regularExpression) {
-            return String(match[nameRange])
+        let matchedText = (line as NSString).substring(with: match.range)
+        if let nameMatch = Self.operatorNameRegex.firstMatch(
+            in: matchedText,
+            range: NSRange(location: 0, length: (matchedText as NSString).length)
+        ) {
+            return (matchedText as NSString).substring(with: nameMatch.range)
         }
         return nil
+    }
+
+    private func isOperatorDefinition(_ line: String) -> Bool {
+        Self.operatorDefinitionRegex.firstMatch(
+            in: line,
+            range: NSRange(line.startIndex..<line.endIndex, in: line)
+        ) != nil
     }
 
     private func deduplicateFoldingRanges(_ ranges: [TLAFoldingRange]) -> [TLAFoldingRange] {

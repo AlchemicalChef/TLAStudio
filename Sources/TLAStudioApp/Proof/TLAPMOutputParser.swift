@@ -29,6 +29,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
     private let lock = NSLock()
     private var lineBuffer = LineBuffer(maxBufferSize: 5 * 1024 * 1024, compactionThreshold: 32 * 1024)
     private var currentBlock: [String: String] = [:]
+    private var currentMultilineKey: String?
     private var isInBlock = false
     private var obligations: [ParsedObligation] = []
     private var sessionId: UUID = UUID()
@@ -119,8 +120,9 @@ final class TLAPMOutputParser: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        let success = exitCode == 0 && failedCount == 0
         let convertedObligations = obligations.map(convertToProofObligation)
+        let hasUnprovedObligations = convertedObligations.contains { !$0.status.isSuccess }
+        let success = exitCode == 0 && failedCount == 0 && !hasUnprovedObligations
 
         return ProofCheckResult(
             success: success,
@@ -139,6 +141,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
 
         lineBuffer.reset()
         currentBlock = [:]
+        currentMultilineKey = nil
         isInBlock = false
         obligations = []
         sessionId = UUID()
@@ -160,11 +163,13 @@ final class TLAPMOutputParser: @unchecked Sendable {
             if content == "BEGIN" {
                 isInBlock = true
                 currentBlock = [:]
+                currentMultilineKey = nil
                 return nil
             }
 
             if content == "END" {
                 isInBlock = false
+                currentMultilineKey = nil
                 let result = processBlock()
                 if result != nil {
                     logger.debug("Block processed, obligations: \(self.obligations.count)")
@@ -177,8 +182,16 @@ final class TLAPMOutputParser: @unchecked Sendable {
                 let key = String(content[..<colonIndex])
                 let value = String(content[content.index(after: colonIndex)...])
                 currentBlock[key] = value
+                currentMultilineKey = Self.multilineBlockKeys.contains(key) ? key : nil
+            } else {
+                currentMultilineKey = nil
             }
 
+            return nil
+        }
+
+        if isInBlock, let currentMultilineKey {
+            appendMultilineValue(line, to: currentMultilineKey)
             return nil
         }
 
@@ -214,7 +227,11 @@ final class TLAPMOutputParser: @unchecked Sendable {
 
         // Extract obligation number
         let parts = content.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-        guard parts.count >= 2, let id = Int(parts[1]) else {
+        guard parts.count >= 2 else {
+            logger.debug("parseNonToolboxLine: malformed OBLIGATION line (too few tokens): \(content, privacy: .public)")
+            return nil
+        }
+        guard let id = parseOrLog(parts[1], context: "non-toolbox OBLIGATION id", parser: Int.init) else {
             return nil
         }
 
@@ -278,7 +295,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
             obligations[existingIndex] = obligation
         } else {
             obligations.append(obligation)
-            totalObligations += 1
+            totalObligations = max(totalObligations, obligations.count)
         }
 
         // Update statistics for the new status
@@ -288,11 +305,38 @@ final class TLAPMOutputParser: @unchecked Sendable {
     }
 
     private func parseRegularOutput(_ line: String) {
-        // Handle non-toolbox output (warnings, errors, info)
-        // This can be extended to capture additional diagnostic information
-        if line.contains("Warning:") || line.contains("Error:") {
-            // Could store these for display
+        // F-S7-error-prop-001: surface warnings/errors from non-toolbox output
+        // via the logger rather than silently dropping them. Until the UI
+        // grows a dedicated channel for these, the unified log is the
+        // user-visible record.
+        if line.contains("Warning:") {
+            logger.notice("TLAPM warning: \(line, privacy: .public)")
+        } else if line.contains("Error:") {
+            logger.error("TLAPM error: \(line, privacy: .public)")
         }
+    }
+
+    // MARK: - Diagnostic Helpers
+
+    /// Apply a parser closure and, on failure, log the raw input alongside the
+    /// caller-supplied `context` so silent-drop sites become diagnosable.
+    ///
+    /// F-S7-error-prop-002 — extracts the recurring `guard let parsed = … else
+    /// { return }` shape so future contributors stop introducing new silent
+    /// drops without leaving a breadcrumb.
+    @discardableResult
+    private func parseOrLog<T>(
+        _ raw: String,
+        context: String,
+        parser: (String) -> T?
+    ) -> T? {
+        if let value = parser(raw) {
+            return value
+        }
+        logger.debug(
+            "TLAPM parse-or-log: failed to parse \(context, privacy: .public) from raw input: \(raw, privacy: .public)"
+        )
+        return nil
     }
 
     // MARK: - Block Processing
@@ -314,6 +358,10 @@ final class TLAPMOutputParser: @unchecked Sendable {
         case "warning":
             return processWarningBlock()
         default:
+            // F-S7-error-prop-004: surface unknown block kinds so future TLAPM
+            // protocol drift is visible in the unified log.
+            let snapshot = currentBlock.map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
+            logger.debug("Unhandled TLAPM message kind: \(type, privacy: .public) [\(snapshot, privacy: .public)]")
             return nil
         }
     }
@@ -321,7 +369,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
     private func processObligationsNumberBlock() -> ProofCheckProgress? {
         // Handle the obligationsnumber block to set total count
         if let countStr = currentBlock["count"], let count = Int(countStr) {
-            totalObligations = max(totalObligations, count)
+            totalObligations = max(count, obligations.count)
             return makeProgressUpdate(latestObligation: nil)
         }
         return nil
@@ -329,9 +377,11 @@ final class TLAPMOutputParser: @unchecked Sendable {
 
     private func processObligationBlock() -> ProofCheckProgress? {
         logger.debug("processObligationBlock: currentBlock = \(self.currentBlock.description)")
-        guard let idString = currentBlock["id"],
-              let id = Int(idString) else {
+        guard let idString = currentBlock["id"] else {
             logger.debug("processObligationBlock: No id found in block")
+            return nil
+        }
+        guard let id = parseOrLog(idString, context: "obligation id", parser: Int.init) else {
             return nil
         }
 
@@ -368,7 +418,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
             obligations[existingIndex] = obligation
         } else {
             obligations.append(obligation)
-            totalObligations += 1
+            totalObligations = max(totalObligations, obligations.count)
         }
 
         // Update statistics for the new status
@@ -408,10 +458,20 @@ final class TLAPMOutputParser: @unchecked Sendable {
         )
 
         obligations.append(errorObligation)
-        totalObligations += 1  // Error blocks must also update totalObligations
+        totalObligations = max(totalObligations, obligations.count)
         failedCount += 1
 
         return makeProgressUpdate(latestObligation: errorObligation)
+    }
+
+    private static let multilineBlockKeys: Set<String> = ["reason", "obl", "msg"]
+
+    private func appendMultilineValue(_ line: String, to key: String) {
+        if let existing = currentBlock[key], !existing.isEmpty {
+            currentBlock[key] = existing + "\n" + line
+        } else {
+            currentBlock[key] = line
+        }
     }
 
     private func processWarningBlock() -> ProofCheckProgress? {
@@ -464,7 +524,7 @@ final class TLAPMOutputParser: @unchecked Sendable {
             return .failed
         case "trivial":
             return .trivial
-        case "checking", "proving", "pending":
+        case "checking", "proving", "pending", "to be proved":
             return .pending
         case "interrupted":
             return .pending  // Interrupted is treated as pending (can retry)
@@ -639,6 +699,7 @@ struct ProofCheckOptions: Codable, Sendable {
     var stepName: String?
     var fingerprints: Bool
     var verbose: Bool
+    var additionalLibraryPaths: [URL]?
 
     init(
         backend: ProverBackend? = nil,
@@ -648,7 +709,8 @@ struct ProofCheckOptions: Codable, Sendable {
         checkToLine: Int? = nil,
         stepName: String? = nil,
         fingerprints: Bool = true,
-        verbose: Bool = false
+        verbose: Bool = false,
+        additionalLibraryPaths: [URL] = []
     ) {
         self.backend = backend
         self.timeout = timeout
@@ -658,6 +720,7 @@ struct ProofCheckOptions: Codable, Sendable {
         self.stepName = stepName
         self.fingerprints = fingerprints
         self.verbose = verbose
+        self.additionalLibraryPaths = additionalLibraryPaths.isEmpty ? nil : additionalLibraryPaths
     }
 
     static let `default` = ProofCheckOptions()

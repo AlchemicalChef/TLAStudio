@@ -76,6 +76,18 @@ final class LineBufferTests: XCTestCase {
         XCTAssertLessThanOrEqual(buf.buffer.count, maxSize)
     }
 
+    func testOversizedPartialLineIsPreservedUntilNewline() {
+        var buf = LineBuffer(maxBufferSize: 10, compactionThreshold: 4)
+
+        let partial = String(repeating: "x", count: 20)
+        XCTAssertTrue(buf.append(partial.data(using: .utf8)!).isEmpty)
+
+        let lines = buf.append("\n".data(using: .utf8)!)
+
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(String(data: lines[0], encoding: .utf8), partial)
+    }
+
     // MARK: - Compaction
 
     func testCompactionTrigger() {

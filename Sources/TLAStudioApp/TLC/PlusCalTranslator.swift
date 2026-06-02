@@ -92,6 +92,51 @@ actor PlusCalTranslator {
         drain(handle: stdoutPipe.fileHandleForReading, into: stdoutAccumulator)
         drain(handle: stderrPipe.fileHandleForReading, into: stderrAccumulator)
 
+        // Register the java subprocess with ProcessRegistry so app shutdown (Cmd-Q)
+        // can reap it via SIGTERM → SIGKILL escalation. Without this, an in-flight
+        // `pcal.trans` JVM survives the parent and gets launchd-reparented.
+        let registrySessionId = UUID()
+
+        // Holds the timeout Task so the termination handler can cancel it once the
+        // process exits normally, preventing the Task from running its full sleep
+        // duration after we no longer care. Captured by reference so the closure
+        // can mutate it on the outer continuation's thread.
+        let timeoutTaskBox = TimeoutTaskBox()
+
+        // Whether `register()` was reached. Used by the post-continuation cleanup so we
+        // only `unregister` what was actually registered (process.run() can throw).
+        var registered = false
+
+        // Cleanup that must run regardless of how the continuation resolved (normal exit,
+        // process.run failure, or timeout-throw). Without this, a thrown timeout error
+        // would skip the unregister/pipe-drain path below.
+        defer {
+            timeoutTaskBox.cancel()
+            process.terminationHandler = nil
+            if registered {
+                if process.isRunning {
+                    // Timeout fired but the process didn't honor SIGTERM (process.terminate);
+                    // delegate to ProcessRegistry for SIGKILL escalation.
+                    ProcessRegistry.shared.terminate(registrySessionId)
+                } else {
+                    ProcessRegistry.shared.unregister(registrySessionId)
+                }
+            }
+
+            // Drain any residual bytes still buffered in the pipes before clearing handlers.
+            // readabilityHandler may not fire for data already in the kernel pipe buffer
+            // after process exit — mirrors the TLC/TLAPM pattern.
+            let lastStdout = stdoutPipe.fileHandleForReading.availableData
+            if !lastStdout.isEmpty { stdoutAccumulator.append(lastStdout) }
+            let lastStderr = stderrPipe.fileHandleForReading.availableData
+            if !lastStderr.isEmpty { stderrAccumulator.append(lastStderr) }
+
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+        }
+
         // Observe termination via the process's handler rather than polling. Resumption is
         // gated by `Atomic` semantics on the continuation so a concurrent timeout can't
         // resume twice.
@@ -99,16 +144,17 @@ actor PlusCalTranslator {
             let didResume = ResumeGuard()
 
             process.terminationHandler = { finished in
+                // Cancel the pending timeout Task — the process is done, the sleep is moot.
+                timeoutTaskBox.cancel()
                 guard didResume.tryConsume() else { return }
                 cont.resume(returning: finished.terminationStatus)
             }
 
             do {
                 try process.run()
+                ProcessRegistry.shared.register(process, for: registrySessionId)
+                registered = true
             } catch {
-                stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                stderrPipe.fileHandleForReading.readabilityHandler = nil
-                process.terminationHandler = nil
                 guard didResume.tryConsume() else { return }
                 cont.resume(throwing: error)
                 return
@@ -118,9 +164,17 @@ actor PlusCalTranslator {
 
             // If the timeout fires first, terminate the process and report the error.
             // The terminationHandler will still fire afterwards, but `didResume` prevents a
-            // double resume.
-            Task {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            // double resume. Store the Task so the termination handler can cancel it on
+            // a fast exit, and distinguish CancellationError from a real timeout.
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                } catch is CancellationError {
+                    // Process exited fast; nothing to do. Termination handler already resumed.
+                    return
+                } catch {
+                    return
+                }
                 guard didResume.tryConsume() else { return }
                 process.terminate()
                 cont.resume(throwing: NSError(
@@ -129,15 +183,38 @@ actor PlusCalTranslator {
                     userInfo: [NSLocalizedDescriptionKey: "Process timed out after \(Int(timeout)) seconds"]
                 ))
             }
+            timeoutTaskBox.set(timeoutTask)
         }
-        process.terminationHandler = nil
-
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        try? stdoutPipe.fileHandleForReading.close()
-        try? stderrPipe.fileHandleForReading.close()
 
         return (terminationStatus, stdoutAccumulator.snapshot(), stderrAccumulator.snapshot())
+    }
+
+    /// Thread-safe handle for the timeout Task so the termination handler can cancel it.
+    /// Lock-guarded because `set` is called on the continuation closure's thread while
+    /// `cancel` may fire from the process's termination thread.
+    private final class TimeoutTaskBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: Task<Void, Never>?
+        private var cancelled = false
+
+        func set(_ task: Task<Void, Never>) {
+            lock.lock()
+            defer { lock.unlock() }
+            if cancelled {
+                task.cancel()
+            } else {
+                self.task = task
+            }
+        }
+
+        func cancel() {
+            lock.lock()
+            let task = self.task
+            self.task = nil
+            cancelled = true
+            lock.unlock()
+            task?.cancel()
+        }
     }
 
     /// Single-shot resume token used to prevent CheckedContinuation from being resumed twice

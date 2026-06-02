@@ -11,7 +11,16 @@ struct LineBuffer {
     private(set) var buffer = Data()
     private(set) var bufferOffset: Int = 0
 
-    /// Maximum allowed buffer size before truncation
+    /// Best-effort compaction trigger.
+    ///
+    /// When `buffer.count + incoming.count` would exceed this size AND some prefix
+    /// has already been consumed (`bufferOffset > 0`), the buffer is compacted to
+    /// drop the consumed prefix before appending. This is intentionally a soft
+    /// limit, not a hard cap: an in-progress single line that has not yet seen a
+    /// `\n` will be preserved even if it exceeds this size, because TLC can emit
+    /// a multi-megabyte JSON trace as one line and losing the prefix would render
+    /// the whole trace unparsable. Callers needing a hard byte ceiling must
+    /// enforce it externally.
     let maxBufferSize: Int
 
     /// Compact when consumed portion exceeds this threshold
@@ -22,11 +31,12 @@ struct LineBuffer {
     /// Returns an array of complete line `Data` segments (without the `\n` delimiter).
     /// Any incomplete trailing line remains in the buffer for the next call.
     mutating func append(_ data: Data) -> [Data] {
-        // Check buffer size BEFORE appending to prevent unbounded growth
-        if buffer.count + data.count > maxBufferSize {
-            // Keep last compactionThreshold bytes to avoid losing partial line at end
-            let keepBytes = min(buffer.count, compactionThreshold)
-            buffer = Data(buffer.suffix(keepBytes))
+        // Best-effort compaction: drop the already-consumed prefix when the buffer
+        // would otherwise exceed `maxBufferSize`. Intentionally does NOT truncate
+        // an active partial line — TLC can emit a large JSON trace as one line and
+        // losing the prefix makes the whole trace unparsable. See `maxBufferSize`.
+        if buffer.count + data.count > maxBufferSize, bufferOffset > 0 {
+            buffer = Data(buffer[bufferOffset...])
             bufferOffset = 0
         }
 

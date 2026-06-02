@@ -21,17 +21,22 @@ final class OutputManager: ObservableObject {
         let source: OutputSource
         let message: String
         let isError: Bool
-        let formattedTimestamp: String
 
         init(timestamp: Date, source: OutputSource, message: String, isError: Bool) {
             self.timestamp = timestamp
             self.source = source
             self.message = message
             self.isError = isError
-            self.formattedTimestamp = Self.formatTimestamp(timestamp)
         }
 
-        private static func formatTimestamp(_ timestamp: Date) -> String {
+        /// Format the timestamp at render time rather than at init time. Entries
+        /// trimmed by `maxEntries` or never displayed (Output panel collapsed) no
+        /// longer pay the Calendar lookup cost. See audit F-GAP08-001.
+        var formattedTimestamp: String {
+            Self.formatTimestamp(timestamp)
+        }
+
+        static func formatTimestamp(_ timestamp: Date) -> String {
             let components = Calendar.current.dateComponents([.hour, .minute, .second], from: timestamp)
             return String(
                 format: "%02d:%02d:%02d",
@@ -118,25 +123,34 @@ final class OutputManager: ObservableObject {
         logLines(messages, source: source, isError: isError)
     }
 
-    /// Clear all entries
+    /// Clear all entries.
+    ///
+    /// Routes both the pending-entry clear AND the published-entry clear through
+    /// the same serial queue path used by `flushBatch`, so any in-flight
+    /// `addEntries(_:)` dispatched to main BEFORE `clear()` was called will
+    /// FIFO-order before the clear's main-queue removal. Mutating `entries`
+    /// synchronously here would otherwise let the previously-enqueued
+    /// `addEntries` resurrect entries after the user clicked Clear.
+    /// See audit F-GAP01-001.
     func clear() {
         queue.async { [weak self] in
-            self?.pendingEntries.removeAll(keepingCapacity: true)
-        }
-
-        updateEntries { entries in
-            entries.removeAll()
+            guard let self else { return }
+            self.pendingEntries.removeAll(keepingCapacity: true)
+            DispatchQueue.main.async { [weak self] in
+                self?.entries.removeAll()
+            }
         }
     }
 
-    /// Clear entries from a specific source
+    /// Clear entries from a specific source. Same FIFO-ordering guarantee as
+    /// `clear()`. See audit F-GAP01-001.
     func clear(source: OutputSource) {
         queue.async { [weak self] in
-            self?.pendingEntries.removeAll { $0.source == source }
-        }
-
-        updateEntries { entries in
-            entries.removeAll { $0.source == source }
+            guard let self else { return }
+            self.pendingEntries.removeAll { $0.source == source }
+            DispatchQueue.main.async { [weak self] in
+                self?.entries.removeAll { $0.source == source }
+            }
         }
     }
 
@@ -191,16 +205,6 @@ final class OutputManager: ObservableObject {
         }
     }
 
-    private func updateEntries(_ update: @escaping (inout [OutputEntry]) -> Void) {
-        if Thread.isMainThread {
-            update(&entries)
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                update(&self.entries)
-            }
-        }
-    }
 }
 
 // MARK: - Convenience Extensions

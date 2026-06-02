@@ -12,15 +12,23 @@ final class FoldingGutterOverlay: NSView {
     private weak var foldingManager: CodeFoldingManager?
     private var trackingArea: NSTrackingArea?
     private var hoveredLine: Int?
+    /// Either the shared per-document line index (preferred) or a self-owned fallback.
+    /// See audit F-S6-editor-perf-006.
+    private let sharedLineIndex: SharedTextLineIndex?
+    private var localLineStartOffsets: [Int] = [0]
+    private var lineStartOffsets: [Int] {
+        sharedLineIndex?.offsets ?? localLineStartOffsets
+    }
 
     private let indicatorWidth: CGFloat = 12
     private let indicatorSize: CGFloat = 9
 
     // MARK: - Initialization
 
-    init(textView: NSTextView, foldingManager: CodeFoldingManager) {
+    init(textView: NSTextView, foldingManager: CodeFoldingManager, sharedLineIndex: SharedTextLineIndex? = nil) {
         self.textView = textView
         self.foldingManager = foldingManager
+        self.sharedLineIndex = sharedLineIndex
         super.init(frame: .zero)
 
         wantsLayer = true
@@ -29,6 +37,9 @@ final class FoldingGutterOverlay: NSView {
         // computed at stale Y positions (e.g. during a bottom-panel resize) can leak
         // outside the editor region and render over the bottom bar.
         layer?.masksToBounds = true
+        if sharedLineIndex == nil {
+            rebuildTextLineIndex()
+        }
 
         // Observe text changes
         NotificationCenter.default.addObserver(
@@ -80,10 +91,22 @@ final class FoldingGutterOverlay: NSView {
     // MARK: - Notifications
 
     @objc private func textDidChange(_ notification: Notification) {
+        // If a shared index owns recomputation, the owner (EditorContainerView)
+        // invalidates it; we only refresh our local fallback.
+        if sharedLineIndex == nil {
+            rebuildTextLineIndex()
+        }
         needsDisplay = true
     }
 
     @objc private func scrollDidChange(_ notification: Notification) {
+        needsDisplay = true
+    }
+
+    func refreshTextLineIndex() {
+        if sharedLineIndex == nil {
+            rebuildTextLineIndex()
+        }
         needsDisplay = true
     }
 
@@ -121,34 +144,31 @@ final class FoldingGutterOverlay: NSView {
     private func lineAtPoint(_ point: NSPoint) -> Int? {
         guard let textView = textView,
               let layoutManager = textView.layoutManager,
-              let textContainer = textView.textContainer else {
+              let textContainer = textView.textContainer,
+              layoutManager.numberOfGlyphs > 0,
+              !lineStartOffsets.isEmpty else {
             return nil
         }
 
         let scrollView = textView.enclosingScrollView
         let visibleRect = scrollView?.documentVisibleRect ?? textView.visibleRect
+        let containerOrigin = textView.textContainerOrigin
 
-        let text = textView.string
-        let lines = text.components(separatedBy: "\n")
-        var charOffset = 0
+        let textPoint = NSPoint(
+            x: point.x + visibleRect.minX - containerOrigin.x,
+            y: point.y + visibleRect.minY - containerOrigin.y
+        )
+        var fraction: CGFloat = 0
+        let glyphIndex = layoutManager.glyphIndex(
+            for: textPoint,
+            in: textContainer,
+            fractionOfDistanceThroughGlyph: &fraction
+        )
+        guard glyphIndex < layoutManager.numberOfGlyphs else { return nil }
 
-        for (lineIndex, line) in lines.enumerated() {
-            let lineRange = NSRange(location: charOffset, length: max(1, line.count))
-            let glyphRange = layoutManager.glyphRange(forCharacterRange: lineRange, actualCharacterRange: nil)
-
-            if glyphRange.location != NSNotFound {
-                var lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-                lineRect.origin.y += textView.textContainerInset.height - visibleRect.minY
-
-                if point.y >= lineRect.minY && point.y < lineRect.maxY {
-                    return lineIndex
-                }
-            }
-
-            charOffset += line.count + 1
-        }
-
-        return nil
+        let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+        let clampedIndex = max(0, min(charIndex, (textView.string as NSString).length))
+        return TextCoordinateMapper.lineIndex(forUTF16Offset: clampedIndex, in: lineStartOffsets)
     }
 
     // MARK: - Drawing
@@ -167,28 +187,51 @@ final class FoldingGutterOverlay: NSView {
 
         let scrollView = textView.enclosingScrollView
         let visibleRect = scrollView?.documentVisibleRect ?? textView.visibleRect
+        let containerOrigin = textView.textContainerOrigin
 
         let text = textView.string
-        let lines = text.components(separatedBy: "\n")
+        let nsText = text as NSString
+        guard !lineStartOffsets.isEmpty, nsText.length > 0 else { return }
+
+        let textContainerVisibleRect = NSRect(
+            x: visibleRect.minX - containerOrigin.x,
+            y: visibleRect.minY - containerOrigin.y,
+            width: visibleRect.width,
+            height: visibleRect.height
+        )
+        let visibleGlyphRange = layoutManager.glyphRange(forBoundingRect: textContainerVisibleRect, in: textContainer)
+        guard visibleGlyphRange.location != NSNotFound else { return }
+
+        let visibleCharacterRange = layoutManager.characterRange(
+            forGlyphRange: visibleGlyphRange,
+            actualGlyphRange: nil
+        )
+        let firstVisibleLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: visibleCharacterRange.location,
+            in: lineStartOffsets
+        )
+        let lastVisibleOffset = max(
+            visibleCharacterRange.location,
+            min(NSMaxRange(visibleCharacterRange), nsText.length) - 1
+        )
+        let lastVisibleLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: lastVisibleOffset,
+            in: lineStartOffsets
+        )
 
         // Draw fold indicators for visible lines
         for range in foldingManager.foldingRanges {
             // Skip if not visible
-            guard range.startLine < lines.count else { continue }
-
-            // Calculate line position
-            var charOffset = 0
-            for i in 0..<range.startLine {
-                charOffset += lines[i].count + 1
-            }
-
-            let lineRange = NSRange(location: charOffset, length: max(1, lines[range.startLine].count))
-            let glyphRange = layoutManager.glyphRange(forCharacterRange: lineRange, actualCharacterRange: nil)
-
-            guard glyphRange.location != NSNotFound else { continue }
-
-            var lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-            lineRect.origin.y += textView.textContainerInset.height - visibleRect.minY
+            guard range.startLine >= firstVisibleLine - 1,
+                  range.startLine <= lastVisibleLine + 1,
+                  let lineRect = lineRect(
+                    forZeroBasedLine: range.startLine,
+                    nsText: nsText,
+                    layoutManager: layoutManager,
+                    textContainer: textContainer,
+                    containerOrigin: containerOrigin,
+                    visibleRect: visibleRect
+                  ) else { continue }
 
             // Skip if outside visible area
             if lineRect.maxY < dirtyRect.minY || lineRect.minY > dirtyRect.maxY {
@@ -237,6 +280,44 @@ final class FoldingGutterOverlay: NSView {
         let color = isHovered ? NSColor.labelColor : NSColor.secondaryLabelColor
         color.setFill()
         path.fill()
+    }
+
+    private func rebuildTextLineIndex() {
+        guard let textView else {
+            localLineStartOffsets = [0]
+            return
+        }
+        localLineStartOffsets = TextCoordinateMapper.lineStartOffsets(in: textView.string)
+    }
+
+    private func lineRect(
+        forZeroBasedLine line: Int,
+        nsText: NSString,
+        layoutManager: NSLayoutManager,
+        textContainer: NSTextContainer,
+        containerOrigin: NSPoint,
+        visibleRect: NSRect
+    ) -> NSRect? {
+        guard line >= 0, line < lineStartOffsets.count else { return nil }
+
+        let lineStart = min(lineStartOffsets[line], nsText.length)
+        guard lineStart < nsText.length else { return nil }
+
+        let lineRange = nsText.lineRange(for: NSRange(location: lineStart, length: 0))
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: lineRange,
+            actualCharacterRange: nil
+        )
+        guard glyphRange.location != NSNotFound,
+              glyphRange.location < layoutManager.numberOfGlyphs else { return nil }
+
+        let rect = layoutManager.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: nil)
+        return NSRect(
+            x: rect.minX + containerOrigin.x - visibleRect.minX,
+            y: rect.minY + containerOrigin.y - visibleRect.minY,
+            width: rect.width,
+            height: rect.height
+        )
     }
 }
 

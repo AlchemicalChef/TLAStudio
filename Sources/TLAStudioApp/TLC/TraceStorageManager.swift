@@ -31,14 +31,20 @@ actor TraceStorageManager {
     private init() {
         // Create storage directory in app support
         // Use fallback to temp directory if app support is unavailable
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        storageDirectory = appSupport.appendingPathComponent("TLAStudio/Traces", isDirectory: true)
+        storageDirectory = Self.tracesDirectory
 
         try? FileManager.default.createDirectory(at: storageDirectory, withIntermediateDirectories: true)
 
         // Initialize LRU cache with 50 pages (5000 states max in memory)
         pageCache = LRUCache(capacity: 50)
+    }
+
+    /// Canonical on-disk location of trace files. Exposed for synchronous cleanup paths
+    /// (e.g. `applicationWillTerminate`) that cannot enter the actor.
+    nonisolated static var tracesDirectory: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return appSupport.appendingPathComponent("TLAStudio/Traces", isDirectory: true)
     }
 
     // MARK: - Public API
@@ -88,6 +94,7 @@ actor TraceStorageManager {
 
         let stateCount = handle.stateCount
         try handle.finalize()
+        handle.close()
 
         logger.info("Finalized trace with \(stateCount) states for session \(sessionId.uuidString)")
 

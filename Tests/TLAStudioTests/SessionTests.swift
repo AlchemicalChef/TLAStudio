@@ -549,6 +549,50 @@ final class ProofObligationTests: XCTestCase {
         XCTAssertEqual(updated.duration, 2.5)
         XCTAssertNil(updated.errorMessage)
     }
+
+    func testProofCheckResultFromPendingObligationIsNotSuccessful() {
+        let obligation = ProofObligation(
+            fingerprint: "pending",
+            location: ProofSourceLocation(
+                fileURL: URL(fileURLWithPath: "/tmp/test.tla"),
+                startLine: 1,
+                startColumn: 1,
+                endLine: 1,
+                endColumn: 10
+            ),
+            kind: .step,
+            status: .pending,
+            obligationText: "test"
+        )
+
+        let result = ProofCheckResult.from(obligations: [obligation], duration: 0.1)
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.provedCount, 0)
+        XCTAssertEqual(result.failedCount, 0)
+    }
+
+    func testProofCheckResultFromOmittedObligationIsNotSuccessful() {
+        let obligation = ProofObligation(
+            fingerprint: "omitted",
+            location: ProofSourceLocation(
+                fileURL: URL(fileURLWithPath: "/tmp/test.tla"),
+                startLine: 1,
+                startColumn: 1,
+                endLine: 1,
+                endColumn: 10
+            ),
+            kind: .step,
+            status: .omitted,
+            obligationText: "test"
+        )
+
+        let result = ProofCheckResult.from(obligations: [obligation], duration: 0.1)
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.provedCount, 0)
+        XCTAssertEqual(result.failedCount, 0)
+    }
 }
 
 // MARK: - Proof Source Location Tests

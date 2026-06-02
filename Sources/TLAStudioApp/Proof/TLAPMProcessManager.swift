@@ -193,11 +193,22 @@ actor TLAPMProcessManager {
         BinaryDiscovery.configuredModuleLibraryDirectories()
     }
 
-    private func appendLibrarySearchPaths(to args: inout [String], includeStdlib: Bool = true) {
+    private func appendLibrarySearchPaths(
+        to args: inout [String],
+        includeStdlib: Bool = true,
+        additionalPaths: [URL] = []
+    ) {
         var seen = Set<String>()
 
         for libraryPath in configuredModuleLibraryPaths {
             guard seen.insert(libraryPath.standardizedFileURL.path).inserted else { continue }
+            args.append("-I")
+            args.append(libraryPath.path)
+        }
+
+        for libraryPath in additionalPaths {
+            guard FileManager.default.fileExists(atPath: libraryPath.path),
+                  seen.insert(libraryPath.standardizedFileURL.path).inserted else { continue }
             args.append("-I")
             args.append(libraryPath.path)
         }
@@ -539,7 +550,8 @@ actor TLAPMProcessManager {
         column: Int,
         backend: ProverBackend? = nil,
         timeout: TimeInterval = 30,
-        sessionId: UUID = UUID()
+        sessionId: UUID = UUID(),
+        additionalLibraryPaths: [URL] = []
     ) async throws -> ProofObligation {
 
         logger.info("checkSingleStep: line=\(line), column=\(column), sessionId=\(sessionId.uuidString)")
@@ -559,7 +571,7 @@ actor TLAPMProcessManager {
         // Build arguments for single step
         var arguments: [String] = []
 
-        appendLibrarySearchPaths(to: &arguments)
+        appendLibrarySearchPaths(to: &arguments, additionalPaths: additionalLibraryPaths)
 
         // Toolbox mode with line range (check just this line)
         arguments.append("--toolbox")
@@ -709,9 +721,14 @@ actor TLAPMProcessManager {
             return obligation
         }
 
-        // If no specific obligation found, check if there's any result
-        if let firstObligation = obligations.first {
-            return firstObligation
+        let sameLineObligations = obligations.filter { obligation in
+            line >= obligation.location.startLine && line <= obligation.location.endLine
+        }
+        if let nearestObligation = sameLineObligations.min(by: { lhs, rhs in
+            distance(from: lhs.location, toLine: line, column: column) <
+                distance(from: rhs.location, toLine: line, column: column)
+        }) {
+            return nearestObligation
         }
 
         // No obligation found - create a pending one
@@ -734,6 +751,22 @@ actor TLAPMProcessManager {
             children: [],
             obligationText: ""
         )
+    }
+
+    private func distance(from location: ProofSourceLocation, toLine line: Int, column: Int) -> Int {
+        if line < location.startLine {
+            return (location.startLine - line) * 10_000 + location.startColumn
+        }
+        if line > location.endLine {
+            return (line - location.endLine) * 10_000 + location.endColumn
+        }
+        if line == location.startLine && column < location.startColumn {
+            return location.startColumn - column
+        }
+        if line == location.endLine && column > location.endColumn {
+            return column - location.endColumn
+        }
+        return 0
     }
 
     // MARK: - Process Control
@@ -846,7 +879,7 @@ actor TLAPMProcessManager {
     private func buildArguments(for options: ProofCheckOptions, specPath: String) -> [String] {
         var args: [String] = []
 
-        appendLibrarySearchPaths(to: &args)
+        appendLibrarySearchPaths(to: &args, additionalPaths: options.additionalLibraryPaths ?? [])
 
         // Toolbox mode for machine-readable output
         // --toolbox <start> <end> specifies line range (0 means start/end of file)

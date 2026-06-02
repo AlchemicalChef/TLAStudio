@@ -937,8 +937,6 @@ pub struct TLACore {
     highlight_query: Query,
     /// Pre-interned capture names for highlight queries (avoids repeated allocation)
     capture_names: Vec<String>,
-    /// Reusable query cursor (avoids allocation per query)
-    query_cursor: Mutex<QueryCursor>,
 }
 
 #[uniffi::export]
@@ -970,7 +968,6 @@ impl TLACore {
             parser: Mutex::new(parser),
             highlight_query,
             capture_names,
-            query_cursor: Mutex::new(QueryCursor::new()),
         })
     }
     
@@ -1073,19 +1070,20 @@ impl TLACore {
             return vec![];
         };
 
-        self.extract_symbols(tree.root_node(), &result.source)
+        self.extract_symbols(tree.root_node(), &result.source, 0)
     }
 
     /// Get syntax highlights for a range.
-    /// Uses a reusable QueryCursor and pre-interned capture names for performance.
+    /// Uses pre-interned capture names for performance. A per-call `QueryCursor`
+    /// avoids the contention and cross-call state risk of a shared `Mutex<QueryCursor>`.
     pub fn get_highlights(&self, result: &ParseResult, range: Range) -> Vec<HighlightToken> {
         let tree_guard = result.tree.lock();
         let Some(tree) = tree_guard.as_ref() else {
             return vec![];
         };
 
-        // Reuse the query cursor to avoid allocation per call
-        let mut cursor = self.query_cursor.lock();
+        // Per-call cursor: cheap to construct, removes inter-call lock contention.
+        let mut cursor = QueryCursor::new();
         cursor.set_point_range(
             tree_sitter::Point {
                 row: range.start.line as usize,
@@ -1270,14 +1268,22 @@ impl TLACore {
 // Private helper methods (not exported via FFI)
 impl TLACore {
     fn extract_diagnostics(&self, tree: &Tree, _source: &str) -> Vec<Diagnostic> {
+        // Cap the diagnostic count so pathological inputs (or tree-sitter error storms)
+        // cannot grow the FFI-copied Vec unbounded per keystroke. The sibling
+        // `get_detailed_completions` uses the same defensive-cap pattern.
+        const MAX_DIAGNOSTICS: usize = 1000;
+
         let mut diagnostics = vec![];
         let mut cursor = tree.walk();
-        
+
         // Find ERROR and MISSING nodes
         loop {
             let node = cursor.node();
-            
+
             if node.is_error() || node.is_missing() {
+                if diagnostics.len() >= MAX_DIAGNOSTICS {
+                    break;
+                }
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
@@ -1298,23 +1304,52 @@ impl TLACore {
                     code: None,
                 });
             }
-            
+
             // Traverse tree
             if cursor.goto_first_child() {
                 continue;
             }
             while !cursor.goto_next_sibling() {
                 if !cursor.goto_parent() {
+                    // Tree fully walked without hitting the cap.
                     return diagnostics;
                 }
             }
         }
+
+        // Reached only when the cap was hit (loop `break`).
+        diagnostics.push(Self::truncation_diagnostic(MAX_DIAGNOSTICS));
+        diagnostics
+    }
+
+    /// Synthetic diagnostic appended when `extract_diagnostics` hits its cap.
+    fn truncation_diagnostic(limit: usize) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position { line: 0, column: 0 },
+                end: Position { line: 0, column: 0 },
+            },
+            severity: DiagnosticSeverity::Information,
+            message: format!(
+                "Too many syntax errors ({} shown); further messages suppressed.",
+                limit
+            ),
+            code: None,
+        }
     }
     
-    fn extract_symbols(&self, node: tree_sitter::Node, source: &str) -> Vec<Symbol> {
+    /// Recursion depth limit for `extract_symbols`. Realistic TLA+ specs stay
+    /// well under this; a hostile file with thousands of nested constructs
+    /// would otherwise overflow the thread stack (Darwin aborts uncatchably).
+    const EXTRACT_SYMBOLS_MAX_DEPTH: u32 = 256;
+
+    fn extract_symbols(&self, node: tree_sitter::Node, source: &str, depth: u32) -> Vec<Symbol> {
         let mut symbols = vec![];
+        if depth >= Self::EXTRACT_SYMBOLS_MAX_DEPTH {
+            return symbols;
+        }
         let mut cursor = node.walk();
-        
+
         for child in node.children(&mut cursor) {
             match child.kind() {
                 "module" => {
@@ -1325,7 +1360,7 @@ impl TLACore {
                             kind: SymbolKind::Module,
                             range: self.node_range(&child),
                             selection_range: Some(self.node_range(&name_node)),
-                            children: self.extract_symbols(child, source),
+                            children: self.extract_symbols(child, source, depth + 1),
                             parameters: vec![],
                         });
                     }
@@ -1412,11 +1447,11 @@ impl TLACore {
                 }
                 _ => {
                     // Recurse into other nodes
-                    symbols.extend(self.extract_symbols(child, source));
+                    symbols.extend(self.extract_symbols(child, source, depth + 1));
                 }
             }
         }
-        
+
         symbols
     }
     
@@ -1484,13 +1519,24 @@ impl TLACore {
             return CompletionContext::AfterInstance;
         }
 
-        // Check for proof context - look at surrounding lines (limited to 200 lines for performance)
-        let lines: Vec<&str> = source.lines().collect();
+        // Check for proof context - look at surrounding lines (limited to 200 lines for performance).
+        // Avoid collecting all lines into a Vec; only the bounded backward window is needed.
+        const PROOF_LOOKBACK: usize = 200;
+        let proof_min_row = point.row.saturating_sub(PROOF_LOOKBACK);
+        let mut window: Vec<&str> = source
+            .split('\n')
+            .skip(proof_min_row)
+            .take(point.row - proof_min_row + 1)
+            .collect();
+        // `point.row` may exceed actual line count; clamp the window.
+        if window.is_empty() {
+            window.push("");
+        }
+        let start_row_in_window = window.len() - 1;
+
         let mut in_proof = false;
-        let start_row = point.row.min(lines.len().saturating_sub(1));
-        let min_row = start_row.saturating_sub(200); // Limit backward scan to 200 lines
-        for i in (min_row..=start_row).rev() {
-            let l = lines[i].trim();
+        for i in (0..=start_row_in_window).rev() {
+            let l = window[i].trim();
             if l.starts_with("PROOF") || l == "PROOF" {
                 in_proof = true;
                 break;
@@ -1520,22 +1566,25 @@ impl TLACore {
         // Check if we're at top level
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            // Check previous non-empty lines (limit to 50 lines to prevent DoS)
+            // Check previous non-empty lines (limit to 50 lines to prevent DoS).
+            // Reuse `window` (already covers up to PROOF_LOOKBACK rows back from point.row).
             const MAX_LOOKBACK: usize = 50;
-            let min_row = point.row.saturating_sub(MAX_LOOKBACK);
-            for i in (min_row..point.row).rev() {
-                if i < lines.len() {
-                    let prev = lines[i].trim();
-                    if prev.is_empty() {
-                        continue;
-                    }
-                    // If previous line ends with definition continuation, we're in expression
-                    if prev.ends_with("/\\") || prev.ends_with("\\/") || prev.ends_with("THEN")
-                       || prev.ends_with("ELSE") || prev.ends_with("->") || prev.ends_with(",") {
-                        return CompletionContext::InExpression;
-                    }
-                    break;
+            let lookback_min_row = point.row.saturating_sub(MAX_LOOKBACK);
+            // Translate absolute row to window index: row r maps to window index
+            // `r - proof_min_row` whenever r >= proof_min_row.
+            let lookback_start = lookback_min_row.saturating_sub(proof_min_row);
+            let lookback_end = start_row_in_window; // exclusive upper bound below
+            for i in (lookback_start..lookback_end).rev() {
+                let prev = window[i].trim();
+                if prev.is_empty() {
+                    continue;
                 }
+                // If previous line ends with definition continuation, we're in expression
+                if prev.ends_with("/\\") || prev.ends_with("\\/") || prev.ends_with("THEN")
+                   || prev.ends_with("ELSE") || prev.ends_with("->") || prev.ends_with(",") {
+                    return CompletionContext::InExpression;
+                }
+                break;
             }
             return CompletionContext::TopLevel;
         }

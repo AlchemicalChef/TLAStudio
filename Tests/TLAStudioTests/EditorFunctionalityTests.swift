@@ -86,6 +86,16 @@ final class EditorFunctionalityTests: XCTestCase {
     }
 
     @MainActor
+    func testWordAtPositionMultilineUnicode() {
+        let content = "---- MODULE Test ----\n🙂counter == 1\n===="
+        let position = TLAPosition(line: 1, column: 2)
+
+        let word = TLACoreWrapper.shared.wordAt(position: position, in: content)
+
+        XCTAssertEqual(word, "counter")
+    }
+
+    @MainActor
     func testFindDefinitionInSymbols() {
         let symbols = [
             TLASymbol(name: "Init", kind: .operator, range: TLARange(

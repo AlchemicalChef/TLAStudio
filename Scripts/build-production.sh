@@ -417,6 +417,8 @@ build_rust_core() {
     # Build release version
     log_info "Compiling TLACore..."
     cargo build --release --target aarch64-apple-darwin
+    mkdir -p target/release
+    cp target/aarch64-apple-darwin/release/libtla_core.dylib target/release/libtla_core.dylib
 
     log_success "TLACore built"
 

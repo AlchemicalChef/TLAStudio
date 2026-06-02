@@ -14,6 +14,7 @@ public final class TLASourceEditor: NSTextView {
         public var theme: SyntaxTheme = .default
         public var showLineNumbers: Bool = true
         public var tabWidth: Int = 4
+        public var insertSpacesForTabs: Bool = true
         public var showInvisibles: Bool = false
         public var lineHeight: CGFloat = 1.4
         public var insertionPointWidth: CGFloat = 2.0
@@ -211,9 +212,10 @@ public final class TLASourceEditor: NSTextView {
     // MARK: - Tab Handling
 
     public override func insertTab(_ sender: Any?) {
-        // Insert spaces instead of tab
-        let spaces = String(repeating: " ", count: configuration.tabWidth)
-        insertText(spaces, replacementRange: selectedRange())
+        let text = configuration.insertSpacesForTabs
+            ? String(repeating: " ", count: configuration.tabWidth)
+            : "\t"
+        insertText(text, replacementRange: selectedRange())
     }
 
     public override func insertBacktab(_ sender: Any?) {
@@ -318,9 +320,11 @@ public class LineNumberRulerView: NSRulerView {
 
     private weak var textView: NSTextView?
 
-    // Cache line offsets for efficient line number calculation
+    // Cache line offsets for efficient line number calculation.
+    // Invalidation is driven exclusively by `textDidChange`; no need to compare
+    // against a stored copy of the previous text on every paint. See audit
+    // F-S6-editor-perf-003.
     private var cachedLineOffsets: [Int]?
-    private var cachedText: String = ""
 
     public init(textView: NSTextView) {
         self.textView = textView
@@ -384,9 +388,10 @@ public class LineNumberRulerView: NSRulerView {
         needsDisplay = true
     }
 
-    /// Get cached line offsets, computing if needed
+    /// Get cached line offsets, computing if needed.
+    /// Invalidation is driven by `textDidChange`; we never re-compare text here.
     private func getLineOffsets(for text: String) -> [Int] {
-        if let cached = cachedLineOffsets, text == cachedText {
+        if let cached = cachedLineOffsets {
             return cached
         }
 
@@ -399,7 +404,6 @@ public class LineNumberRulerView: NSRulerView {
         }
 
         cachedLineOffsets = offsets
-        cachedText = text
         return offsets
     }
 

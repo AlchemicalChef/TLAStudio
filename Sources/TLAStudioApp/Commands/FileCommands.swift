@@ -140,7 +140,7 @@ struct ViewCommands: Commands {
                 guard let document = activeTLADocument() else { return }
                 NotificationCenter.default.post(name: .goToLine, object: document)
             }
-            .keyboardShortcut("g", modifiers: .command)
+            .keyboardShortcut("l", modifiers: .command)
 
             Divider()
 

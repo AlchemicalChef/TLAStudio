@@ -170,41 +170,76 @@ final class IsabelleDownloader: ObservableObject {
         logger.info("Starting Isabelle download from: \(Self.downloadURL)")
 
         let session = URLSession(configuration: .default)
-        let task = session.downloadTask(with: Self.downloadURL) { [weak self] tempURL, response, error in
-            Task { @MainActor in
-                guard let self = self else { return }
+        let task = session.downloadTask(with: Self.downloadURL) { [weak self] tempURL, _, error in
+            // URLSession deletes `tempURL` as soon as this handler returns. Any work that
+            // needs the file (SHA-256 verify + extract) MUST happen synchronously here, or
+            // the file must first be moved out from under URLSession's control. We do the
+            // latter so the verify/extract path can stay on the MainActor.
 
-                if let error = error {
+            if let error = error {
+                Task { @MainActor in
+                    guard let self = self else { return }
                     if (error as NSError).code == NSURLErrorCancelled {
                         self.state = .notInstalled
                     } else {
                         self.state = .error("Download failed: \(error.localizedDescription)")
                         logger.error("Isabelle download failed: \(error.localizedDescription)")
                     }
-                    return
                 }
+                return
+            }
 
-                guard let tempURL = tempURL else {
-                    self.state = .error("Download failed: No file received")
+            guard let tempURL = tempURL else {
+                Task { @MainActor in
+                    self?.state = .error("Download failed: No file received")
+                }
+                return
+            }
+
+            // Stage the temp file into a private location we control before URLSession
+            // reclaims it. Synchronous FileManager calls are safe here (delegate queue).
+            let stagingURL: URL
+            do {
+                let fm = FileManager.default
+                let stagingDir = fm.temporaryDirectory.appendingPathComponent("TLA+ Studio", isDirectory: true)
+                try fm.createDirectory(
+                    at: stagingDir,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                stagingURL = stagingDir.appendingPathComponent("isabelle-download-\(UUID().uuidString).tar.gz")
+                try fm.moveItem(at: tempURL, to: stagingURL)
+            } catch {
+                logger.error("Failed to stage Isabelle download: \(error.localizedDescription)")
+                Task { @MainActor in
+                    self?.state = .error("Failed to stage download: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            Task { @MainActor in
+                guard let self = self else {
+                    // We took ownership of the staged file when self was alive but is now gone.
+                    try? FileManager.default.removeItem(at: stagingURL)
                     return
                 }
 
                 // Verify archive integrity before extraction
                 do {
-                    guard try self.verifySHA256(of: tempURL) else {
+                    guard try self.verifySHA256(of: stagingURL) else {
                         self.state = .error("Download integrity check failed: SHA-256 hash mismatch. The download may be corrupted or tampered with.")
-                        try? FileManager.default.removeItem(at: tempURL)
+                        try? FileManager.default.removeItem(at: stagingURL)
                         return
                     }
                     logger.info("SHA-256 verification passed")
                 } catch {
                     self.state = .error("Failed to verify download integrity: \(error.localizedDescription)")
-                    try? FileManager.default.removeItem(at: tempURL)
+                    try? FileManager.default.removeItem(at: stagingURL)
                     return
                 }
 
-                // Extract the archive
-                await self.extractArchive(from: tempURL)
+                // Extract the archive (clean up the staged file on the way through).
+                await self.extractArchive(from: stagingURL)
             }
         }
 
@@ -239,16 +274,24 @@ final class IsabelleDownloader: ObservableObject {
 
         logger.info("Extracting Isabelle archive...")
 
-        do {
-            let fileManager = FileManager.default
+        let fileManager = FileManager.default
+        let targetDir = isabellePath
+        // Sibling backup path so we can atomically swap on success or restore on
+        // failure. Previously the existing install was deleted before extraction;
+        // any throw (validation, disk full, etc.) left the user with no install.
+        let backupDir = targetDir.deletingLastPathComponent()
+            .appendingPathComponent(".isabelle.backup-\(UUID().uuidString)", isDirectory: true)
+        var backupExists = false
 
+        do {
             // Create install directory
             try fileManager.createDirectory(at: installDirectory, withIntermediateDirectories: true)
 
-            // Remove existing Isabelle if present
-            let targetDir = isabellePath
+            // Rename existing Isabelle (if present) to a backup name. This preserves
+            // the working install in case extraction fails partway through.
             if fileManager.fileExists(atPath: targetDir.path) {
-                try fileManager.removeItem(at: targetDir)
+                try fileManager.moveItem(at: targetDir, to: backupDir)
+                backupExists = true
             }
 
             // Extract using SafeArchiveExtractor (validates paths and prevents symlink attacks)
@@ -257,21 +300,44 @@ final class IsabelleDownloader: ObservableObject {
             // Rename extracted directory to "isabelle"
             let contents = try fileManager.contentsOfDirectory(at: installDirectory, includingPropertiesForKeys: nil)
             if let extractedDir = contents.first(where: { $0.lastPathComponent.hasPrefix("Isabelle") }) {
+                // `installDirectory` now contains only the freshly extracted dir
+                // (backup lives at a sibling path), so no destination collision.
                 try fileManager.moveItem(at: extractedDir, to: targetDir)
+            }
+
+            // Verify installation BEFORE deleting the backup, so a malformed archive
+            // that happens to validate path-wise still rolls back cleanly.
+            guard fileManager.isExecutableFile(atPath: isabelleBinaryPath.path) else {
+                throw NSError(
+                    domain: "IsabelleDownloader", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Installation verification failed (isabelle binary missing or not executable)"]
+                )
+            }
+
+            // Commit: delete the backup now that the new install is verified.
+            if backupExists {
+                try? fileManager.removeItem(at: backupDir)
             }
 
             // Clean up temp file
             try? fileManager.removeItem(at: tempURL)
 
-            // Verify installation
-            if fileManager.isExecutableFile(atPath: isabelleBinaryPath.path) {
-                state = .installed(path: targetDir.path)
-                logger.info("Isabelle installed successfully at: \(targetDir.path)")
-            } else {
-                state = .error("Installation verification failed")
-            }
-
+            state = .installed(path: targetDir.path)
+            logger.info("Isabelle installed successfully at: \(targetDir.path)")
         } catch {
+            // Roll back: if we had a working install, restore it; otherwise leave a
+            // clean slate for retry.
+            if backupExists {
+                if fileManager.fileExists(atPath: targetDir.path) {
+                    try? fileManager.removeItem(at: targetDir)
+                }
+                do {
+                    try fileManager.moveItem(at: backupDir, to: targetDir)
+                    logger.info("Restored previous Isabelle install after failed update")
+                } catch {
+                    logger.error("Failed to restore Isabelle backup: \(error.localizedDescription)")
+                }
+            }
             state = .error("Extraction failed: \(error.localizedDescription)")
             logger.error("Isabelle extraction failed: \(error.localizedDescription)")
         }

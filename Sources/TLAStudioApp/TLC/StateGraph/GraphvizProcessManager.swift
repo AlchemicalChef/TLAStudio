@@ -64,8 +64,21 @@ actor GraphvizProcessManager {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
-        // Ensure file handles are closed to prevent resource leaks
+        // Track this render with ProcessRegistry so app-quit / cancellation can reap
+        // the `dot` subprocess. SIGTERM-only escalation on timeout cannot guarantee a
+        // wedged dot exits; ProcessRegistry handles SIGTERM → SIGKILL.
+        let registrySessionId = UUID()
+
+        // Ensure file handles are closed and any still-running dot is reaped.
+        // - Cancellation (CancellationError from Task.sleep) flows through here.
+        // - Normal exit also flows here; ProcessRegistry.terminate is a no-op for a
+        //   process that has already exited.
         defer {
+            if process.isRunning {
+                ProcessRegistry.shared.terminate(registrySessionId)
+            } else {
+                ProcessRegistry.shared.unregister(registrySessionId)
+            }
             try? outputPipe.fileHandleForReading.close()
             try? errorPipe.fileHandleForReading.close()
         }
@@ -73,6 +86,7 @@ actor GraphvizProcessManager {
         // Start process
         do {
             try process.run()
+            ProcessRegistry.shared.register(process, for: registrySessionId)
         } catch {
             throw GraphvizError.failedToStart(error)
         }
@@ -114,7 +128,11 @@ actor GraphvizProcessManager {
             if Date().timeIntervalSince(startTime) > timeoutSeconds {
                 outputHandle.readabilityHandler = nil
                 errorHandle.readabilityHandler = nil
-                process.terminate()
+                // Delegate teardown to ProcessRegistry — it issues SIGTERM, briefly waits,
+                // then escalates to SIGKILL. Bare process.terminate() (SIGTERM-only) can
+                // be ignored by a wedged dot. The defer above will see !isRunning and
+                // simply unregister.
+                ProcessRegistry.shared.terminate(registrySessionId)
                 throw GraphvizError.renderingFailed("Process timed out after \(Int(timeoutSeconds / 60)) minutes")
             }
             try await Task.sleep(nanoseconds: 100_000_000) // 100ms
@@ -174,14 +192,24 @@ actor GraphvizProcessManager {
         process.standardOutput = outputPipe
         process.standardError = errorPipe  // dot -V writes to stderr
 
-        // Ensure file handles are closed
+        // Track this probe with ProcessRegistry so a stalled `dot -V` (rare, but possible
+        // on a wedged install) is reaped at quit time via SIGTERM → SIGKILL escalation.
+        let registrySessionId = UUID()
+
+        // Ensure file handles are closed and any still-running dot is reaped.
         defer {
+            if process.isRunning {
+                ProcessRegistry.shared.terminate(registrySessionId)
+            } else {
+                ProcessRegistry.shared.unregister(registrySessionId)
+            }
             try? outputPipe.fileHandleForReading.close()
             try? errorPipe.fileHandleForReading.close()
         }
 
         do {
             try process.run()
+            ProcessRegistry.shared.register(process, for: registrySessionId)
         } catch {
             throw GraphvizError.failedToStart(error)
         }
@@ -191,7 +219,8 @@ actor GraphvizProcessManager {
         let startTime = Date()
         while process.isRunning {
             if Date().timeIntervalSince(startTime) > timeoutSeconds {
-                process.terminate()
+                // Delegate teardown to ProcessRegistry for SIGKILL escalation.
+                ProcessRegistry.shared.terminate(registrySessionId)
                 return "Unknown version (timeout)"
             }
             try await Task.sleep(nanoseconds: 50_000_000) // 50ms

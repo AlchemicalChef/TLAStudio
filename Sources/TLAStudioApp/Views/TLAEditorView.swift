@@ -209,8 +209,11 @@ public struct TLAEditorView: NSViewRepresentable {
         if context.coordinator.lastKnownSelection != selectedRange {
             context.coordinator.lastKnownSelection = selectedRange
 
-            // Ensure the range is valid (clamp negative values and bounds check)
-            let maxLocation = textView.string.count
+            // Ensure the range is valid (clamp negative values and bounds check).
+            // Use NSString.length (UTF-16 units, O(1)) instead of String.count (grapheme
+            // clusters, O(N)) since NSRange is measured in UTF-16 units. See audit
+            // F-S6-editor-perf-005.
+            let maxLocation = textView.textStorage?.length ?? (textView.string as NSString).length
             let clampedLocation = max(0, selectedRange.location)  // Clamp negative to 0
             let validLocation = min(clampedLocation, maxLocation)
             let validLength = max(0, min(selectedRange.length, maxLocation - validLocation))
@@ -380,20 +383,30 @@ public struct TLAEditorView: NSViewRepresentable {
 
                     // Build line offset indices for both UTF-8 (for tree-sitter) and UTF-16 (for NSString/NSRange).
                     // Tree-sitter columns are byte offsets within the line (UTF-8), but NSRange uses UTF-16 code units.
+                    // We also mark each line as ASCII-only so the per-token conversion can take a
+                    // byte-index == utf16-index fast path. See audit F-S6-editor-perf-009.
                     let utf8 = text.utf8
                     let nsText = text as NSString
 
                     // lineStartsUTF8[i] = byte offset of the start of line i in the UTF-8 view
                     // lineStartsUTF16[i] = UTF-16 offset of the start of line i in the NSString
+                    // lineIsASCII[i]    = true iff line i contains no byte >= 0x80
                     var lineStartsUTF8: [Int] = [0]
                     var lineStartsUTF16: [Int] = [0]
+                    var lineIsASCII: [Bool] = []
                     var utf16Offset = 0
+                    var currentLineIsASCII = true
                     for (byteIdx, byte) in utf8.enumerated() {
                         if byte == 0x0A {  // newline
+                            lineIsASCII.append(currentLineIsASCII)
+                            currentLineIsASCII = true
                             utf16Offset += 1
                             lineStartsUTF8.append(byteIdx + 1)
                             lineStartsUTF16.append(utf16Offset)
                         } else {
+                            if byte >= 0x80 {
+                                currentLineIsASCII = false
+                            }
                             // Count UTF-16 code units for this byte:
                             // In UTF-8: leading bytes (0xxxxxxx, 110xxxxx, 1110xxxx, 11110xxx) start a character;
                             // continuation bytes (10xxxxxx) do not.
@@ -412,12 +425,21 @@ public struct TLAEditorView: NSViewRepresentable {
                             // continuation bytes don't add to UTF-16 offset
                         }
                     }
+                    // Final line (no trailing newline)
+                    lineIsASCII.append(currentLineIsASCII)
 
                     /// Convert a tree-sitter Point (line + byte column) to a UTF-16 offset
                     func tsPointToUTF16(line: Int, byteCol: Int) -> Int? {
                         guard line < lineStartsUTF8.count, line < lineStartsUTF16.count else { return nil }
                         let lineByteStart = lineStartsUTF8[line]
                         let lineUTF16Start = lineStartsUTF16[line]
+
+                        // ASCII fast path: for ASCII-only lines, 1 byte == 1 UTF-16 code unit,
+                        // so the column equals the offset and the walk is unnecessary.
+                        // See audit F-S6-editor-perf-009.
+                        if line < lineIsASCII.count, lineIsASCII[line] {
+                            return lineUTF16Start + byteCol
+                        }
 
                         // Walk from line start, counting UTF-16 code units until we've consumed byteCol bytes
                         var bytesConsumed = 0
@@ -718,49 +740,42 @@ class FoldingGutterView: NSRulerView {
         separatorPath.lineWidth = 1
         separatorPath.stroke()
 
-        // Get visible range
+        // Migrate visible-line and line-start computation onto TextCoordinateMapper
+        // so we don't pay an O(N) Character-based `components(separatedBy:)` and
+        // per-line `count + 1` walk on every paint. See audit F-GAP06-001.
+        let text = textView.string
+        let lineStartOffsets = TextCoordinateMapper.lineStartOffsets(in: text)
+        guard !lineStartOffsets.isEmpty else { return }
+
+        let nsText = text as NSString
+
         let visibleRect = textView.visibleRect
         let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
         let characterRange = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
 
-        // Calculate visible lines
-        let text = textView.string
-        let lines = text.components(separatedBy: "\n")
-
-        var charOffset = 0
-        var visibleStartLine = 0
-        for (i, line) in lines.enumerated() {
-            if charOffset >= characterRange.location {
-                visibleStartLine = i
-                break
-            }
-            charOffset += line.count + 1
-        }
-
-        charOffset = 0
-        var visibleEndLine = lines.count - 1
-        for (i, line) in lines.enumerated() {
-            charOffset += line.count + 1
-            if charOffset >= characterRange.location + characterRange.length {
-                visibleEndLine = i
-                break
-            }
-        }
+        let visibleStartLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: characterRange.location,
+            in: lineStartOffsets
+        )
+        let lastVisibleOffset = max(
+            characterRange.location,
+            min(NSMaxRange(characterRange), nsText.length) - 1
+        )
+        let visibleEndLine = TextCoordinateMapper.lineIndex(
+            forUTF16Offset: lastVisibleOffset,
+            in: lineStartOffsets
+        )
 
         // Draw fold indicators for visible lines
         for range in foldingRanges {
             guard range.startLine >= visibleStartLine - 1 && range.startLine <= visibleEndLine + 1 else {
                 continue
             }
-
-            // Get the line rect
-            var lineCharOffset = 0
-            for i in 0..<range.startLine {
-                if i < lines.count {
-                    lineCharOffset += lines[i].count + 1
-                }
+            guard range.startLine >= 0, range.startLine < lineStartOffsets.count else {
+                continue
             }
 
+            let lineCharOffset = min(lineStartOffsets[range.startLine], nsText.length)
             let lineGlyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: lineCharOffset, length: 1), actualCharacterRange: nil)
             var lineRect = layoutManager.boundingRect(forGlyphRange: lineGlyphRange, in: textContainer)
             lineRect.origin.y += textView.textContainerInset.height
@@ -809,17 +824,18 @@ class FoldingGutterView: NSRulerView {
             return
         }
 
+        // Use TextCoordinateMapper rather than `components(separatedBy:)` + per-line
+        // `count + 1`. See audit F-GAP06-001.
         let text = textView.string
-        let lines = text.components(separatedBy: "\n")
+        let lineStartOffsets = TextCoordinateMapper.lineStartOffsets(in: text)
+        let nsText = text as NSString
 
         // Find which fold indicator was clicked
         for range in foldingRanges {
-            var lineCharOffset = 0
-            for i in 0..<range.startLine {
-                if i < lines.count {
-                    lineCharOffset += lines[i].count + 1
-                }
+            guard range.startLine >= 0, range.startLine < lineStartOffsets.count else {
+                continue
             }
+            let lineCharOffset = min(lineStartOffsets[range.startLine], nsText.length)
 
             let lineGlyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: lineCharOffset, length: 1), actualCharacterRange: nil)
             var lineRect = layoutManager.boundingRect(forGlyphRange: lineGlyphRange, in: textContainer)
@@ -845,6 +861,11 @@ class GoToDefinitionTextView: NSTextView {
     var completionProvider: ((Int) -> [String])?
     var detailedCompletionProvider: ((Int) async -> [TLADetailedCompletionItem])?
     var foldingManager: CodeFoldingManager?
+    var editorConfiguration = TLASourceEditor.Configuration() {
+        didSet {
+            applyEditorConfiguration()
+        }
+    }
 
     /// Completion controller for IntelliSense
     private(set) var intelliSenseController: CompletionController?
@@ -864,6 +885,28 @@ class GoToDefinitionTextView: NSTextView {
         if let area = trackingArea {
             removeTrackingArea(area)
         }
+    }
+
+    func applyEditorConfiguration() {
+        font = editorConfiguration.font
+
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineHeightMultiple = editorConfiguration.lineHeight
+        if let font {
+            let spaceWidth = " ".size(withAttributes: [.font: font]).width
+            paragraphStyle.defaultTabInterval = spaceWidth * CGFloat(editorConfiguration.tabWidth)
+        }
+
+        defaultParagraphStyle = paragraphStyle
+        typingAttributes[.font] = editorConfiguration.font
+        typingAttributes[.paragraphStyle] = paragraphStyle
+
+        let fullRange = NSRange(location: 0, length: (string as NSString).length)
+        if fullRange.length > 0 {
+            textStorage?.addAttribute(.paragraphStyle, value: paragraphStyle, range: fullRange)
+        }
+
+        needsDisplay = true
     }
 
     /// Set up the IntelliSense completion controller
@@ -1027,6 +1070,13 @@ class GoToDefinitionTextView: NSTextView {
         if event.keyCode == 51 {  // Backspace
             intelliSenseController?.handleBackspace()
         }
+    }
+
+    override func insertTab(_ sender: Any?) {
+        let text = editorConfiguration.insertSpacesForTabs
+            ? String(repeating: " ", count: editorConfiguration.tabWidth)
+            : "\t"
+        insertText(text, replacementRange: selectedRange())
     }
 
     // MARK: - Text Changes

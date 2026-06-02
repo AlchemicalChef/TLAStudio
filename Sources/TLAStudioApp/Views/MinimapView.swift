@@ -20,10 +20,30 @@ struct MinimapView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MinimapNSView, context: Context) {
-        nsView.content = content
-        nsView.visibleRange = visibleRange
-        nsView.diagnostics = diagnostics
-        nsView.needsDisplay = true
+        // Diff before invalidating: only mark dirty when something actually changed,
+        // and when only the viewport indicator changed, invalidate just the viewport
+        // band rather than triggering a full O(N-lines) repaint. See audit
+        // F-S4-memory-005.
+        let contentChanged = nsView.content != content
+        let diagnosticsChanged = nsView.diagnostics != diagnostics
+        let oldViewport = nsView.visibleRange
+        let viewportChanged = !NSEqualRanges(oldViewport, visibleRange)
+
+        if contentChanged {
+            nsView.content = content
+        }
+        if diagnosticsChanged {
+            nsView.diagnostics = diagnostics
+        }
+        if viewportChanged {
+            nsView.visibleRange = visibleRange
+        }
+
+        if contentChanged || diagnosticsChanged {
+            nsView.needsDisplay = true
+        } else if viewportChanged {
+            nsView.invalidateViewport(previous: oldViewport, current: visibleRange)
+        }
     }
 }
 
@@ -33,33 +53,61 @@ final class MinimapNSView: NSView {
     var content: String = "" {
         didSet {
             if content != oldValue {
-                // Invalidate cached lines when content changes
-                cachedLines = nil
+                // Invalidate cached layout when content changes
+                cachedLineMetrics = nil
                 cachedLineOffsets = nil
             }
         }
     }
     var visibleRange: NSRange = NSRange(location: 0, length: 0)
-    var diagnostics: [TLADiagnostic] = []
+    var diagnostics: [TLADiagnostic] = [] {
+        didSet {
+            if diagnostics != oldValue {
+                // Diagnostic markers live in their own band; conservatively repaint.
+                needsDisplay = true
+            }
+        }
+    }
     var onNavigate: ((Int) -> Void)?
 
     private let lineHeight: CGFloat = 2
     private let charWidth: CGFloat = 1
 
-    // Cached line splits and offsets for efficient drawing and navigation
-    private var cachedLines: [String]?
+    /// Per-line precomputed render metrics (visual width + fill color).
+    /// Built once per content change via a single Substring iteration over `content`,
+    /// avoiding the previous per-keystroke `[String]` line-split allocation.
+    /// See audit F-S4-memory-004.
+    private struct LineMetric {
+        let width: CGFloat
+        let color: NSColor
+    }
+    private var cachedLineMetrics: [LineMetric]?
     private var cachedLineOffsets: [Int]?
 
     override var isFlipped: Bool { true }
 
-    /// Get cached lines, computing and caching if needed
-    private var lines: [String] {
-        if let cached = cachedLines {
+    /// Get cached per-line draw metrics, computing and caching on miss.
+    /// One pass over `content.split(...omittingEmptySubsequences: false)` produces
+    /// both the width and the color; we never materialize `[String]`.
+    private var lineMetrics: [LineMetric] {
+        if let cached = cachedLineMetrics {
             return cached
         }
-        let computed = content.components(separatedBy: "\n")
-        cachedLines = computed
-        return computed
+        var metrics: [LineMetric] = []
+        // Reserve a rough estimate; content.count is a Character count but a good
+        // upper-bound proxy for "small" specs and a soft over-allocation for big.
+        metrics.reserveCapacity(max(16, content.count / 32))
+        let maxBarWidth = bounds.width - 4
+        for substring in content.split(separator: "\n", omittingEmptySubsequences: false) {
+            // `substring.count` is O(n) per line over Characters; but we already
+            // had to walk the line for color classification, so the cost is one
+            // amortized walk per cache build, not per draw.
+            let width = min(CGFloat(substring.count) * charWidth, maxBarWidth)
+            let color = colorForLine(substring)
+            metrics.append(LineMetric(width: width, color: color))
+        }
+        cachedLineMetrics = metrics
+        return metrics
     }
 
     /// Get cached line offsets for character position calculation
@@ -67,48 +115,69 @@ final class MinimapNSView: NSView {
         if let cached = cachedLineOffsets {
             return cached
         }
-        var offsets: [Int] = [0]
-        var offset = 0
-        for line in lines {
-            offset += line.count + 1  // +1 for newline
-            offsets.append(offset)
-        }
+        let offsets = TextCoordinateMapper.lineStartOffsets(in: content)
         cachedLineOffsets = offsets
         return offsets
     }
 
+    /// Invalidate just the viewport indicator band when only the visible range
+    /// changed. The union of the previous and current viewport rects is dirtied
+    /// so the old indicator is erased and the new one drawn, without repainting
+    /// the per-line bars or diagnostic markers.
+    func invalidateViewport(previous: NSRange, current: NSRange) {
+        let metrics = lineMetrics
+        let lineCount = metrics.count
+        guard lineCount > 0 else {
+            needsDisplay = true
+            return
+        }
+
+        // Diagnostic markers and per-line bars live in disjoint regions from the
+        // viewport rect except for the body, but repainting the union of the two
+        // viewport bands also re-fills the background and bars in that band, so we
+        // dirty the slim diagnostic strip on the right edge for the affected
+        // vertical extent too.
+        let prevRect = viewportRect(for: previous)
+        let curRect = viewportRect(for: current)
+        let union = prevRect.union(curRect)
+        // Extend to full width so diagnostic markers in the band are redrawn.
+        let fullWidthBand = NSRect(x: 0, y: union.minY, width: bounds.width, height: union.height)
+        setNeedsDisplay(fullWidthBand.insetBy(dx: -1, dy: -1))
+    }
+
+    private func viewportRect(for range: NSRange) -> NSRect {
+        let startLine = lineNumber(for: range.location)
+        let endLine = lineNumber(for: range.location + range.length)
+        let y = CGFloat(startLine) * lineHeight
+        let height = CGFloat(max(1, endLine - startLine + 1)) * lineHeight
+        return NSRect(x: 0, y: y, width: bounds.width, height: height)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        // Background
+        // Background — only fill the dirty rect rather than always the full bounds,
+        // so viewport-only invalidations stay cheap.
         NSColor.textBackgroundColor.setFill()
-        bounds.fill()
+        dirtyRect.fill()
 
-        // Use cached lines
-        let lineArray = lines
+        let metrics = lineMetrics
 
-        // Draw each line as a thin bar
-        for (index, line) in lineArray.enumerated() {
+        // Draw each line as a thin bar, clipped to dirtyRect for cheap repaints.
+        for (index, metric) in metrics.enumerated() {
             let y = CGFloat(index) * lineHeight
-            let width = min(CGFloat(line.count) * charWidth, bounds.width - 4)
+            if y + lineHeight < dirtyRect.minY { continue }
+            if y > dirtyRect.maxY { break }
 
-            if width > 0 {
-                // Determine line color based on content
-                let color = colorForLine(line, at: index)
-                color.setFill()
-
-                let lineRect = NSRect(x: 2, y: y, width: width, height: lineHeight - 0.5)
+            if metric.width > 0 {
+                metric.color.setFill()
+                let lineRect = NSRect(x: 2, y: y, width: metric.width, height: lineHeight - 0.5)
                 lineRect.fill()
             }
         }
 
         // Draw visible viewport indicator
-        let visibleStartLine = lineNumber(for: visibleRange.location)
-        let visibleEndLine = lineNumber(for: visibleRange.location + visibleRange.length)
-
-        let viewportY = CGFloat(visibleStartLine) * lineHeight
-        let viewportHeight = CGFloat(visibleEndLine - visibleStartLine + 1) * lineHeight
+        let viewportRect = self.viewportRect(for: visibleRange)
 
         NSColor.systemBlue.withAlphaComponent(0.15).setFill()
-        let viewportRect = NSRect(x: 0, y: viewportY, width: bounds.width, height: viewportHeight)
         viewportRect.fill()
 
         // Viewport border
@@ -121,6 +190,7 @@ final class MinimapNSView: NSView {
         for diagnostic in diagnostics {
             let line = Int(diagnostic.range.start.line)
             let y = CGFloat(line) * lineHeight
+            if y + lineHeight < dirtyRect.minY || y > dirtyRect.maxY { continue }
 
             let markerColor: NSColor = diagnostic.severity == .error ? .systemRed : .systemOrange
             markerColor.setFill()
@@ -144,6 +214,7 @@ final class MinimapNSView: NSView {
     private func lineNumber(for characterOffset: Int) -> Int {
         // Use binary search on cached line offsets for O(log n) lookup
         let offsets = lineOffsets
+        guard !offsets.isEmpty else { return 0 }
         var low = 0
         var high = offsets.count - 1
 
@@ -159,8 +230,15 @@ final class MinimapNSView: NSView {
         return low
     }
 
-    private func colorForLine(_ line: String, at index: Int) -> NSColor {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
+    /// Classify a line by its prefix to pick a minimap bar color.
+    /// Accepts `Substring` so we can avoid copying to `String`.
+    private func colorForLine(_ line: Substring) -> NSColor {
+        // Trim leading whitespace by skipping space/tab characters.
+        var idx = line.startIndex
+        while idx < line.endIndex, line[idx] == " " || line[idx] == "\t" {
+            idx = line.index(after: idx)
+        }
+        let trimmed = line[idx...]
 
         // Comments
         if trimmed.hasPrefix("\\*") || trimmed.hasPrefix("(*") {
@@ -168,7 +246,7 @@ final class MinimapNSView: NSView {
         }
 
         // Keywords
-        let keywords = ["MODULE", "EXTENDS", "VARIABLE", "CONSTANT", "ASSUME", "THEOREM", "PROOF", "LET", "IN"]
+        let keywords: [String] = ["MODULE", "EXTENDS", "VARIABLE", "CONSTANT", "ASSUME", "THEOREM", "PROOF", "LET", "IN"]
         for keyword in keywords {
             if trimmed.hasPrefix(keyword) {
                 return NSColor.systemPurple.withAlphaComponent(0.8)
@@ -182,6 +260,16 @@ final class MinimapNSView: NSView {
 
         // Default
         return NSColor.secondaryLabelColor.withAlphaComponent(0.4)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let widthChanged = newSize.width != frame.size.width
+        super.setFrameSize(newSize)
+        // Bar widths are clamped by bounds.width; resize invalidates them.
+        if widthChanged {
+            cachedLineMetrics = nil
+            needsDisplay = true
+        }
     }
 }
 

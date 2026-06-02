@@ -34,7 +34,27 @@ struct DOTGenerator {
             case box
             case ellipse
             case rectangle
-            case roundedBox = "box, style=rounded"
+            case roundedBox = "roundedBox"
+
+            var dotShape: String {
+                switch self {
+                case .box, .roundedBox:
+                    return "box"
+                case .ellipse:
+                    return "ellipse"
+                case .rectangle:
+                    return "rectangle"
+                }
+            }
+
+            var style: String? {
+                switch self {
+                case .roundedBox:
+                    return "rounded"
+                default:
+                    return nil
+                }
+            }
         }
     }
 
@@ -81,6 +101,7 @@ struct DOTGenerator {
         // Handle liveness loop (back-edge)
         if let loopStart = trace.loopStart,
            !trace.states.isEmpty,
+           loopStart >= 0,
            loopStart < trace.states.count {
             let lastIndex = trace.states.count - 1
             lines.append("")
@@ -101,28 +122,35 @@ struct DOTGenerator {
 
     private func nodeStyle(for state: TraceState, at index: Int, in trace: ErrorTrace) -> String {
         var styles: [String] = []
+        var styleValues: [String] = []
 
         // Determine node color based on state type
         if index == 0 {
             // Initial state - green
             styles.append("fillcolor=\"#d4edda\"")
-            styles.append("style=filled")
+            styleValues.append("filled")
         } else if index == trace.states.count - 1 && trace.loopStart == nil {
             // Final error state (non-liveness) - red
             styles.append("fillcolor=\"#f8d7da\"")
-            styles.append("style=filled")
+            styleValues.append("filled")
         } else if trace.loopStart == index {
             // Loop start state (liveness) - orange
             styles.append("fillcolor=\"#fff3cd\"")
-            styles.append("style=filled")
+            styleValues.append("filled")
         } else if index == trace.states.count - 1 && trace.loopStart != nil {
             // Last state before loop back - red
             styles.append("fillcolor=\"#f8d7da\"")
-            styles.append("style=filled")
+            styleValues.append("filled")
         }
 
         // Node shape
-        styles.append("shape=\(configuration.nodeShape.rawValue)")
+        styles.append("shape=\(configuration.nodeShape.dotShape)")
+        if let shapeStyle = configuration.nodeShape.style {
+            styleValues.append(shapeStyle)
+        }
+        if !styleValues.isEmpty {
+            styles.append("style=\"\(styleValues.joined(separator: ","))\"")
+        }
 
         return styles.joined(separator: ", ")
     }

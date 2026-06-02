@@ -606,7 +606,8 @@ public struct ProofCheckResult: Codable, Sendable {
         let failedCount = obligations.filter {
             $0.status == .failed || $0.status == .timeout
         }.count
-        let success = failedCount == 0 && errorMessages.isEmpty
+        let hasUnprovedObligations = obligations.contains { !$0.status.isSuccess }
+        let success = !hasUnprovedObligations && errorMessages.isEmpty
 
         return ProofCheckResult(
             success: success,

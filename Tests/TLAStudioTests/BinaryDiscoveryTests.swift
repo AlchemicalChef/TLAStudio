@@ -54,4 +54,67 @@ final class BinaryDiscoveryTests: TempDirectoryTestCase {
             [firstDirectory.standardizedFileURL.path, secondDirectory.standardizedFileURL.path].joined(separator: ":")
         )
     }
+
+    func testResourceFilesystemSearchFindsNestedBundleSubdirectoryExecutables() throws {
+        let nestedBin = tempDirectory
+            .appendingPathComponent("TLAStudio_TLAStudioApp.bundle")
+            .appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: nestedBin, withIntermediateDirectories: true)
+
+        let tlapm = nestedBin.appendingPathComponent("tlapm")
+        try makeFile(tlapm, executable: true)
+
+        let found = BinaryDiscovery.findUsableFileInResourceRoot(
+            tempDirectory,
+            fullName: "tlapm",
+            bundleSubdirectories: ["bin", "Provers"],
+            checkNestedBundle: true,
+            requiresExecutable: true
+        )
+
+        XCTAssertEqual(found?.standardizedFileURL.path, tlapm.standardizedFileURL.path)
+    }
+
+    func testResourceFilesystemSearchSkipsNonExecutableTools() throws {
+        let direct = tempDirectory.appendingPathComponent("tlapm")
+        try makeFile(direct, executable: false)
+
+        let bin = tempDirectory.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let executable = bin.appendingPathComponent("tlapm")
+        try makeFile(executable, executable: true)
+
+        let found = BinaryDiscovery.findUsableFileInResourceRoot(
+            tempDirectory,
+            fullName: "tlapm",
+            bundleSubdirectories: ["bin"],
+            checkNestedBundle: false,
+            requiresExecutable: true
+        )
+
+        XCTAssertEqual(found?.standardizedFileURL.path, executable.standardizedFileURL.path)
+    }
+
+    func testResourceFilesystemSearchAllowsNonExecutableJarResources() throws {
+        let jar = tempDirectory.appendingPathComponent("tla2tools.jar")
+        try makeFile(jar, executable: false)
+
+        let found = BinaryDiscovery.findUsableFileInResourceRoot(
+            tempDirectory,
+            fullName: "tla2tools.jar",
+            bundleSubdirectories: [],
+            checkNestedBundle: false,
+            requiresExecutable: false
+        )
+
+        XCTAssertEqual(found?.standardizedFileURL.path, jar.standardizedFileURL.path)
+    }
+
+    private func makeFile(_ url: URL, executable: Bool) throws {
+        try "#!/bin/sh\nexit 0\n".write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: executable ? 0o755 : 0o644],
+            ofItemAtPath: url.path
+        )
+    }
 }

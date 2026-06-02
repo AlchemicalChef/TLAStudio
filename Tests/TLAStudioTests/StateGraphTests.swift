@@ -163,6 +163,25 @@ final class DOTGeneratorTests: XCTestCase {
         XCTAssertTrue(dot.contains("#fff3cd"))
     }
 
+    func testRoundedBoxKeepsFillStyle() {
+        let trace = ErrorTrace(
+            type: .invariantViolation,
+            message: "Test",
+            states: [
+                TraceState(id: 0, action: nil, variables: [:])
+            ]
+        )
+        var config = DOTGenerator.Configuration()
+        config.nodeShape = .roundedBox
+
+        let generator = DOTGenerator(configuration: config)
+        let dot = generator.generate(from: trace)
+
+        XCTAssertTrue(dot.contains("shape=box"))
+        XCTAssertTrue(dot.contains("style=\"filled,rounded\""))
+        XCTAssertTrue(dot.contains("#d4edda"))
+    }
+
     // MARK: - Edge Cases
 
     func testEmptyTrace() {
@@ -222,6 +241,7 @@ final class CheckpointInfoTests: XCTestCase {
 
         // Create the directory
         try? FileManager.default.createDirectory(at: checkpointDir, withIntermediateDirectories: true)
+        try? "test".write(to: checkpointDir.appendingPathComponent("queue.chkpt"), atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: checkpointDir) }
 
         let info = CheckpointInfo.from(directoryURL: checkpointDir, specName: "TestSpec")
@@ -264,6 +284,7 @@ final class CheckpointInfoTests: XCTestCase {
 
         // Create directory
         try? FileManager.default.createDirectory(at: checkpointDir, withIntermediateDirectories: true)
+        try? "test".write(to: checkpointDir.appendingPathComponent("states.chkpt"), atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: checkpointDir) }
 
         let info = CheckpointInfo(

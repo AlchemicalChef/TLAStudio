@@ -20,7 +20,7 @@ struct CoverageView: View {
                 VStack(alignment: .leading) {
                     Text("Action Coverage")
                         .font(.headline)
-                    Text("\(coverage.count) actions, \(totalStates) total states")
+                    Text("\(coverage.count) actions, \(formatNumber(totalStates)) total states")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -66,7 +66,7 @@ struct CoverageView: View {
 
                 TableColumn("Coverage") { action in
                     CoverageBar(
-                        value: Double(action.distinctStates),
+                        value: Double(coverageValue(for: action)),
                         total: Double(totalStates)
                     )
                 }
@@ -77,15 +77,21 @@ struct CoverageView: View {
 
     var overallCoveragePercent: Int {
         guard totalStates > 0 else { return 0 }
-        let coveredStates = coverage.reduce(0) { $0 + $1.distinctStates }
+        let coveredStates = coverage.reduce(UInt64(0)) { $0 + coverageValue(for: $1) }
         // Each state might be covered by multiple actions, so cap at 100%
         return min(100, Int((Double(coveredStates) / Double(totalStates)) * 100))
     }
 
+    private var usesExecutionCoverageFallback: Bool {
+        coverage.contains { $0.count > 0 } && coverage.allSatisfy { $0.distinctStates == 0 }
+    }
+
+    private func coverageValue(for action: ActionCoverage) -> UInt64 {
+        usesExecutionCoverageFallback ? min(action.count, totalStates) : action.distinctStates
+    }
+
     func formatNumber(_ n: UInt64) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: n)) ?? "\(n)"
+        n.formatted()
     }
 }
 

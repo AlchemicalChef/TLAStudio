@@ -61,10 +61,6 @@ final class TLAWindowController: NSWindowController, NSWindowDelegate {
         window?.makeKey()
     }
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        true
-    }
-
     // MARK: - Setup
 
     private func setupToolbar() {
@@ -321,6 +317,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.editorConfiguration = configuration
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = !wordWrap
         textView.autoresizingMask = wordWrap ? [.width] : []
@@ -483,7 +480,9 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
     }
 
     private func syncEditorConfiguration(for textView: NSTextView) {
-        if textView.font != configuration.font {
+        if let textView = textView as? GoToDefinitionTextView {
+            textView.editorConfiguration = configuration
+        } else if textView.font != configuration.font {
             textView.font = configuration.font
         }
 
@@ -494,7 +493,11 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         }
     }
 
-    private func syncTextIfNeeded(for textView: NSTextView, coordinator: Coordinator) {
+    private func syncTextIfNeeded(
+        for textView: NSTextView,
+        in containerView: EditorContainerView,
+        coordinator: Coordinator
+    ) {
         guard coordinator.lastKnownText != text else {
             return
         }
@@ -508,6 +511,8 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         )
 
         textView.string = text
+        (textView as? GoToDefinitionTextView)?.applyEditorConfiguration()
+        containerView.refreshTextDependentGutters()
 
         NotificationCenter.default.addObserver(
             coordinator,
@@ -569,7 +574,8 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         guard let textView = containerView.scrollView.documentView as? NSTextView else { return }
 
         syncEditorConfiguration(for: textView)
-        syncTextIfNeeded(for: textView, coordinator: context.coordinator)
+        containerView.setLineNumbersVisible(configuration.showLineNumbers)
+        syncTextIfNeeded(for: textView, in: containerView, coordinator: context.coordinator)
         syncDiagnostics(for: textView, coordinator: context.coordinator)
         syncProofAnnotations(for: containerView)
         syncSelectionIfNeeded(for: textView, coordinator: context.coordinator)
@@ -603,6 +609,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         /// Cached tree-sitter highlight tokens as absolute NSRange values.
         var cachedHighlightTokens: [(NSRange, String)] = []
         var cachedHighlightText: String = ""
+        var cachedParseResult: TLAParseResult?
 
         init(_ parent: TLAEditorViewWithFindReplace) {
             self.parent = parent
@@ -772,12 +779,13 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
                 guard let self, !Task.isCancelled else { return }
 
                 do {
-                    let parseResult = try await TLACoreWrapper.shared.parse(text)
+                    let parseResult = try await TLACoreWrapper.shared.parse(text, previous: self.cachedParseResult)
                     guard !Task.isCancelled else { return }
 
                     let tokens = await TLACoreWrapper.shared.getAllHighlights(from: parseResult)
                     guard !Task.isCancelled else { return }
 
+                    self.cachedParseResult = parseResult
                     self.cachedHighlightTokens = Self.convertHighlightTokens(tokens, in: text)
                     self.cachedHighlightText = text
                     self.highlighter?.highlightImmediately()
@@ -960,6 +968,12 @@ extension TLAEditorViewWithFindReplace {
     func lineHeight(_ multiplier: CGFloat) -> TLAEditorViewWithFindReplace {
         var copy = self
         copy.configuration.lineHeight = multiplier
+        return copy
+    }
+
+    func insertSpacesForTabs(_ insertSpaces: Bool) -> TLAEditorViewWithFindReplace {
+        var copy = self
+        copy.configuration.insertSpacesForTabs = insertSpaces
         return copy
     }
 

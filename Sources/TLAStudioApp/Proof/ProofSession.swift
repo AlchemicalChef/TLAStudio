@@ -47,12 +47,19 @@ final class ProofSession: ObservableObject {
         result = nil
         obligations = []
 
-        task = Task {
+        // Capture identifiers up front so the cancellation/dealloc paths below can still
+        // emit completion notifications without dereferencing self. Pattern mirrors
+        // TLCSession.start() — see TLCProcessManager.swift:806-814.
+        let capturedSpecURL = specURL
+        let capturedOptions = options
+        let capturedSessionId = id
+
+        task = Task { @MainActor [weak self] in
             do {
                 let finalResult = try await TLAPMProcessManager.shared.startProofCheck(
-                    spec: specURL,
-                    options: options,
-                    sessionId: id
+                    spec: capturedSpecURL,
+                    options: capturedOptions,
+                    sessionId: capturedSessionId
                 ) { [weak self] progressUpdate in
                     Task { @MainActor in
                         self?.handleProgress(progressUpdate)
@@ -61,6 +68,9 @@ final class ProofSession: ObservableObject {
 
                 // Check for cancellation before updating state
                 guard !Task.isCancelled else { return }
+
+                // Guard against self being deallocated during await
+                guard let self else { return }
 
                 self.result = finalResult
                 self.obligations = finalResult.obligations
@@ -78,6 +88,9 @@ final class ProofSession: ObservableObject {
             } catch {
                 // Check for cancellation before updating state
                 guard !Task.isCancelled else { return }
+
+                // Guard against self being deallocated during await
+                guard let self else { return }
 
                 self.error = error
                 self.isRunning = false
@@ -105,20 +118,33 @@ final class ProofSession: ObservableObject {
 
         isRunning = true
         error = nil
+        result = nil
+        progress = nil
 
-        task = Task {
+        // Capture state needed by the Task body so weak self can be dereferenced lazily.
+        let capturedSpecURL = specURL
+        let capturedBackend = backend ?? options.backend
+        let capturedTimeout = options.timeout
+        let capturedSessionId = id
+        let capturedLibraryPaths = options.additionalLibraryPaths ?? []
+
+        task = Task { @MainActor [weak self] in
             do {
                 let obligation = try await TLAPMProcessManager.shared.checkSingleStep(
-                    spec: specURL,
+                    spec: capturedSpecURL,
                     line: line,
                     column: column,
-                    backend: backend ?? options.backend,
-                    timeout: options.timeout,
-                    sessionId: self.id
+                    backend: capturedBackend,
+                    timeout: capturedTimeout,
+                    sessionId: capturedSessionId,
+                    additionalLibraryPaths: capturedLibraryPaths
                 )
 
                 // Check for cancellation before updating state
                 guard !Task.isCancelled else { return }
+
+                // Guard against self being deallocated during await
+                guard let self else { return }
 
                 logger.info("checkStep: Got obligation result: \(String(describing: obligation.status))")
 
@@ -129,8 +155,12 @@ final class ProofSession: ObservableObject {
                 // Check for cancellation before updating state
                 guard !Task.isCancelled else { return }
 
+                // Guard against self being deallocated during await
+                guard let self else { return }
+
                 logger.error("checkStep: \(String(describing: error))")
                 self.error = error
+                self.result = nil
                 self.isRunning = false
             }
         }
