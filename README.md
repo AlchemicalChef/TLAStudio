@@ -160,7 +160,7 @@ which tlapm && tlapm --version
 ## Installation
 
 ### Download Release
-Download the latest `.dmg` from [Releases](https://github.com/yourusername/TLAStudio/releases).
+Download the latest `.dmg` from [Releases](https://github.com/AlchemicalChef/TLAStudio/releases).
 
 ### Build from Source
 
@@ -170,7 +170,7 @@ The production build script automatically installs all prerequisites and builds 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/TLAStudio.git
+git clone https://github.com/AlchemicalChef/TLAStudio.git
 cd TLAStudio
 
 # Run full production build (installs prereqs, builds TLC, TLAPM, etc.)
