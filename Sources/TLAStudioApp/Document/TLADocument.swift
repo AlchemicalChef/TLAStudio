@@ -603,6 +603,10 @@ final class TLADocument: NSDocument, ObservableObject {
     /// Run TLAPS proof checker on this document
     @MainActor
     func runProofCheck() {
+        // Offer to install missing proof backends the first time a proof runs. Non-blocking:
+        // the proof still proceeds with whatever backends are already present.
+        ProofSetupCoordinator.shared.maybePresentBeforeFirstProof()
+
         let specURL: URL
         do {
             specURL = try specURLForTooling()

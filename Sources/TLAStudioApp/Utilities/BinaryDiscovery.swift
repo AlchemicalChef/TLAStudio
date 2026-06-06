@@ -11,6 +11,42 @@ enum BinaryDiscovery {
 
     private static let spmBundleName = "TLAStudio_TLAStudioApp.bundle"
 
+    /// Safe replacement for SPM's generated `Bundle.module`.
+    ///
+    /// SPM's `Bundle.module` accessor only checks two paths — `Bundle.main.bundleURL`
+    /// (the `.app` root, *not* `Contents/Resources/`) and a build-time-absolute
+    /// `.build/.../<config>/` path — and calls `fatalError` if neither resolves. In a
+    /// distributed `.app`, `build-app.sh` stages the SPM bundle under
+    /// `Contents/Resources/`, so *both* of those paths miss and merely *touching*
+    /// `Bundle.module` traps the process (SIGTRAP). This never reproduces on a developer
+    /// machine because the hardcoded `.build/` path still exists there.
+    ///
+    /// This accessor probes the locations where the bundle actually lives and returns
+    /// `nil` instead of trapping, so callers can fall through to other search paths.
+    static let resourceBundle: Bundle? = {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+        if let resources = Bundle.main.resourceURL {
+            // Contents/Resources/TLAStudio_TLAStudioApp.bundle (where build-app.sh stages it)
+            candidates.append(resources.appendingPathComponent(spmBundleName))
+            // Contents/Resources itself (flat resource layout)
+            candidates.append(resources)
+        }
+        if let execDir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            // Raw `swift build` output: bundle sits next to the executable.
+            candidates.append(execDir.appendingPathComponent(spmBundleName))
+        }
+        // The .app root — the first path SPM's own accessor checks.
+        candidates.append(Bundle.main.bundleURL.appendingPathComponent(spmBundleName))
+
+        for url in candidates where fm.fileExists(atPath: url.path) {
+            if let bundle = Bundle(url: url) {
+                return bundle
+            }
+        }
+        return nil
+    }()
+
     private static var developmentProjectRoot: URL? {
         let fileURL = URL(fileURLWithPath: #filePath)
         let root = fileURL
@@ -160,20 +196,22 @@ enum BinaryDiscovery {
         let requiresExecutable = requiresExecutablePermission(extension: ext)
 
         if options.searchBundles {
-            // 1. Bundle.module with subdirectories
-            for subdir in options.bundleSubdirectories {
-                if let url = Bundle.module.url(forResource: name, withExtension: ext, subdirectory: subdir),
+            // 1. SPM resource bundle (safe accessor; never traps like Bundle.module)
+            if let moduleBundle = resourceBundle {
+                for subdir in options.bundleSubdirectories {
+                    if let url = moduleBundle.url(forResource: name, withExtension: ext, subdirectory: subdir),
+                       isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
+                        logger.debug("Found \(name) in resourceBundle/\(subdir): \(url.path)")
+                        return url
+                    }
+                }
+
+                // resource bundle at root
+                if let url = moduleBundle.url(forResource: name, withExtension: ext),
                    isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
-                    logger.debug("Found \(name) in Bundle.module/\(subdir): \(url.path)")
+                    logger.debug("Found \(name) in resourceBundle: \(url.path)")
                     return url
                 }
-            }
-
-            // Bundle.module at root
-            if let url = Bundle.module.url(forResource: name, withExtension: ext),
-               isUsableDiscoveredFile(url, requiresExecutable: requiresExecutable) {
-                logger.debug("Found \(name) in Bundle.module: \(url.path)")
-                return url
             }
 
             // 2. Bundle.main with subdirectories
@@ -223,8 +261,8 @@ enum BinaryDiscovery {
                 }
             }
 
-            // 5. Bundle.module.resourcePath direct filesystem check
-            if let modulePath = Bundle.module.resourcePath {
+            // 5. SPM resource bundle resourcePath direct filesystem check
+            if let modulePath = resourceBundle?.resourcePath {
                 let root = URL(fileURLWithPath: modulePath)
                 if let found = findUsableFileInResourceRoot(
                     root,

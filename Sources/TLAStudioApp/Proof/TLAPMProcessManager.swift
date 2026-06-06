@@ -134,7 +134,10 @@ actor TLAPMProcessManager {
             roots.append(url)
         }
 
-        if let modulePath = Bundle.module.resourcePath {
+        // Use BinaryDiscovery's safe accessor, not SPM's `Bundle.module`: the latter
+        // `fatalError`s in a distributed .app where the bundle lives under
+        // Contents/Resources/ rather than the .app root or the build-time `.build/` path.
+        if let modulePath = BinaryDiscovery.resourceBundle?.resourcePath {
             append(URL(fileURLWithPath: modulePath))
         }
         if let mainResources = Bundle.main.resourcePath {

@@ -86,6 +86,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // race that no longer exists.
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first?.makeKeyAndOrderFront(nil)
+
+            // First-launch proof-dependency check. Deferred briefly so it surfaces on top
+            // of the welcome window / initial document rather than racing them. No-ops on
+            // every launch after the first, when fully set up, or once dismissed.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                ProofSetupCoordinator.shared.maybePresentOnLaunch()
+            }
         }
     }
 

@@ -136,6 +136,7 @@ final class IsabelleDownloader: ObservableObject {
                fileManager.fileExists(atPath: isabelleBin.path) {
                 // Verify it's executable
                 if fileManager.isExecutableFile(atPath: isabelleBin.path) {
+                    persistInstallPathIfNeeded()
                     state = .installed(path: isabelleDir.path)
                     logger.info("Isabelle found at: \(isabelleDir.path)")
                     return
@@ -156,6 +157,24 @@ final class IsabelleDownloader: ObservableObject {
             state = .notInstalled
             logger.info("Isabelle not installed")
         }
+    }
+
+    /// Records the canonical App Support install directory in `UserSettings.isabellePath`
+    /// so the proof runner's prover discovery resolves it. `configuredExecutableURL`
+    /// accepts a directory and appends `bin/isabelle`, so storing the directory suffices.
+    /// Does not clobber a user's existing, still-valid custom path.
+    private func persistInstallPathIfNeeded() {
+        let current = UserSettings.shared.isabellePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty {
+            let fm = FileManager.default
+            let asIs = fm.isExecutableFile(atPath: current)
+            let nested = fm.isExecutableFile(
+                atPath: URL(fileURLWithPath: current).appendingPathComponent("bin/isabelle").path
+            )
+            if asIs || nested { return }
+        }
+        UserSettings.shared.isabellePath = isabellePath.path
+        logger.info("Recorded Isabelle install path for discovery: \(self.isabellePath.path, privacy: .public)")
     }
 
     // MARK: - Download
@@ -321,6 +340,13 @@ final class IsabelleDownloader: ObservableObject {
 
             // Clean up temp file
             try? fileManager.removeItem(at: tempURL)
+
+            // Persist the install location so prover discovery (which only knows bundle
+            // paths, PATH, and `~/.tla`) can find this App Support install. Done here in
+            // the downloader — the single source of truth — rather than in a transient
+            // SwiftUI `onChange`, which would miss the transition if the user closed the
+            // setup/settings window before this 1 GB download finished.
+            persistInstallPathIfNeeded()
 
             state = .installed(path: targetDir.path)
             logger.info("Isabelle installed successfully at: \(targetDir.path)")

@@ -60,6 +60,10 @@ final class UserSettings: ObservableObject {
         static let tlcWorkers = "settings.prover.tlcWorkers"
         static let tlcCheckpointEnabled = "settings.prover.tlcCheckpointEnabled"
         static let tlcCheckpointInterval = "settings.prover.tlcCheckpointInterval"
+        // Proof-dependency setup prompt state.
+        static let proofSetupLaunchPromptShown = "settings.prover.setupLaunchPromptShown"
+        static let proofSetupProofPromptShown = "settings.prover.setupProofPromptShown"
+        static let proofSetupNeverAsk = "settings.prover.setupNeverAsk"
     }
 
     /// Legacy keys that older builds used. Migrated once on first launch of this build and then removed.
@@ -236,6 +240,18 @@ final class UserSettings: ObservableObject {
     @AppStorage(Keys.tlcCheckpointInterval)
     var tlcCheckpointInterval: Int = 30
 
+    /// Whether the proof-setup prompt has already been offered once on launch.
+    @AppStorage(Keys.proofSetupLaunchPromptShown)
+    var proofSetupLaunchPromptShown: Bool = false
+
+    /// Whether the proof-setup prompt has already been offered before a first proof run.
+    @AppStorage(Keys.proofSetupProofPromptShown)
+    var proofSetupProofPromptShown: Bool = false
+
+    /// When true, never auto-present the proof-setup prompt ("Don't ask again").
+    @AppStorage(Keys.proofSetupNeverAsk)
+    var proofSetupNeverAsk: Bool = false
+
     // MARK: - Computed Properties
 
     /// Returns the path to the TLC executable, using the bundled version if no custom path is set.
@@ -257,7 +273,7 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the Z3 executable, using the bundled version if no custom path is set.
     var resolvedZ3Path: String {
         if z3Path.isEmpty {
-            return bundledToolPath(named: "z3", subdirectories: ["Provers", "lib/tlapm/backends/bin"]) ?? ""
+            return bundledToolPath(named: "z3", subdirectories: ["bin", "Provers", "lib/tlapm/backends/bin"]) ?? ""
         }
         return z3Path
     }
@@ -265,7 +281,7 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the Zenon executable, using the bundled version if no custom path is set.
     var resolvedZenonPath: String {
         if zenonPath.isEmpty {
-            return bundledToolPath(named: "zenon", subdirectories: ["Provers", "lib/tlapm/backends/bin"]) ?? ""
+            return bundledToolPath(named: "zenon", subdirectories: ["bin", "Provers", "lib/tlapm/backends/bin"]) ?? ""
         }
         return zenonPath
     }
@@ -273,7 +289,7 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the CVC5 executable, using the bundled version if no custom path is set.
     var resolvedCvc5Path: String {
         if cvc5Path.isEmpty {
-            return bundledToolPath(named: "cvc5", subdirectories: ["Provers"]) ?? ""
+            return bundledToolPath(named: "cvc5", subdirectories: ["bin", "Provers", "lib/tlapm/backends/bin"]) ?? ""
         }
         return cvc5Path
     }
@@ -281,7 +297,7 @@ final class UserSettings: ObservableObject {
     /// Returns the path to the SPASS executable, using the bundled version if no custom path is set.
     var resolvedSpassPath: String {
         if spassPath.isEmpty {
-            return bundledToolPath(named: "SPASS", subdirectories: ["Provers"]) ?? ""
+            return bundledToolPath(named: "SPASS", subdirectories: ["bin", "Provers", "lib/tlapm/backends/bin"]) ?? ""
         }
         return spassPath
     }

@@ -276,6 +276,12 @@ struct ProofCommands: Commands {
                 }
             }
             .keyboardShortcut("'", modifiers: .command)
+
+            Divider()
+
+            Button("Proof System Setup…") {
+                ProofSetupCoordinator.shared.presentManually()
+            }
         }
     }
 }
