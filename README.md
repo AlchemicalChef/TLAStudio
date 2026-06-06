@@ -43,14 +43,6 @@
 
 ---
 
-## Screenshots
-
-<p align="center">
-  <img src="Screenshot 2026-01-17 at 11.21.03 AM.png" alt="TLA+ Studio Main Window" width="800">
-</p>
-
----
-
 ## Requirements
 
 ### System Requirements
