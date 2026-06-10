@@ -292,6 +292,11 @@ void*_Nonnull uniffi_tla_core_fn_constructor_tlacore_new(RustCallStatus *_Nonnul
 RustBuffer uniffi_tla_core_fn_method_tlacore_analyze_context(void*_Nonnull ptr, void*_Nonnull result, RustBuffer position, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TLA_CORE_FN_METHOD_TLACORE_FIND_IDENTIFIER_OCCURRENCES
+#define UNIFFI_FFIDEF_UNIFFI_TLA_CORE_FN_METHOD_TLACORE_FIND_IDENTIFIER_OCCURRENCES
+RustBuffer uniffi_tla_core_fn_method_tlacore_find_identifier_occurrences(void*_Nonnull ptr, void*_Nonnull result, RustBuffer name, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TLA_CORE_FN_METHOD_TLACORE_GET_COMPLETIONS
 #define UNIFFI_FFIDEF_UNIFFI_TLA_CORE_FN_METHOD_TLACORE_GET_COMPLETIONS
 RustBuffer uniffi_tla_core_fn_method_tlacore_get_completions(void*_Nonnull ptr, void*_Nonnull _result, RustBuffer _position, RustCallStatus *_Nonnull out_status
@@ -622,6 +627,12 @@ uint16_t uniffi_tla_core_checksum_method_parseresult_is_valid(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_TLA_CORE_CHECKSUM_METHOD_TLACORE_ANALYZE_CONTEXT
 #define UNIFFI_FFIDEF_UNIFFI_TLA_CORE_CHECKSUM_METHOD_TLACORE_ANALYZE_CONTEXT
 uint16_t uniffi_tla_core_checksum_method_tlacore_analyze_context(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TLA_CORE_CHECKSUM_METHOD_TLACORE_FIND_IDENTIFIER_OCCURRENCES
+#define UNIFFI_FFIDEF_UNIFFI_TLA_CORE_CHECKSUM_METHOD_TLACORE_FIND_IDENTIFIER_OCCURRENCES
+uint16_t uniffi_tla_core_checksum_method_tlacore_find_identifier_occurrences(void
     
 );
 #endif

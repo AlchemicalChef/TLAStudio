@@ -101,7 +101,7 @@ struct ModelCheckPanel: View {
                         viewModel.jumpToSource(location, in: document)
                     }
                 } else if viewModel.isLoadingErrorTrace {
-                    ProgressView("Loading trace...")
+                    ProgressView("Loading trace…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     Text("No error trace available")
@@ -113,7 +113,7 @@ struct ModelCheckPanel: View {
                 if let trace = viewModel.errorTrace {
                     StateGraphView(trace: trace)
                 } else if viewModel.isLoadingErrorTrace {
-                    ProgressView("Loading trace...")
+                    ProgressView("Loading trace…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     Text("No error trace available")
@@ -135,8 +135,38 @@ struct ModelCheckPanel: View {
                     ProofObligationsPanel(
                         session: proofSession,
                         onJumpToSource: { location in
-                            let offset = document.offset(forLine: location.startLine, column: location.startColumn)
+                            // ProofSourceLocation is 1-based; offset(forLine:column:) is 0-based.
+                            let offset = document.offset(
+                                forLine: max(0, location.startLine - 1),
+                                column: max(0, location.startColumn - 1)
+                            )
                             document.selectedRange = NSRange(location: offset, length: 0)
+                        },
+                        assistProvider: { obligation in
+                            let suggestions = ProofAssist.byDefSuggestions(
+                                for: obligation,
+                                content: document.content,
+                                symbols: document.symbols,
+                                crossModuleSymbols: document.crossModuleProvider.symbols
+                            )
+                            return ProofObligationAssist(
+                                byDefSuggestions: suggestions,
+                                byDefInsertion: ProofAssist.planByDefInsertion(
+                                    names: suggestions,
+                                    for: obligation,
+                                    content: document.content
+                                ),
+                                invariantCandidates: ProofAssist.invariantCandidates(
+                                    for: obligation,
+                                    symbols: document.symbols
+                                )
+                            )
+                        },
+                        onApplyByDef: { insertion in
+                            document.applyByDefInsertion(insertion)
+                        },
+                        onModelCheckInvariant: { name in
+                            document.modelCheckInvariant(named: name)
                         }
                     )
                 } else {
@@ -148,7 +178,7 @@ struct ModelCheckPanel: View {
                         Text("Proof Checking")
                             .font(.headline)
 
-                        Text("Click 'Check All Proofs' or press Shift+Cmd+P to verify proofs")
+                        Text("Click 'Check All Proofs' or press ⇧⌘P to verify proofs")
                             .font(.callout)
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
@@ -166,17 +196,11 @@ struct ModelCheckPanel: View {
         .task(id: viewModel.traceLoadKey) {
             await viewModel.refreshLoadedErrorTrace(loadIfNeeded: viewModel.shouldLoadErrorTrace)
         }
-        .onReceive(NotificationCenter.default.publisher(for: .runModelCheck)) { notification in
-            // Handle both nil (from menu) and specific document (from toolbar)
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                viewModel.runModelCheck()
-            }
+        .onReceiveDocumentNotification(.runModelCheck, for: document) {
+            viewModel.runModelCheck()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .stopModelCheck)) { notification in
-            // Handle both nil (from menu) and specific document (from toolbar)
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                viewModel.stopModelCheck()
-            }
+        .onReceiveDocumentNotification(.stopModelCheck, for: document) {
+            viewModel.stopModelCheck()
         }
     }
 
@@ -221,10 +245,10 @@ struct ModelCheckPanel: View {
                     .font(.largeTitle)
                     .foregroundColor(.secondary)
 
-                Text("Ready to Check")
+                Text("Ready to check")
                     .font(.headline)
 
-                Text("Click 'Run TLC' or press Cmd+R to start model checking")
+                Text("Click 'Run TLC' or press ⌘R to start model checking")
                     .font(.callout)
                     .foregroundColor(.secondary)
 
@@ -467,7 +491,7 @@ private struct LazyErrorTraceSummaryView: View {
 
             Button(action: onOpenTrace) {
                 if isLoading {
-                    Label("Loading Trace...", systemImage: "hourglass")
+                    Label("Loading Trace…", systemImage: "hourglass")
                 } else {
                     Label("Open Trace", systemImage: "list.bullet.rectangle")
                 }
@@ -478,118 +502,6 @@ private struct LazyErrorTraceSummaryView: View {
         .padding()
         .background(Color.orange.opacity(0.08))
         .cornerRadius(8)
-    }
-}
-
-
-// MARK: - Compact Panel for Bottom Bar
-
-/// Smaller version of model check panel for bottom panel integration
-struct ModelCheckPanelCompact: View {
-    @ObservedObject var document: TLADocument
-    @StateObject private var viewModel: ModelCheckViewModel
-
-    init(document: TLADocument) {
-        self.document = document
-        self._viewModel = StateObject(wrappedValue: ModelCheckViewModel(document: document))
-    }
-
-    var body: some View {
-        HStack {
-            if viewModel.isRunning {
-                ProgressView()
-                    .controlSize(.small)
-
-                if let progress = viewModel.session?.progress {
-                    Text("\(progress.distinctStates) states")
-                        .font(.caption)
-                        .monospacedDigit()
-
-                    Text("(\(Int(progress.statesPerSecond))/s)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Spacer()
-
-                Button("Stop") {
-                    viewModel.stopModelCheck()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            } else if let error = viewModel.session?.error {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
-
-                Text(error.localizedDescription)
-                    .font(.caption)
-                    .foregroundColor(.red)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .textSelection(.enabled)
-
-                Spacer()
-
-                Button("Run Again") {
-                    viewModel.runModelCheck()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            } else if let result = viewModel.lastResult {
-                Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                    .foregroundColor(result.success ? .green : .red)
-
-                Text(result.success ? "Passed" : "Error Found")
-                    .font(.caption)
-
-                Text("(\(result.distinctStates) states)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Spacer()
-
-                if result.hasErrorTrace {
-                    Button("View Trace") {
-                        // Show trace in popover or new window
-                    }
-                    .buttonStyle(.link)
-                    .controlSize(.small)
-                }
-
-                Button("Run Again") {
-                    viewModel.runModelCheck()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            } else {
-                Text("Ready to check")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Spacer()
-
-                Button("Run TLC") {
-                    viewModel.runModelCheck()
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(!viewModel.canRun)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .onReceive(NotificationCenter.default.publisher(for: .runModelCheck)) { notification in
-            // Handle both nil (from menu) and specific document (from toolbar)
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                viewModel.runModelCheck()
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .stopModelCheck)) { notification in
-            // Handle both nil (from menu) and specific document (from toolbar)
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                viewModel.stopModelCheck()
-            }
-        }
     }
 }
 

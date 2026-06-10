@@ -51,114 +51,45 @@ actor GraphvizProcessManager {
             throw GraphvizError.notInstalled
         }
 
-        let process = Process()
-        process.executableURL = dotPath
-        process.arguments = ["-T\(format.graphvizFormat)"]
-
-        // Set up pipes
-        let inputPipe = Pipe()
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-
-        process.standardInput = inputPipe
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
-        // Track this render with ProcessRegistry so app-quit / cancellation can reap
-        // the `dot` subprocess. SIGTERM-only escalation on timeout cannot guarantee a
-        // wedged dot exits; ProcessRegistry handles SIGTERM → SIGKILL.
-        let registrySessionId = UUID()
-
-        // Ensure file handles are closed and any still-running dot is reaped.
-        // - Cancellation (CancellationError from Task.sleep) flows through here.
-        // - Normal exit also flows here; ProcessRegistry.terminate is a no-op for a
-        //   process that has already exited.
-        defer {
-            if process.isRunning {
-                ProcessRegistry.shared.terminate(registrySessionId)
-            } else {
-                ProcessRegistry.shared.unregister(registrySessionId)
-            }
-            try? outputPipe.fileHandleForReading.close()
-            try? errorPipe.fileHandleForReading.close()
+        guard let inputData = dotSource.data(using: .utf8) else {
+            throw GraphvizError.encodingError
         }
 
-        // Start process
+        // One-shot spawn via the shared runner: DOT source on stdin, rendered bytes on
+        // stdout. Stdout must be UNBOUNDED — a large state-graph SVG/PDF legitimately
+        // exceeds the default 10 MB capture cap and truncation would corrupt it. Stderr
+        // carries diagnostics only, so the default bounded head-keep is safe there.
+        // The runner registers with ProcessRegistry (SIGTERM → SIGKILL escalation) and
+        // bridges task cancellation, replacing the old 100 ms polling loop.
+        let timeoutSeconds: Double = 600.0
+        let result: (terminationStatus: Int32, stdout: Data, stderr: Data)
         do {
-            try process.run()
-            ProcessRegistry.shared.register(process, for: registrySessionId)
+            result = try await SubprocessRunner.run(
+                executableURL: dotPath,
+                arguments: ["-T\(format.graphvizFormat)"],
+                timeout: timeoutSeconds,
+                stdinData: inputData,
+                stdoutPolicy: .unbounded
+            )
+        } catch is SubprocessRunner.TimeoutError {
+            throw GraphvizError.renderingFailed("Process timed out after \(Int(timeoutSeconds / 60)) minutes")
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw GraphvizError.failedToStart(error)
         }
 
-        // Write DOT source to stdin
-        guard let inputData = dotSource.data(using: .utf8) else {
-            process.terminate()
-            throw GraphvizError.encodingError
-        }
-
-        // Collect stdout/stderr concurrently to prevent deadlock.
-        // If the pipe buffer fills (~64KB) and nobody is reading, the process blocks forever.
-        let outputHandle = outputPipe.fileHandleForReading
-        let errorHandle = errorPipe.fileHandleForReading
-        let accumulator = GraphvizOutputAccumulator()
-
-        outputHandle.readabilityHandler = { [weak accumulator] handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                accumulator?.appendOutput(data)
-            }
-        }
-        errorHandle.readabilityHandler = { [weak accumulator] handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                accumulator?.appendError(data)
-            }
-        }
-
-        // Write input and close pipe to signal EOF to graphviz
-        let inputHandle = inputPipe.fileHandleForWriting
-        inputHandle.write(inputData)
-        try inputHandle.close()
-
-        // Wait for process to complete with timeout
-        let timeoutSeconds: Double = 600.0
-        let startTime = Date()
-        while process.isRunning {
-            if Date().timeIntervalSince(startTime) > timeoutSeconds {
-                outputHandle.readabilityHandler = nil
-                errorHandle.readabilityHandler = nil
-                // Delegate teardown to ProcessRegistry — it issues SIGTERM, briefly waits,
-                // then escalates to SIGKILL. Bare process.terminate() (SIGTERM-only) can
-                // be ignored by a wedged dot. The defer above will see !isRunning and
-                // simply unregister.
-                ProcessRegistry.shared.terminate(registrySessionId)
-                throw GraphvizError.renderingFailed("Process timed out after \(Int(timeoutSeconds / 60)) minutes")
-            }
-            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
-        }
-
-        // Drain remaining buffered data after process exits
-        let lastOutput = outputHandle.availableData
-        let lastError = errorHandle.availableData
-        if !lastOutput.isEmpty { accumulator.appendOutput(lastOutput) }
-        if !lastError.isEmpty { accumulator.appendError(lastError) }
-
-        outputHandle.readabilityHandler = nil
-        errorHandle.readabilityHandler = nil
-
         // Check exit status
-        if process.terminationStatus != 0 {
-            let errorMessage = String(data: accumulator.getError(), encoding: .utf8) ?? "Unknown error"
+        if result.terminationStatus != 0 {
+            let errorMessage = String(data: result.stderr, encoding: .utf8) ?? "Unknown error"
             throw GraphvizError.renderingFailed(errorMessage)
         }
 
-        let outputData = accumulator.getOutput()
-        if outputData.isEmpty {
+        if result.stdout.isEmpty {
             throw GraphvizError.emptyOutput
         }
 
-        return outputData
+        return result.stdout
     }
 
     /// Render an error trace to the specified format
@@ -183,52 +114,25 @@ actor GraphvizProcessManager {
             throw GraphvizError.notInstalled
         }
 
-        let process = Process()
-        process.executableURL = dotPath
-        process.arguments = ["-V"]
-
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe  // dot -V writes to stderr
-
-        // Track this probe with ProcessRegistry so a stalled `dot -V` (rare, but possible
-        // on a wedged install) is reaped at quit time via SIGTERM → SIGKILL escalation.
-        let registrySessionId = UUID()
-
-        // Ensure file handles are closed and any still-running dot is reaped.
-        defer {
-            if process.isRunning {
-                ProcessRegistry.shared.terminate(registrySessionId)
-            } else {
-                ProcessRegistry.shared.unregister(registrySessionId)
-            }
-            try? outputPipe.fileHandleForReading.close()
-            try? errorPipe.fileHandleForReading.close()
-        }
-
+        // `dot -V` is a quick probe; a stalled one (wedged install) is terminated by
+        // the runner's timeout with ProcessRegistry SIGKILL escalation.
+        let result: (terminationStatus: Int32, stdout: Data, stderr: Data)
         do {
-            try process.run()
-            ProcessRegistry.shared.register(process, for: registrySessionId)
+            result = try await SubprocessRunner.run(
+                executableURL: dotPath,
+                arguments: ["-V"],
+                timeout: 5.0
+            )
+        } catch is SubprocessRunner.TimeoutError {
+            return "Unknown version (timeout)"
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw GraphvizError.failedToStart(error)
         }
 
-        // Wait with timeout
-        let timeoutSeconds: Double = 5.0
-        let startTime = Date()
-        while process.isRunning {
-            if Date().timeIntervalSince(startTime) > timeoutSeconds {
-                // Delegate teardown to ProcessRegistry for SIGKILL escalation.
-                ProcessRegistry.shared.terminate(registrySessionId)
-                return "Unknown version (timeout)"
-            }
-            try await Task.sleep(nanoseconds: 50_000_000) // 50ms
-        }
-
         // dot -V writes to stderr, not stdout
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        if let version = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+        if let version = String(data: result.stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
             return version
         }
 
@@ -277,39 +181,5 @@ extension GraphvizProcessManager {
 
         After installation, restart TLA+ Studio.
         """
-    }
-}
-
-// MARK: - Output Accumulator
-
-/// Thread-safe accumulator for Graphviz process output.
-/// @unchecked Sendable: thread safety ensured by NSLock.
-private final class GraphvizOutputAccumulator: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _output = Data()
-    private var _error = Data()
-
-    func appendOutput(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        _output.append(data)
-    }
-
-    func appendError(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        _error.append(data)
-    }
-
-    func getOutput() -> Data {
-        lock.lock()
-        defer { lock.unlock() }
-        return _output
-    }
-
-    func getError() -> Data {
-        lock.lock()
-        defer { lock.unlock() }
-        return _error
     }
 }

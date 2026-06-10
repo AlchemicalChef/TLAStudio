@@ -148,6 +148,123 @@ enum TextCoordinateMapper {
     }
 }
 
+// MARK: - Tree-sitter (byte-column) Conversion
+
+extension TextCoordinateMapper {
+
+    /// Converts tree-sitter positions — (row, **byte** column) — to UTF-16
+    /// offsets and `NSRange`s.
+    ///
+    /// tree-sitter reports columns in UTF-8 bytes while AppKit ranges are
+    /// UTF-16 code units; treating byte columns as character or UTF-16 columns
+    /// is only correct for ASCII. Build one converter per text and reuse it for
+    /// batch conversions — construction walks the whole UTF-8 view once to
+    /// build line tables.
+    struct TreeSitterRangeConverter {
+        private let text: String
+        private let utf16Length: Int
+        private let lineStartsUTF8: [Int]
+        private let lineStartsUTF16: [Int]
+
+        init(text: String) {
+            self.text = text
+            self.utf16Length = (text as NSString).length
+
+            let utf8 = text.utf8
+            var lineStartsUTF8: [Int] = [0]
+            var lineStartsUTF16: [Int] = [0]
+            var utf16Offset = 0
+
+            for (byteIndex, byte) in utf8.enumerated() {
+                if byte == 0x0A {
+                    utf16Offset += 1
+                    lineStartsUTF8.append(byteIndex + 1)
+                    lineStartsUTF16.append(utf16Offset)
+                } else if byte & 0xC0 != 0x80 {
+                    // Lead byte: 1 UTF-16 unit, except 4-byte sequences
+                    // (code points above the BMP) which need a surrogate pair.
+                    utf16Offset += byte < 0xF0 ? 1 : 2
+                }
+            }
+
+            self.lineStartsUTF8 = lineStartsUTF8
+            self.lineStartsUTF16 = lineStartsUTF16
+        }
+
+        /// UTF-16 offset for a tree-sitter point, or nil when the line is out
+        /// of bounds. A byte column past the end of the line clamps to the
+        /// line's end (mirrors tree-sitter's own clamping on edits).
+        func utf16Offset(line: Int, byteColumn: Int) -> Int? {
+            guard line >= 0,
+                  line < lineStartsUTF8.count,
+                  line < lineStartsUTF16.count else {
+                return nil
+            }
+
+            let utf8 = text.utf8
+            let lineByteStart = lineStartsUTF8[line]
+            let lineUTF16Start = lineStartsUTF16[line]
+            guard let startIndex = utf8.index(
+                utf8.startIndex,
+                offsetBy: lineByteStart,
+                limitedBy: utf8.endIndex
+            ) else {
+                return nil
+            }
+
+            var bytesConsumed = 0
+            var utf16Count = 0
+            var index = startIndex
+
+            while bytesConsumed < byteColumn && index < utf8.endIndex {
+                let byte = utf8[index]
+                if byte == 0x0A { break }
+
+                let characterByteLength: Int
+                let characterUTF16Length: Int
+                if byte < 0x80 {
+                    characterByteLength = 1
+                    characterUTF16Length = 1
+                } else if byte < 0xE0 {
+                    characterByteLength = 2
+                    characterUTF16Length = 1
+                } else if byte < 0xF0 {
+                    characterByteLength = 3
+                    characterUTF16Length = 1
+                } else {
+                    characterByteLength = 4
+                    characterUTF16Length = 2
+                }
+
+                bytesConsumed += characterByteLength
+                utf16Count += characterUTF16Length
+                index = utf8.index(index, offsetBy: characterByteLength, limitedBy: utf8.endIndex) ?? utf8.endIndex
+            }
+
+            return lineUTF16Start + utf16Count
+        }
+
+        /// UTF-16 `NSRange` for a tree-sitter range, or nil when out of bounds
+        /// or inverted. Zero-length ranges are valid.
+        func utf16Range(for range: TLARange) -> NSRange? {
+            guard let start = utf16Offset(line: Int(range.start.line), byteColumn: Int(range.start.column)),
+                  let end = utf16Offset(line: Int(range.end.line), byteColumn: Int(range.end.column)),
+                  start <= utf16Length,
+                  end <= utf16Length,
+                  end >= start else {
+                return nil
+            }
+            return NSRange(location: start, length: end - start)
+        }
+    }
+
+    /// One-shot convenience; prefer building a `TreeSitterRangeConverter` for
+    /// batch conversions.
+    static func utf16Range(forTreeSitterRange range: TLARange, in text: String) -> NSRange? {
+        TreeSitterRangeConverter(text: text).utf16Range(for: range)
+    }
+}
+
 // MARK: - SharedTextLineIndex
 
 /// Reference-type cache of a text view's line-start UTF-16 offsets, shared

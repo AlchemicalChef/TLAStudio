@@ -95,11 +95,11 @@ enum CheckpointStatus: Equatable {
         case .none:
             return ""
         case .saving:
-            return "Creating checkpoint..."
+            return "Creating checkpoint…"
         case .saved(let info):
             return "Checkpoint saved: \(info.displayName)"
         case .restoring(let info):
-            return "Restoring from \(info.displayName)..."
+            return "Restoring from \(info.displayName)…"
         case .restored(let info):
             return "Restored from \(info.displayName)"
         case .failed(let message):

@@ -5,7 +5,7 @@ import SwiftUI
 
 // MARK: - UserSettings
 
-/// Central settings model for TLA Studio that persists user preferences using @AppStorage.
+/// Central settings model for TLA+ Studio that persists user preferences using @AppStorage.
 ///
 /// Access the shared instance via `UserSettings.shared`. All properties are automatically
 /// persisted to UserDefaults and trigger SwiftUI view updates when changed.
@@ -25,11 +25,6 @@ final class UserSettings: ObservableObject {
 
     enum Keys {
         // General
-        static let autosaveEnabled = "settings.general.autosaveEnabled"
-        static let autosaveInterval = "settings.general.autosaveInterval"
-        static let defaultEncoding = "settings.general.defaultEncoding"
-        static let reopenLastDocument = "settings.general.reopenLastDocument"
-        static let checkForUpdates = "settings.general.checkForUpdates"
         static let showWelcomeOnLaunch = "settings.general.showWelcomeOnLaunch"
         static let moduleLibraryFolders = "settings.general.moduleLibraryFolders"
 
@@ -91,26 +86,6 @@ final class UserSettings: ObservableObject {
     }
 
     // MARK: - General Settings
-
-    /// Enables automatic saving of documents at regular intervals.
-    @AppStorage(Keys.autosaveEnabled)
-    var autosaveEnabled: Bool = true
-
-    /// The interval in seconds between automatic saves when autosave is enabled.
-    @AppStorage(Keys.autosaveInterval)
-    var autosaveInterval: Int = 30
-
-    /// The default text encoding used when reading and writing files.
-    @AppStorage(Keys.defaultEncoding)
-    var defaultEncoding: String = "UTF-8"
-
-    /// Whether to reopen the last edited document when launching the application.
-    @AppStorage(Keys.reopenLastDocument)
-    var reopenLastDocument: Bool = true
-
-    /// Whether to automatically check for application updates on launch.
-    @AppStorage(Keys.checkForUpdates)
-    var checkForUpdates: Bool = true
 
     /// Whether to show the welcome screen when launching the application.
     @AppStorage(Keys.showWelcomeOnLaunch)
@@ -489,11 +464,6 @@ final class UserSettings: ObservableObject {
 
     /// Resets all general settings to their default values.
     func resetGeneralSettings() {
-        autosaveEnabled = true
-        autosaveInterval = 30
-        defaultEncoding = "UTF-8"
-        reopenLastDocument = true
-        checkForUpdates = true
         showWelcomeOnLaunch = true
         moduleLibraryFolders = []
     }

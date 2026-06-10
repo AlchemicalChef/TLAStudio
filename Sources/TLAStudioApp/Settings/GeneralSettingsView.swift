@@ -1,53 +1,6 @@
 import AppKit
 import SwiftUI
 
-// MARK: - Text Encoding
-
-/// Supported text encodings for document handling.
-enum TextEncoding: String, CaseIterable, Identifiable {
-    case utf8 = "UTF-8"
-    case windows1252 = "Windows-1252"
-    case ascii = "ASCII"
-
-    var id: String { rawValue }
-
-    var stringEncoding: String.Encoding {
-        switch self {
-        case .utf8:
-            return .utf8
-        case .windows1252:
-            return .windowsCP1252
-        case .ascii:
-            return .ascii
-        }
-    }
-}
-
-// MARK: - Autosave Interval
-
-/// Available intervals for document autosave.
-enum AutosaveInterval: Int, CaseIterable, Identifiable {
-    case tenSeconds = 10
-    case fifteenSeconds = 15
-    case thirtySeconds = 30
-    case sixtySeconds = 60
-
-    var id: Int { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .tenSeconds:
-            return "10 seconds"
-        case .fifteenSeconds:
-            return "15 seconds"
-        case .thirtySeconds:
-            return "30 seconds"
-        case .sixtySeconds:
-            return "60 seconds"
-        }
-    }
-}
-
 // MARK: - General Settings View
 
 /// A SwiftUI settings view for general application preferences.
@@ -57,16 +10,8 @@ enum AutosaveInterval: Int, CaseIterable, Identifiable {
 /// user preferences.
 struct GeneralSettingsView: View {
 
-    // MARK: - Document Handling Settings
-
-    @AppStorage(UserSettings.Keys.autosaveEnabled) private var autosaveEnabled = true
-    @AppStorage(UserSettings.Keys.autosaveInterval) private var autosaveInterval = 30
-    @AppStorage(UserSettings.Keys.reopenLastDocument) private var reopenLastDocument = true
-    @AppStorage(UserSettings.Keys.defaultEncoding) private var defaultTextEncoding = TextEncoding.utf8.rawValue
-
     // MARK: - Application Settings
 
-    @AppStorage(UserSettings.Keys.checkForUpdates) private var checkForUpdates = true
     @AppStorage(UserSettings.Keys.showWelcomeOnLaunch) private var showWelcomeOnLaunch = true
 
     // MARK: - Module Library Settings
@@ -82,37 +27,12 @@ struct GeneralSettingsView: View {
 
     var body: some View {
         Form {
-            documentHandlingSection
             moduleLibrariesSection
             applicationSection
             dataManagementSection
         }
         .formStyle(.grouped)
         .padding()
-    }
-
-    // MARK: - Document Handling Section
-
-    private var documentHandlingSection: some View {
-        Section("Document Handling") {
-            Toggle("Automatically save documents", isOn: $autosaveEnabled)
-
-            if autosaveEnabled {
-                Picker("Save interval", selection: $autosaveInterval) {
-                    ForEach(AutosaveInterval.allCases) { interval in
-                        Text(interval.displayName).tag(interval.rawValue)
-                    }
-                }
-            }
-
-            Toggle("Reopen last document on launch", isOn: $reopenLastDocument)
-
-            Picker("Default text encoding", selection: $defaultTextEncoding) {
-                ForEach(TextEncoding.allCases) { encoding in
-                    Text(encoding.rawValue).tag(encoding.rawValue)
-                }
-            }
-        }
     }
 
     // MARK: - Application Section
@@ -147,7 +67,7 @@ struct GeneralSettingsView: View {
             }
 
             HStack {
-                Button("Add Folder...") {
+                Button("Add Folder…") {
                     addModuleLibraryFolder()
                 }
 
@@ -167,7 +87,6 @@ struct GeneralSettingsView: View {
 
     private var applicationSection: some View {
         Section("Application") {
-            Toggle("Check for updates automatically", isOn: $checkForUpdates)
             Toggle("Show welcome screen on launch", isOn: $showWelcomeOnLaunch)
         }
     }
@@ -218,7 +137,7 @@ struct GeneralSettingsView: View {
         HStack {
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
-                Text("TLA Studio \(appVersion)")
+                Text("TLA+ Studio \(appVersion)")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Text("Build \(buildNumber)")
@@ -246,16 +165,10 @@ struct GeneralSettingsView: View {
     }
 
     private func resetAllSettings() {
-        // Document Handling
-        autosaveEnabled = true
-        autosaveInterval = 30
-        reopenLastDocument = true
-        defaultTextEncoding = TextEncoding.utf8.rawValue
         moduleLibraryFolders = []
         persistModuleLibraryFolders()
 
         // Application
-        checkForUpdates = true
         showWelcomeOnLaunch = true
     }
 

@@ -253,7 +253,9 @@ public final class FindReplaceManager: ObservableObject {
 
     // MARK: - Replace Operations
 
-    /// Replaces the current match with the replacement text.
+    /// Replaces the current match with the replacement text. In regex mode the
+    /// replacement is an ICU template (`$0`…`$n` backreferences, `\$` for a
+    /// literal dollar); otherwise it is inserted literally.
     public func replaceCurrent() {
         guard let index = currentMatchIndex,
               index < matches.count else {
@@ -262,11 +264,18 @@ public final class FindReplaceManager: ObservableObject {
 
         let range = matches[index]
 
+        guard let replacement = replacementText(forMatchAt: range) else {
+            // The stored match no longer agrees with the buffer — refresh
+            // instead of splicing template text into the wrong place.
+            performSearch()
+            return
+        }
+
         // Use custom replacer if provided
         if let replacer = textReplacer {
-            replacer(range, replaceQuery)
+            replacer(range, replacement)
         } else if let textView = textView {
-            guard replace(range, in: textView, with: replaceQuery) else {
+            guard replace(range, in: textView, with: replacement) else {
                 performSearch()
                 return
             }
@@ -295,7 +304,8 @@ public final class FindReplaceManager: ObservableObject {
         }
     }
 
-    /// Replaces all matches with the replacement text.
+    /// Replaces all matches with the replacement text. In regex mode the
+    /// replacement is an ICU template (`$0`…`$n` backreferences).
     /// - Returns: The number of replacements made.
     @discardableResult
     public func replaceAll() -> Int {
@@ -303,17 +313,33 @@ public final class FindReplaceManager: ObservableObject {
 
         var replacementCount = 0
 
-        // Replace from end to start to preserve range validity
-        let sortedMatches = matches.sorted { $0.location > $1.location }
-
-        if let replacer = textReplacer {
-            for range in sortedMatches {
-                replacer(range, replaceQuery)
-                replacementCount += 1
+        // Pair every match with its expanded replacement up front, against the
+        // *original* text — capture groups and lookarounds must see the
+        // pre-replacement buffer — then apply from end to start so earlier
+        // ranges stay valid as the text shrinks/grows.
+        let replacements: [(range: NSRange, replacement: String)]
+        if isRegex {
+            guard let (text, regex, results) = currentRegexResults() else {
+                performSearch()
+                return 0
             }
-        } else if let textView = textView {
-            for range in sortedMatches {
-                if replace(range, in: textView, with: replaceQuery) {
+            let template = Self.sanitizedTemplate(
+                replaceQuery,
+                captureGroupCount: regex.numberOfCaptureGroups
+            )
+            replacements = results.map {
+                ($0.range, regex.replacementString(for: $0, in: text, offset: 0, template: template))
+            }
+        } else {
+            replacements = matches.map { ($0, replaceQuery) }
+        }
+
+        for (range, replacement) in replacements.sorted(by: { $0.range.location > $1.range.location }) {
+            if let replacer = textReplacer {
+                replacer(range, replacement)
+                replacementCount += 1
+            } else if let textView = textView {
+                if replace(range, in: textView, with: replacement) {
                     replacementCount += 1
                 }
             }
@@ -326,6 +352,101 @@ public final class FindReplaceManager: ObservableObject {
         performSearch()
 
         return replacementCount
+    }
+
+    /// The text to insert for the match at `range`: the literal replace query
+    /// in literal/whole-word mode, or the ICU-template-expanded replacement in
+    /// regex mode. Returns nil when the stored range no longer corresponds to a
+    /// regex match in the current buffer (stale state).
+    private func replacementText(forMatchAt range: NSRange) -> String? {
+        guard isRegex else { return replaceQuery }
+
+        guard let (text, regex, results) = currentRegexResults(),
+              let match = results.first(where: { $0.range == range }) else {
+            return nil
+        }
+
+        let template = Self.sanitizedTemplate(
+            replaceQuery,
+            captureGroupCount: regex.numberOfCaptureGroups
+        )
+        return regex.replacementString(for: match, in: text, offset: 0, template: template)
+    }
+
+    /// Re-run the current regex over the current text, returning the full
+    /// match results (with capture groups — `matches` only stores ranges).
+    private func currentRegexResults() -> (text: String, regex: NSRegularExpression, results: [NSTextCheckingResult])? {
+        let text: String
+        if let provider = textProvider {
+            text = provider()
+        } else if let textView = textView {
+            text = textView.string
+        } else {
+            return nil
+        }
+
+        guard let regex = try? compiledRegex(for: buildSearchPattern(), options: regexOptions()) else {
+            return nil
+        }
+        let results = regex.matches(
+            in: text,
+            options: [],
+            range: NSRange(location: 0, length: (text as NSString).length)
+        )
+        return (text, regex, results)
+    }
+
+    /// Make a user-typed replacement string safe for ICU template expansion:
+    /// `$n` references to capture groups the pattern doesn't have, and bare `$`
+    /// signs, are escaped so they come out literally instead of failing
+    /// expansion. Mirrors ICU's digit parsing: group numbers are read one digit
+    /// at a time (two only when the pattern has ≥ 10 groups).
+    static func sanitizedTemplate(_ template: String, captureGroupCount: Int) -> String {
+        let characters = Array(template)
+        let maxDigits = captureGroupCount >= 10 ? 2 : 1
+        var result = ""
+        var index = 0
+
+        while index < characters.count {
+            let character = characters[index]
+
+            if character == "\\" {
+                if index + 1 < characters.count {
+                    result.append(character)
+                    result.append(characters[index + 1])
+                    index += 2
+                } else {
+                    // Lone trailing backslash — escape it for ICU.
+                    result.append("\\\\")
+                    index += 1
+                }
+                continue
+            }
+
+            if character == "$" {
+                var digits = ""
+                var next = index + 1
+                while next < characters.count, digits.count < maxDigits, characters[next].isNumber {
+                    digits.append(characters[next])
+                    next += 1
+                }
+                if let group = Int(digits), group <= captureGroupCount {
+                    result.append("$")
+                    result.append(digits)
+                } else {
+                    // No digits, or a group the pattern doesn't have → literal.
+                    result.append("\\$")
+                    result.append(digits)
+                }
+                index = next
+                continue
+            }
+
+            result.append(character)
+            index += 1
+        }
+
+        return result
     }
 
     private func replace(_ range: NSRange, in textView: NSTextView, with replacement: String) -> Bool {

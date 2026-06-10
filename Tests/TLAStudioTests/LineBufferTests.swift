@@ -122,6 +122,47 @@ final class LineBufferTests: XCTestCase {
         XCTAssertEqual(String(data: lines[0], encoding: .utf8), "after reset")
     }
 
+    // MARK: - CRLF Handling
+
+    func testCRLFLinesAreStrippedOfCarriageReturn() {
+        var buf = LineBuffer(maxBufferSize: 1024, compactionThreshold: 256)
+        let lines = buf.append("alpha\r\nbeta\r\ngamma\n".data(using: .utf8)!)
+
+        XCTAssertEqual(lines.count, 3)
+        XCTAssertEqual(String(data: lines[0], encoding: .utf8), "alpha")
+        XCTAssertEqual(String(data: lines[1], encoding: .utf8), "beta")
+        XCTAssertEqual(String(data: lines[2], encoding: .utf8), "gamma")
+    }
+
+    func testCRLFSplitAcrossChunks() {
+        var buf = LineBuffer(maxBufferSize: 1024, compactionThreshold: 256)
+
+        // \r arrives in one chunk, \n in the next
+        XCTAssertTrue(buf.append("split\r".data(using: .utf8)!).isEmpty)
+        let lines = buf.append("\nnext\r\n".data(using: .utf8)!)
+
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(String(data: lines[0], encoding: .utf8), "split")
+        XCTAssertEqual(String(data: lines[1], encoding: .utf8), "next")
+    }
+
+    func testInteriorCarriageReturnIsPreserved() {
+        var buf = LineBuffer(maxBufferSize: 1024, compactionThreshold: 256)
+        let lines = buf.append("a\rb\n".data(using: .utf8)!)
+
+        // Only the trailing \r of a CRLF pair is stripped
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(String(data: lines[0], encoding: .utf8), "a\rb")
+    }
+
+    func testBareCRLFProducesEmptyLine() {
+        var buf = LineBuffer(maxBufferSize: 1024, compactionThreshold: 256)
+        let lines = buf.append("\r\n".data(using: .utf8)!)
+
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertTrue(lines[0].isEmpty)
+    }
+
     // MARK: - Incremental Appends
 
     func testIncrementalByteByByte() {

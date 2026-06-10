@@ -108,7 +108,7 @@ struct StateGraphView: View {
     var loadingView: some View {
         VStack(spacing: 16) {
             ProgressView()
-            Text("Rendering graph...")
+            Text("Rendering graph…")
                 .foregroundColor(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

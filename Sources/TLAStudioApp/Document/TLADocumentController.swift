@@ -70,6 +70,32 @@ final class TLADocumentController: NSDocumentController {
         addDocument(document)
     }
 
+    override func addDocument(_ document: NSDocument) {
+        super.addDocument(document)
+
+        // Self-healing for launch races and state restoration: launch-time
+        // opens (odoc) and window restoration can interleave with the
+        // launch-created Untitled in either order, so sweep on EVERY add.
+        // Whenever a file-backed document coexists with a pristine
+        // (template-content, never-saved) Untitled, close the Untitled —
+        // TextEdit-style behavior (platform review 2026-06-10). Deferred a
+        // runloop hop so a document still being added isn't closed mid-flight.
+        DispatchQueue.main.async { [weak self] in
+            self?.closePristineUntitledsIfFileBackedDocumentExists()
+        }
+    }
+
+    private func closePristineUntitledsIfFileBackedDocumentExists() {
+        guard documents.contains(where: { $0.fileURL != nil }) else { return }
+        let pristineTemplate = TLADocument.newDocumentTemplate()
+        for candidate in documents {
+            guard let untouched = candidate as? TLADocument,
+                  untouched.fileURL == nil,
+                  untouched.content == pristineTemplate else { continue }
+            untouched.close()
+        }
+    }
+
     override func makeUntitledDocument(ofType typeName: String) throws -> NSDocument {
         let document = TLADocument()
         return document

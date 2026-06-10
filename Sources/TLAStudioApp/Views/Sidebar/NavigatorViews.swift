@@ -21,7 +21,7 @@ struct FileNavigatorView: View {
 
             // File tree
             if fileManager.isLoading {
-                ProgressView("Loading files...")
+                ProgressView("Loading files…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if fileManager.projectFiles.isEmpty {
                 emptyStateView
@@ -489,13 +489,13 @@ struct EnhancedSymbolOutline: View {
                 .foregroundColor(.secondary)
 
             if filterText.isEmpty {
-                Text("No Symbols")
+                Text("No symbols")
                     .font(.headline)
                 Text("Symbols will appear here after parsing")
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
-                Text("No Matches")
+                Text("No matches")
                     .font(.headline)
                 Text("No symbols match '\(filterText)'")
                     .font(.caption)

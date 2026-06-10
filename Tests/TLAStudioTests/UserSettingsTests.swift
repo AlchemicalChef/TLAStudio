@@ -27,11 +27,6 @@ final class UserSettingsTests: XCTestCase {
     func testDefaultGeneralSettings() {
         settings.resetGeneralSettings()
 
-        XCTAssertTrue(settings.autosaveEnabled)
-        XCTAssertEqual(settings.autosaveInterval, 30)
-        XCTAssertEqual(settings.defaultEncoding, "UTF-8")
-        XCTAssertTrue(settings.reopenLastDocument)
-        XCTAssertTrue(settings.checkForUpdates)
         XCTAssertTrue(settings.showWelcomeOnLaunch)
         XCTAssertTrue(settings.moduleLibraryFolders.isEmpty)
     }
@@ -200,18 +195,14 @@ final class UserSettingsTests: XCTestCase {
 
     func testResetGeneralSettings() {
         // Modify settings
-        settings.autosaveEnabled = false
-        settings.autosaveInterval = 60
-        settings.defaultEncoding = "ASCII"
+        settings.showWelcomeOnLaunch = false
         settings.moduleLibraryFolders = ["/tmp/library"]
 
         // Reset
         settings.resetGeneralSettings()
 
         // Verify defaults restored
-        XCTAssertTrue(settings.autosaveEnabled)
-        XCTAssertEqual(settings.autosaveInterval, 30)
-        XCTAssertEqual(settings.defaultEncoding, "UTF-8")
+        XCTAssertTrue(settings.showWelcomeOnLaunch)
         XCTAssertTrue(settings.moduleLibraryFolders.isEmpty)
     }
 
@@ -280,7 +271,7 @@ final class UserSettingsTests: XCTestCase {
 
     func testResetAllSettings() {
         // Modify settings in each category
-        settings.autosaveEnabled = false
+        settings.showWelcomeOnLaunch = false
         settings.fontName = "Monaco"
         settings.tlcPath = "/custom/tlc"
 
@@ -288,20 +279,12 @@ final class UserSettingsTests: XCTestCase {
         settings.resetAllSettings()
 
         // Verify all defaults restored
-        XCTAssertTrue(settings.autosaveEnabled)
+        XCTAssertTrue(settings.showWelcomeOnLaunch)
         XCTAssertEqual(settings.fontName, "SF Mono")
         XCTAssertEqual(settings.tlcPath, "")
     }
 
     // MARK: - Settings Modification Tests
-
-    func testModifyAutosaveInterval() {
-        settings.autosaveInterval = 60
-        XCTAssertEqual(settings.autosaveInterval, 60)
-
-        settings.autosaveInterval = 15
-        XCTAssertEqual(settings.autosaveInterval, 15)
-    }
 
     func testModifyFontSize() {
         settings.fontSize = 18
@@ -345,10 +328,10 @@ final class UserSettingsTests: XCTestCase {
 
     // MARK: - Boolean Toggle Tests
 
-    func testToggleAutosave() {
-        let original = settings.autosaveEnabled
-        settings.autosaveEnabled = !original
-        XCTAssertEqual(settings.autosaveEnabled, !original)
+    func testToggleShowWelcomeOnLaunch() {
+        let original = settings.showWelcomeOnLaunch
+        settings.showWelcomeOnLaunch = !original
+        XCTAssertEqual(settings.showWelcomeOnLaunch, !original)
     }
 
     func testToggleShowLineNumbers() {

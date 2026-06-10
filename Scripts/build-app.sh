@@ -158,10 +158,14 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
     <string>TLA+ Studio</string>
     <key>CFBundleExecutable</key>
     <string>TLAStudio</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>0.9.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -183,6 +187,8 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
             <string>TLA+ Specification</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
             <key>LSHandlerRank</key>
             <string>Owner</string>
             <key>LSItemContentTypes</key>
@@ -197,6 +203,8 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
             <string>TLA+ Configuration</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
             <key>LSHandlerRank</key>
             <string>Alternate</string>
             <key>LSItemContentTypes</key>
@@ -247,7 +255,7 @@ cat > "$APP_DIR/Contents/Info.plist" << 'PLIST'
         </dict>
     </array>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2025. All rights reserved.</string>
+    <string>© 2026 TLA+ Studio</string>
 </dict>
 </plist>
 PLIST

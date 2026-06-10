@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 // MARK: - Centralized Notification Names
 
@@ -22,6 +23,28 @@ extension Notification.Name {
     static let goToDefinition = Notification.Name("TLAGoToDefinition")
     static let findReferences = Notification.Name("TLAFindReferences")
 
+    // MARK: Language Intelligence
+
+    /// Posted by ModuleSymbolIndex after entries are invalidated/re-indexed;
+    /// per-document providers re-query their snapshot.
+    static let moduleSymbolIndexDidUpdate = Notification.Name("TLAModuleSymbolIndexDidUpdate")
+
+    /// Posted (with the document as object) when reference results are ready;
+    /// the bottom panel switches to the References tab.
+    static let showReferencesPanel = Notification.Name("TLAShowReferencesPanel")
+
+    /// Rename the symbol at the cursor (opens the rename sheet).
+    static let renameSymbol = Notification.Name("TLARenameSymbol")
+
+    /// Generate a proof skeleton for the theorem at the cursor.
+    static let decomposeProof = Notification.Name("TLADecomposeProof")
+
+    /// Switch the bottom panel to the Output tab.
+    static let showOutputPanel = Notification.Name("TLAShowOutputPanel")
+
+    /// Switch the bottom panel to the Model Check tab.
+    static let showModelCheckPanel = Notification.Name("TLAShowModelCheckPanel")
+
     // MARK: Model Checking
 
     static let runModelCheck = Notification.Name("TLARunModelCheck")
@@ -30,7 +53,6 @@ extension Notification.Name {
 
     // MARK: Proofs
 
-    static let checkAllProofs = Notification.Name("TLACheckAllProofs")
     static let checkCurrentStep = Notification.Name("TLACheckCurrentStep")
     static let stopProofCheck = Notification.Name("TLAStopProofCheck")
     static let goToNextFailed = Notification.Name("TLAGoToNextFailed")
@@ -54,4 +76,34 @@ extension Notification.Name {
     // MARK: Document
 
     static let documentWillClose = Notification.Name("TLADocumentWillClose")
+}
+
+// MARK: - Document-Scoped Notification Receiving
+
+extension View {
+    /// `.onReceive` for a document-scoped notification.
+    ///
+    /// Fires when the notification's object is `nil` (broadcast, e.g. from a
+    /// menu command) or identical to `document` (targeted, e.g. from a
+    /// toolbar button or another view of the same document).
+    func onReceiveDocumentNotification(
+        _ name: Notification.Name,
+        for document: TLADocument,
+        perform action: @escaping () -> Void
+    ) -> some View {
+        onReceiveDocumentNotification(name, for: document) { _ in action() }
+    }
+
+    /// Variant passing the `Notification` through for `userInfo` consumers.
+    func onReceiveDocumentNotification(
+        _ name: Notification.Name,
+        for document: TLADocument,
+        perform action: @escaping (Notification) -> Void
+    ) -> some View {
+        onReceive(NotificationCenter.default.publisher(for: name)) { notification in
+            guard notification.object == nil
+                    || (notification.object as? TLADocument) === document else { return }
+            action(notification)
+        }
+    }
 }

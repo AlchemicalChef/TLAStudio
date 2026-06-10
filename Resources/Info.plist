@@ -11,10 +11,14 @@
     <string>TLA+ Studio</string>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>0.9.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     
@@ -49,6 +53,8 @@
             <string>TLA+ Specification</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
             <key>LSHandlerRank</key>
             <string>Owner</string>
             <key>LSItemContentTypes</key>
@@ -64,14 +70,19 @@
             <string>TLA+ Configuration</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
+            <!-- Alternate, matching build-app.sh/build-production.sh: .cfg is a
+                 generic extension also claimed by other tools. -->
             <key>LSHandlerRank</key>
-            <string>Owner</string>
+            <string>Alternate</string>
             <key>LSItemContentTypes</key>
             <array>
                 <string>com.tlaplus.configuration</string>
             </array>
+            <!-- TLADocument handles .cfg too; a TLAConfigDocument class does not exist. -->
             <key>NSDocumentClass</key>
-            <string>$(PRODUCT_MODULE_NAME).TLAConfigDocument</string>
+            <string>$(PRODUCT_MODULE_NAME).TLADocument</string>
         </dict>
     </array>
     
@@ -130,7 +141,7 @@
     
     <!-- Usage Descriptions -->
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2025. All rights reserved.</string>
+    <string>© 2026 TLA+ Studio</string>
     
     <!-- Sparkle Updates (optional) -->
     <key>SUFeedURL</key>

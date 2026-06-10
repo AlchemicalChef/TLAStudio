@@ -28,7 +28,8 @@ struct LineBuffer {
 
     /// Append data, extract complete lines, and compact if needed.
     ///
-    /// Returns an array of complete line `Data` segments (without the `\n` delimiter).
+    /// Returns an array of complete line `Data` segments (without the `\n`
+    /// delimiter; a trailing `\r` from CRLF-delimited output is also stripped).
     /// Any incomplete trailing line remains in the buffer for the next call.
     mutating func append(_ data: Data) -> [Data] {
         // Best-effort compaction: drop the already-consumed prefix when the buffer
@@ -46,7 +47,12 @@ struct LineBuffer {
 
         // Extract complete lines using index tracking (zero-copy until compaction)
         while let newlineIndex = buffer[bufferOffset...].firstIndex(of: UInt8(ascii: "\n")) {
-            let lineData = Data(buffer[bufferOffset..<newlineIndex])
+            // Strip one trailing \r so CRLF-delimited output parses like LF.
+            var lineEnd = newlineIndex
+            if lineEnd > bufferOffset, buffer[buffer.index(before: lineEnd)] == UInt8(ascii: "\r") {
+                lineEnd = buffer.index(before: lineEnd)
+            }
+            let lineData = Data(buffer[bufferOffset..<lineEnd])
             bufferOffset = buffer.index(after: newlineIndex)
             lines.append(lineData)
         }

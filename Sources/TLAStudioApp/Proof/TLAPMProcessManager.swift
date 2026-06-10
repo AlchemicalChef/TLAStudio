@@ -27,6 +27,11 @@ actor TLAPMProcessManager {
     private var progressTasks: [UUID: Task<Void, Never>] = [:]
     private var streamStates: [UUID: StreamState<ProofCheckProgress>] = [:]
 
+    /// Session ids of in-flight single-step checks. Their `Process` objects are owned
+    /// by `SubprocessRunner` (registered with ProcessRegistry under the same id), so we
+    /// track only the ids for stopAll/isRunning/activeSessionCount bookkeeping.
+    private var activeStepSessions: Set<UUID> = []
+
 
     // MARK: - Binary Discovery
 
@@ -604,106 +609,53 @@ actor TLAPMProcessManager {
 
         logger.info("Single step arguments: \(arguments.joined(separator: " "))")
 
-        // Create process
-        let process = Process()
-        process.executableURL = tlapmPath
-        process.arguments = arguments
-        process.currentDirectoryURL = specURL.deletingLastPathComponent()
-
-        // Set up minimal environment with prover paths
-        process.environment = buildTLAPMEnvironment()
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        let stdoutHandle = stdoutPipe.fileHandleForReading
-        let stderrHandle = stderrPipe.fileHandleForReading
-
-        // Ensure handles are closed on all paths
-        defer {
-            try? stdoutHandle.close()
-            try? stderrHandle.close()
-        }
-
-        activeProcesses[sessionId] = process
-
         let startTime = Date()
 
         logger.info("checkSingleStep: Starting TLAPM process")
 
-        // Accumulate output data using thread-safe storage
-        // (pipes must be drained while process runs to avoid deadlock)
-        let outputAccumulator = OutputAccumulator()
+        // Track the step session so stopAll/isRunning/activeSessionCount cover it.
+        // Unlike the streaming path we never store into `activeProcesses` — the
+        // runner owns the Process — which also means a step check can no longer
+        // clobber a streaming session's entry if the ids ever collide.
+        activeStepSessions.insert(sessionId)
+        defer { activeStepSessions.remove(sessionId) }
 
-        // Set up readability handlers to drain pipes and prevent deadlock
-        stdoutHandle.readabilityHandler = { [weak outputAccumulator] handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                outputAccumulator?.appendStdout(data)
-            }
-        }
-
-        stderrHandle.readabilityHandler = { [weak outputAccumulator] handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                outputAccumulator?.appendStderr(data)
-                // Log to output manager
-                if let str = String(data: data, encoding: .utf8) {
-                    OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
-                }
-            }
-        }
-
-        // Run process
+        // One-shot spawn/drain/timeout via the shared runner. It registers the
+        // process with ProcessRegistry under `sessionId`, so `stop(sessionId:)` and
+        // ProofSession's per-step terminate calls still reach the child. Tail-keep
+        // truncation: if output ever exceeds the cap, the latest obligation results
+        // are the ones worth keeping.
+        let stdoutData: Data
+        let stderrData: Data
         do {
-            try process.run()
-            ProcessRegistry.shared.register(process, for: sessionId)
-            logger.info("checkSingleStep: Process started with PID \(process.processIdentifier)")
+            let result = try await SubprocessRunner.run(
+                executableURL: tlapmPath,
+                arguments: arguments,
+                currentDirectoryURL: specURL.deletingLastPathComponent(),
+                timeout: timeout,
+                environment: buildTLAPMEnvironment(),
+                registryId: sessionId,
+                stdoutPolicy: .keepTail(limit: SubprocessRunner.maxCapturedBytes),
+                stderrPolicy: .keepTail(limit: SubprocessRunner.maxCapturedBytes),
+                onStderrData: { data in
+                    // Live-log TLAPM's stderr (its primary output channel) to the Output panel.
+                    if let str = String(data: data, encoding: .utf8) {
+                        OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
+                    }
+                }
+            )
+            stdoutData = result.stdout
+            stderrData = result.stderr
+            logger.info("checkSingleStep: Process exited with status \(result.terminationStatus)")
+        } catch is SubprocessRunner.TimeoutError {
+            logger.error("checkSingleStep: Process timed out after \(String(format: "%.1f", timeout))s")
+            throw TLAPMError.timeout
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
-            stdoutHandle.readabilityHandler = nil
-            stderrHandle.readabilityHandler = nil
-            activeProcesses.removeValue(forKey: sessionId)
             logger.error("checkSingleStep: Failed to start process: \(error.localizedDescription)")
             throw TLAPMError.failedToStart(error)
         }
-
-        let exitStatus: Int32
-        do {
-            exitStatus = try await Self.waitForExit(of: process, timeout: timeout)
-        } catch {
-            stdoutHandle.readabilityHandler = nil
-            stderrHandle.readabilityHandler = nil
-            ProcessRegistry.shared.terminate(sessionId)
-            activeProcesses.removeValue(forKey: sessionId)
-            logger.error("checkSingleStep: Process timed out after \(String(format: "%.1f", timeout))s")
-            throw error
-        }
-
-        logger.info("checkSingleStep: Process exited with status \(exitStatus)")
-
-        // Drain any remaining buffered pipe data before clearing handlers
-        let lastStdout = stdoutHandle.availableData
-        if !lastStdout.isEmpty {
-            outputAccumulator.appendStdout(lastStdout)
-        }
-        let lastStderr = stderrHandle.availableData
-        if !lastStderr.isEmpty {
-            outputAccumulator.appendStderr(lastStderr)
-        }
-
-        // Clean up handlers
-        stdoutHandle.readabilityHandler = nil
-        stderrHandle.readabilityHandler = nil
-
-        // Clean up process tracking
-        ProcessRegistry.shared.unregister(sessionId)
-        activeProcesses.removeValue(forKey: sessionId)
-
-        // Get accumulated output and parse it
-        let stdoutData = outputAccumulator.getStdout()
-        let stderrData = outputAccumulator.getStderr()
 
         // Parse accumulated output - TLAPM outputs to stderr in toolbox mode
         _ = parser.parse(stdoutData)
@@ -807,19 +759,34 @@ actor TLAPMProcessManager {
             ProcessRegistry.shared.terminate(sessionId)
         }
         activeProcesses.removeAll()
+
+        // In-flight single-step checks live in ProcessRegistry under their session id.
+        for sessionId in activeStepSessions {
+            ProcessRegistry.shared.terminate(sessionId)
+        }
+
         parsers.removeAll()
     }
 
     /// Check if a session is running
     func isRunning(sessionId: UUID) -> Bool {
-        activeProcesses[sessionId]?.isRunning ?? false
+        if let process = activeProcesses[sessionId] {
+            return process.isRunning
+        }
+        // Single-step sessions: the Process is owned by SubprocessRunner; the
+        // registry tracks liveness under the same session id.
+        return activeStepSessions.contains(sessionId) && ProcessRegistry.shared.isRunning(sessionId)
     }
 
     /// Get the number of active sessions
     var activeSessionCount: Int {
-        activeProcesses.count
+        activeProcesses.count + activeStepSessions.count
     }
 
+    /// Polling wait for process exit. No longer used by `checkSingleStep` (which now
+    /// goes through `SubprocessRunner`'s terminationHandler-based wait); retained only
+    /// because `TLAPMProcessManagerTests` pins its timeout behavior directly. Candidate
+    /// for deletion together with those two tests.
     static func waitForExit(of process: Process, timeout: TimeInterval? = nil) async throws -> Int32 {
         let startTime = Date()
 
@@ -931,63 +898,6 @@ actor TLAPMProcessManager {
         args.append(specPath)
 
         return args
-    }
-}
-
-// MARK: - Output Accumulator
-
-/// Thread-safe accumulator for process output data.
-/// Used to collect stdout/stderr while process runs to prevent pipe deadlock.
-/// Limits buffer size to prevent unbounded memory growth.
-/// @unchecked Sendable: thread safety ensured by NSLock
-private final class OutputAccumulator: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _stdout = Data()
-    private var _stderr = Data()
-
-    /// Maximum buffer size per stream (10MB) to prevent OOM
-    private static let maxBufferSize = 10 * 1024 * 1024
-
-    func appendStdout(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        // Enforce buffer limit: keep last maxBufferSize bytes if exceeded
-        if _stdout.count + data.count > Self.maxBufferSize {
-            let overflow = (_stdout.count + data.count) - Self.maxBufferSize
-            if overflow < _stdout.count {
-                _stdout = Data(_stdout.suffix(_stdout.count - overflow))
-            } else {
-                _stdout = Data()
-            }
-        }
-        _stdout.append(data)
-    }
-
-    func appendStderr(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        // Enforce buffer limit: keep last maxBufferSize bytes if exceeded
-        if _stderr.count + data.count > Self.maxBufferSize {
-            let overflow = (_stderr.count + data.count) - Self.maxBufferSize
-            if overflow < _stderr.count {
-                _stderr = Data(_stderr.suffix(_stderr.count - overflow))
-            } else {
-                _stderr = Data()
-            }
-        }
-        _stderr.append(data)
-    }
-
-    func getStdout() -> Data {
-        lock.lock()
-        defer { lock.unlock() }
-        return _stdout
-    }
-
-    func getStderr() -> Data {
-        lock.lock()
-        defer { lock.unlock() }
-        return _stderr
     }
 }
 

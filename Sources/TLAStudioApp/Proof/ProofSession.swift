@@ -28,6 +28,12 @@ final class ProofSession: ObservableObject {
 
     private var task: Task<Void, Never>?
 
+    /// Each single-step check runs under its OWN registry id so a stale call's
+    /// tail cleanup can never unregister a newer run that reused the session
+    /// id (the shared-id clobber race, bug-review-2026-06-09d #1). Tracked so
+    /// stop() can terminate in-flight step processes too.
+    private var activeStepSessionIds = Set<UUID>()
+
     // MARK: - Initialization
 
     init(specURL: URL, options: ProofCheckOptions = .default) {
@@ -108,8 +114,12 @@ final class ProofSession: ObservableObject {
         }
     }
 
-    /// Check a single proof step at the given location
-    func checkStep(line: Int, column: Int, backend: ProverBackend? = nil) {
+    /// Check a single proof step at the given location.
+    /// - Parameters:
+    ///   - backend: Override the session's default prover for this check.
+    ///   - timeout: Override the session's timeout (the workbench's
+    ///     "retry with more time" action).
+    func checkStep(line: Int, column: Int, backend: ProverBackend? = nil, timeout: TimeInterval? = nil) {
         logger.info("checkStep called: line=\(line), column=\(column), isRunning=\(self.isRunning)")
         guard !isRunning else {
             logger.debug("checkStep: BLOCKED - isRunning is true")
@@ -124,11 +134,13 @@ final class ProofSession: ObservableObject {
         // Capture state needed by the Task body so weak self can be dereferenced lazily.
         let capturedSpecURL = specURL
         let capturedBackend = backend ?? options.backend
-        let capturedTimeout = options.timeout
-        let capturedSessionId = id
+        let capturedTimeout = timeout ?? options.timeout
         let capturedLibraryPaths = options.additionalLibraryPaths ?? []
+        let stepSessionId = UUID()
+        activeStepSessionIds.insert(stepSessionId)
 
         task = Task { @MainActor [weak self] in
+            defer { self?.activeStepSessionIds.remove(stepSessionId) }
             do {
                 let obligation = try await TLAPMProcessManager.shared.checkSingleStep(
                     spec: capturedSpecURL,
@@ -136,7 +148,7 @@ final class ProofSession: ObservableObject {
                     column: column,
                     backend: capturedBackend,
                     timeout: capturedTimeout,
-                    sessionId: capturedSessionId,
+                    sessionId: stepSessionId,
                     additionalLibraryPaths: capturedLibraryPaths
                 )
 
@@ -166,6 +178,70 @@ final class ProofSession: ObservableObject {
         }
     }
 
+    /// Re-check one obligation, optionally with a different backend and/or a
+    /// stretched timeout — the failed-proof workbench's retry actions.
+    func retryObligation(
+        _ obligation: ProofObligation,
+        backend: ProverBackend? = nil,
+        timeoutMultiplier: Double = 1
+    ) {
+        checkStep(
+            line: obligation.location.startLine,
+            column: obligation.location.startColumn,
+            backend: backend,
+            timeout: options.timeout * max(1, timeoutMultiplier)
+        )
+    }
+
+    /// Obligations that need attention (failed or timed out).
+    var failedObligations: [ProofObligation] {
+        obligations.filter { $0.status == .failed || $0.status == .timeout }
+    }
+
+    /// Re-check only the failed/timed-out obligations, sequentially — the fast
+    /// iteration loop after editing a proof, instead of re-running the whole
+    /// spec.
+    func recheckFailedObligations() {
+        guard !isRunning else { return }
+        let failed = failedObligations
+        guard !failed.isEmpty else { return }
+
+        isRunning = true
+        error = nil
+        progress = nil
+
+        let capturedSpecURL = specURL
+        let capturedOptions = options
+        let stepSessionId = UUID()
+        activeStepSessionIds.insert(stepSessionId)
+
+        task = Task { @MainActor [weak self] in
+            defer { self?.activeStepSessionIds.remove(stepSessionId) }
+            for obligation in failed {
+                guard !Task.isCancelled else { break }
+                do {
+                    let updated = try await TLAPMProcessManager.shared.checkSingleStep(
+                        spec: capturedSpecURL,
+                        line: obligation.location.startLine,
+                        column: obligation.location.startColumn,
+                        backend: capturedOptions.backend,
+                        timeout: capturedOptions.timeout,
+                        sessionId: stepSessionId,
+                        additionalLibraryPaths: capturedOptions.additionalLibraryPaths ?? []
+                    )
+                    guard !Task.isCancelled, let self else { return }
+                    self.updateObligation(updated)
+                } catch {
+                    guard !Task.isCancelled, let self else { return }
+                    logger.error("recheckFailedObligations: \(String(describing: error))")
+                    self.error = error
+                    break
+                }
+            }
+            self?.isRunning = false
+        }
+    }
+
     /// Stop the current proof checking session synchronously
     func stop() {
         // Cancel the task first to prevent it from setting isRunning after we clear it
@@ -176,8 +252,13 @@ final class ProofSession: ObservableObject {
         // Now mark as not running - safe because we've already cancelled the task
         isRunning = false
 
-        // Use synchronous process termination via ProcessRegistry
+        // Use synchronous process termination via ProcessRegistry — the main
+        // session plus any in-flight single-step checks (per-call ids).
         ProcessRegistry.shared.terminate(id)
+        for stepId in activeStepSessionIds {
+            ProcessRegistry.shared.terminate(stepId)
+        }
+        activeStepSessionIds.removeAll()
     }
 
     /// Stop the session and wait for async cleanup to complete
@@ -185,7 +266,12 @@ final class ProofSession: ObservableObject {
         isRunning = false
         task?.cancel()
         task = nil
+        let stepIds = activeStepSessionIds
+        activeStepSessionIds.removeAll()
         await TLAPMProcessManager.shared.stop(sessionId: id)
+        for stepId in stepIds {
+            await TLAPMProcessManager.shared.stop(sessionId: stepId)
+        }
     }
 
     /// Clear all results
@@ -353,6 +439,7 @@ extension ProverBackend {
 
 extension ProofStatus {
     /// Unicode icon for display
+    /// (SF Symbol + color live in Views/StatusIconography.swift)
     var icon: String {
         switch self {
         case .unknown: return "?"
@@ -362,19 +449,6 @@ extension ProofStatus {
         case .timeout: return "\u{23F0}"     // ⏰
         case .omitted: return "\u{25CB}"     // ○
         case .trivial: return "\u{2728}"     // ✨
-        }
-    }
-
-    /// Color for UI display
-    var color: Color {
-        switch self {
-        case .unknown: return .secondary
-        case .pending: return .secondary
-        case .proved: return .green
-        case .failed: return .red
-        case .timeout: return .orange
-        case .omitted: return .secondary
-        case .trivial: return .green
         }
     }
 }

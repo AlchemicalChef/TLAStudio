@@ -33,7 +33,9 @@ BUILD_DIR=""
 DEPS_DIR="$PROJECT_DIR/.deps"
 APP_NAME="TLA+ Studio"
 APP_DIR=""
-VERSION="1.0.0"
+VERSION="0.9.0"
+# Monotonically increasing build number, distinct from the marketing version.
+BUILD_NUMBER="1"
 
 # Parse arguments
 SKIP_PREREQS=false
@@ -507,8 +509,12 @@ create_app_bundle() {
     <string>TLA+ Studio</string>
     <key>CFBundleExecutable</key>
     <string>TLAStudio</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
     <key>CFBundleVersion</key>
-    <string>$VERSION</string>
+    <string>$BUILD_NUMBER</string>
     <key>CFBundleShortVersionString</key>
     <string>$VERSION</string>
     <key>CFBundlePackageType</key>
@@ -532,6 +538,8 @@ create_app_bundle() {
             <string>TLA+ Specification</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
             <key>LSHandlerRank</key>
             <string>Owner</string>
             <key>LSItemContentTypes</key>
@@ -546,6 +554,8 @@ create_app_bundle() {
             <string>TLA+ Configuration</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
             <key>LSHandlerRank</key>
             <string>Alternate</string>
             <key>LSItemContentTypes</key>
@@ -596,7 +606,7 @@ create_app_bundle() {
         </dict>
     </array>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright © 2025. All rights reserved.</string>
+    <string>© 2026 TLA+ Studio</string>
 </dict>
 </plist>
 PLIST

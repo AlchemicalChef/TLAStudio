@@ -21,7 +21,13 @@ struct ProofObligationsPanel: View {
     @ObservedObject var session: ProofSession
     @State private var filter: ObligationFilter = .all
     @State private var selectedObligationId: UUID?
+    @State private var sortByDuration = false
     var onJumpToSource: ((ProofSourceLocation) -> Void)?
+    /// Workbench context (BY DEF suggestions, TLC-bridge candidates) computed
+    /// by the embedding view, which has document access.
+    var assistProvider: ((ProofObligation) -> ProofObligationAssist)?
+    var onApplyByDef: ((ProofAssist.ByDefInsertion) -> Void)?
+    var onModelCheckInvariant: ((String) -> Void)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,6 +51,20 @@ struct ProofObligationsPanel: View {
                 emptyStateView
             } else {
                 obligationsListView
+            }
+
+            // Failed-proof workbench: inspector for the selected obligation.
+            if let selectedId = selectedObligationId,
+               let selected = session.findObligation(by: selectedId) {
+                Divider()
+                ObligationInspectorView(
+                    obligation: selected,
+                    session: session,
+                    assist: assistProvider?(selected) ?? ProofObligationAssist(),
+                    onApplyByDef: onApplyByDef,
+                    onModelCheckInvariant: onModelCheckInvariant,
+                    onJumpToSource: onJumpToSource
+                )
             }
 
             Divider()
@@ -76,6 +96,13 @@ struct ProofObligationsPanel: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(selectedObligationId == nil)
+
+                Button(action: session.recheckFailedObligations) {
+                    Label("Re-check Failed (\(session.failedObligations.count))", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(session.failedObligations.isEmpty)
+                .help("Re-check only the failed/timed-out obligations")
             }
 
             Spacer()
@@ -95,13 +122,21 @@ struct ProofObligationsPanel: View {
     // MARK: - Filter Tabs
 
     private var filterTabsView: some View {
-        Picker("Filter", selection: $filter) {
-            Text("All").tag(ObligationFilter.all)
-            Text("Proved").tag(ObligationFilter.proved)
-            Text("Failed").tag(ObligationFilter.failed)
-            Text("Pending").tag(ObligationFilter.pending)
+        HStack(spacing: 8) {
+            Picker("Filter", selection: $filter) {
+                Text("All").tag(ObligationFilter.all)
+                Text("Proved").tag(ObligationFilter.proved)
+                Text("Failed").tag(ObligationFilter.failed)
+                Text("Pending").tag(ObligationFilter.pending)
+            }
+            .pickerStyle(.segmented)
+
+            Toggle(isOn: $sortByDuration) {
+                Image(systemName: "timer")
+            }
+            .toggleStyle(.button)
+            .help("Sort by duration (slowest first) — find the obligations worth optimizing")
         }
-        .pickerStyle(.segmented)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
@@ -120,7 +155,7 @@ struct ProofObligationsPanel: View {
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                 } else {
-                    Text(progress.phase == .parsing ? "Parsing..." : "Checking proofs...")
+                    Text(progress.phase == .parsing ? "Parsing…" : "Checking proofs…")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -180,16 +215,35 @@ struct ProofObligationsPanel: View {
 
     private var obligationsListView: some View {
         List(selection: $selectedObligationId) {
-            ForEach(filteredObligationTrees) { tree in
-                ObligationTreeRow(
-                    tree: tree,
-                    selectedId: $selectedObligationId,
-                    filter: filter,
-                    onJumpToSource: onJumpToSource
-                )
+            if sortByDuration {
+                // Flat list, slowest first — the duration data has always been
+                // captured; this surfaces where the proof time actually goes.
+                ForEach(durationSortedObligations) { obligation in
+                    ObligationRowView(
+                        obligation: obligation,
+                        isSelected: obligation.id == selectedObligationId,
+                        onJumpToSource: onJumpToSource
+                    )
+                    .tag(obligation.id)
+                }
+            } else {
+                ForEach(filteredObligationTrees) { tree in
+                    ObligationTreeRow(
+                        tree: tree,
+                        selectedId: $selectedObligationId,
+                        filter: filter,
+                        onJumpToSource: onJumpToSource
+                    )
+                }
             }
         }
         .listStyle(.sidebar)
+    }
+
+    private var durationSortedObligations: [ProofObligation] {
+        session.obligations
+            .filter { filter.matches($0.status) }
+            .sorted { ($0.duration ?? 0) > ($1.duration ?? 0) }
     }
 
     private var filteredObligationTrees: [ObligationTree] {
@@ -228,7 +282,7 @@ struct ProofObligationsPanel: View {
             } else if session.isRunning {
                 ProgressView()
                     .controlSize(.small)
-                Text("Checking...")
+                Text("Checking…")
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
@@ -416,30 +470,9 @@ struct ObligationRowView: View {
         return "\(kindName) (line \(line))"
     }
 
-    @ViewBuilder
     private var statusIcon: some View {
-        switch obligation.status {
-        case .proved:
-            Text("\u{2713}")
-                .foregroundColor(.green)
-                .fontWeight(.bold)
-        case .failed:
-            Text("\u{2717}")
-                .foregroundColor(.red)
-                .fontWeight(.bold)
-        case .pending, .unknown:
-            Text("\u{22EF}")
-                .foregroundColor(.yellow)
-        case .timeout:
-            Text("\u{23F0}")
-                .foregroundColor(.orange)
-        case .omitted:
-            Text("\u{25CB}")
-                .foregroundColor(.gray)
-        case .trivial:
-            Text("\u{2728}")
-                .foregroundColor(.green)
-        }
+        Image(systemName: obligation.status.iconName)
+            .foregroundColor(obligation.status.color)
     }
 
     private func formatDuration(_ seconds: TimeInterval) -> String {

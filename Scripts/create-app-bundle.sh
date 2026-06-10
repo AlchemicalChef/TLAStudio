@@ -41,6 +41,12 @@ if [ -f "$TLACORE_DIR/target/release/libtla_core.dylib" ]; then
     echo "Updated dylib paths for bundle portability"
 fi
 
+# Copy app icon (referenced by CFBundleIconFile and the document types'
+# CFBundleTypeIconFile in Info.plist).
+if [ -f "Sources/TLAStudioApp/Resources/AppIcon.icns" ]; then
+    cp "Sources/TLAStudioApp/Resources/AppIcon.icns" "$BUNDLE_DIR/Contents/Resources/AppIcon.icns"
+fi
+
 # Copy Info.plist and process variables
 sed -e "s/\$(PRODUCT_BUNDLE_IDENTIFIER)/com.tlaplus.studio/g" \
     -e "s/\$(EXECUTABLE_NAME)/$APP_NAME/g" \

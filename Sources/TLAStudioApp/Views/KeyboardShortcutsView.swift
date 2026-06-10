@@ -30,9 +30,15 @@ struct KeyboardShortcutsView: View {
                     ShortcutSection(title: "File", shortcuts: fileShortcuts)
                     ShortcutSection(title: "Edit", shortcuts: editShortcuts)
                     ShortcutSection(title: "View", shortcuts: viewShortcuts)
-                    ShortcutSection(title: "Navigation", shortcuts: navigationShortcuts)
+                    ShortcutSection(title: "TLA+", shortcuts: tlaShortcuts)
                     ShortcutSection(title: "Model Checking", shortcuts: modelShortcuts)
                     ShortcutSection(title: "Proof", shortcuts: proofShortcuts)
+                    ShortcutSection(title: "Help", shortcuts: helpShortcuts)
+
+                    Text("The Simulator is controlled from the Simulator tab in the bottom panel; it has no keyboard shortcuts. In the editor, ⌘-click jumps to a definition and ⌃Space triggers completion.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding()
             }
@@ -45,9 +51,9 @@ struct KeyboardShortcutsView: View {
     private var fileShortcuts: [ShortcutItem] {
         [
             ShortcutItem(keys: "N", description: "New Specification"),
-            ShortcutItem(keys: "O", description: "Open..."),
+            ShortcutItem(keys: "O", description: "Open…"),
             ShortcutItem(keys: "S", description: "Save"),
-            ShortcutItem(keys: "S", modifiers: [.shift], description: "Save As..."),
+            ShortcutItem(keys: "S", modifiers: [.shift], description: "Save As…"),
             ShortcutItem(keys: "S", modifiers: [.option], description: "Save All"),
             ShortcutItem(keys: "W", description: "Close"),
             ShortcutItem(keys: "W", modifiers: [.option], description: "Close All"),
@@ -62,8 +68,8 @@ struct KeyboardShortcutsView: View {
             ShortcutItem(keys: "C", description: "Copy"),
             ShortcutItem(keys: "V", description: "Paste"),
             ShortcutItem(keys: "A", description: "Select All"),
-            ShortcutItem(keys: "F", description: "Find..."),
-            ShortcutItem(keys: "F", modifiers: [.option], description: "Find and Replace..."),
+            ShortcutItem(keys: "F", description: "Find…"),
+            ShortcutItem(keys: "F", modifiers: [.option], description: "Find and Replace…"),
             ShortcutItem(keys: "G", description: "Find Next"),
             ShortcutItem(keys: "G", modifiers: [.shift], description: "Find Previous"),
             ShortcutItem(keys: "E", description: "Use Selection for Find"),
@@ -72,7 +78,7 @@ struct KeyboardShortcutsView: View {
 
     private var viewShortcuts: [ShortcutItem] {
         [
-            ShortcutItem(keys: "L", description: "Go to Line..."),
+            ShortcutItem(keys: "L", description: "Go to Line…"),
             ShortcutItem(keys: "K", modifiers: [.option], description: "Fold All"),
             ShortcutItem(keys: "J", modifiers: [.option], description: "Unfold All"),
             ShortcutItem(keys: "[", description: "Toggle Fold"),
@@ -80,10 +86,12 @@ struct KeyboardShortcutsView: View {
         ]
     }
 
-    private var navigationShortcuts: [ShortcutItem] {
+    private var tlaShortcuts: [ShortcutItem] {
         [
+            ShortcutItem(keys: "T", modifiers: [.shift], description: "Translate PlusCal"),
             ShortcutItem(keys: "D", description: "Go to Definition"),
             ShortcutItem(keys: "R", modifiers: [.shift], description: "Find All References"),
+            ShortcutItem(keys: "R", modifiers: [.control], description: "Rename Symbol…"),
         ]
     }
 
@@ -91,7 +99,7 @@ struct KeyboardShortcutsView: View {
         [
             ShortcutItem(keys: "R", description: "Run TLC"),
             ShortcutItem(keys: ".", description: "Stop TLC"),
-            ShortcutItem(keys: "M", modifiers: [.shift], description: "Edit Model Configuration..."),
+            ShortcutItem(keys: "M", modifiers: [.shift], description: "Edit Model Configuration…"),
         ]
     }
 
@@ -99,8 +107,14 @@ struct KeyboardShortcutsView: View {
         [
             ShortcutItem(keys: "P", modifiers: [.shift], description: "Check All Proofs"),
             ShortcutItem(keys: "P", description: "Check Selection"),
+            ShortcutItem(keys: "D", modifiers: [.shift], description: "Decompose Proof"),
             ShortcutItem(keys: "'", description: "Go to Next Failed Proof"),
-            ShortcutItem(keys: "T", modifiers: [.shift], description: "Translate PlusCal"),
+        ]
+    }
+
+    private var helpShortcuts: [ShortcutItem] {
+        [
+            ShortcutItem(keys: "/", description: "Keyboard Shortcuts"),
         ]
     }
 }
@@ -150,20 +164,20 @@ private struct ShortcutBadge: View {
     let shortcut: ShortcutItem
 
     var body: some View {
+        // macOS modifier order: ⌃ ⌥ ⇧ ⌘ (command last, next to the key)
         HStack(spacing: 2) {
-            // Command key is always present
-            KeyCap(symbol: "\u{2318}")
-
-            // Additional modifiers
-            if shortcut.modifiers.contains(.shift) {
-                KeyCap(symbol: "\u{21E7}")
+            if shortcut.modifiers.contains(.control) {
+                KeyCap(symbol: "\u{2303}")
             }
             if shortcut.modifiers.contains(.option) {
                 KeyCap(symbol: "\u{2325}")
             }
-            if shortcut.modifiers.contains(.control) {
-                KeyCap(symbol: "\u{2303}")
+            if shortcut.modifiers.contains(.shift) {
+                KeyCap(symbol: "\u{21E7}")
             }
+
+            // Command key is always present
+            KeyCap(symbol: "\u{2318}")
 
             // Main key
             KeyCap(symbol: shortcut.keys)
@@ -191,8 +205,19 @@ private struct KeyCap: View {
 
 // MARK: - Menu Command
 
+/// Single shared panel: recreating an NSPanel per invocation with the default
+/// `isReleasedWhenClosed = true` is an over-release crash pattern under ARC,
+/// and stacked repeat invocations.
+@MainActor
+private var sharedShortcutsPanel: NSPanel?
+
 extension NSApplication {
     @objc func showKeyboardShortcuts() {
+        if let panel = sharedShortcutsPanel {
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
+
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 600),
             styleMask: [.titled, .closable, .resizable],
@@ -200,9 +225,11 @@ extension NSApplication {
             defer: false
         )
         panel.title = "Keyboard Shortcuts"
+        panel.isReleasedWhenClosed = false
         panel.contentView = NSHostingView(rootView: KeyboardShortcutsView())
         panel.center()
         panel.makeKeyAndOrderFront(nil)
+        sharedShortcutsPanel = panel
     }
 }
 

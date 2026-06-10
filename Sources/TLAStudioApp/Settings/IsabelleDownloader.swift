@@ -389,7 +389,7 @@ final class IsabelleDownloader: ObservableObject {
     // MARK: - Helpers
 
     var formattedProgress: String {
-        guard totalBytes > 0 else { return "Starting..." }
+        guard totalBytes > 0 else { return "Starting…" }
         let downloaded = ByteCountFormatter.string(fromByteCount: downloadedBytes, countStyle: .file)
         let total = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
         return "\(downloaded) / \(total)"

@@ -9,8 +9,18 @@ private let logger = Log.logger(category: "App")
 @main
 struct TLAStudioApp: App {
 
-    // Register custom document controller before any documents open
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    init() {
+        // The FIRST NSDocumentController instantiated becomes `shared`, and
+        // SwiftUI creates a vanilla one during scene setup — before any app
+        // delegate callback. Instantiating ours here (App.init runs first) is
+        // the only way it actually becomes the shared controller; doing it in
+        // applicationWillFinishLaunching was provably too late, leaving every
+        // TLADocumentController override dead — template creation, recents
+        // filtering, the custom open panel (platform review 2026-06-10).
+        _ = TLADocumentController()
+    }
 
     var body: some Scene {
         // Settings window only - documents are managed by NSDocumentController
@@ -34,7 +44,12 @@ struct TLAStudioApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func presentInitialInterfaceIfNeeded() {
-        guard NSDocumentController.shared.documents.isEmpty else {
+        // `odoc` opens and draft restoration both add documents asynchronously
+        // around launch; checking `documents` alone raced them and spawned
+        // phantom Untitled documents (platform review 2026-06-10). A visible
+        // window also counts as "interface present".
+        guard NSDocumentController.shared.documents.isEmpty,
+              !NSApp.windows.contains(where: { $0.isVisible }) else {
             return
         }
 
@@ -50,8 +65,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Ensure app is a regular foreground app that can receive keyboard input
         NSApp.setActivationPolicy(.regular)
 
-        // Install custom document controller before any documents open
-        _ = TLADocumentController()
+        // The custom document controller is installed in TLAStudioApp.init()
+        // — by this point SwiftUI has already created a vanilla controller,
+        // so installing here would silently fail to become `shared`.
+        assert(NSDocumentController.shared is TLADocumentController,
+               "TLADocumentController must be installed before SwiftUI scene setup")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -70,10 +88,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             SafeArchiveExtractor.cleanupStaleStagingDirs()
         }
 
-        // Show welcome screen or create new document if none are open
-        DispatchQueue.main.async {
+        // Welcome-or-untitled decision, deferred long enough for launch-time
+        // document opens to land: the odoc for `open App file` can arrive as
+        // a separate event seconds into a cold start. The guards inside
+        // (documents.isEmpty + no visible window) make a late fire harmless.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             self.presentInitialInterfaceIfNeeded()
+        }
 
+        DispatchQueue.main.async {
             // Prime the parser off the first edit so initial completions/highlighting
             // do not also pay the language-core startup cost.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
@@ -124,8 +147,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        // Launch flow is handled explicitly in applicationDidFinishLaunching to avoid
-        // racing the welcome screen against NSDocument's automatic untitled-document path.
+        // Always false: `open -a App file` can deliver the odoc as a SECOND
+        // Apple event after launch, so AppKit's "no documents at launch"
+        // signal fires before the document arrives and would spawn a phantom
+        // Untitled next to it (verified empirically, platform review). The
+        // welcome-or-untitled decision is made by the deferred check in
+        // applicationDidFinishLaunching instead.
         false
     }
 
@@ -138,11 +165,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !flag {
             presentInitialInterfaceIfNeeded()
         }
-        return true
-    }
-
-    func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        NSDocumentController.shared.newDocument(nil)
         return true
     }
 

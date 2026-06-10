@@ -101,7 +101,7 @@ struct FindReplacePanel: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(manager.totalMatches == 0)
-                .help("Previous Match (Shift+Enter)")
+                .help("Previous Match (⇧↩)")
                 .keyboardShortcut("g", modifiers: [.command, .shift])
 
                 Button {

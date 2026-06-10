@@ -364,7 +364,7 @@ struct ModelCheckInspector: View {
             HStack {
                 ProgressView()
                     .controlSize(.small)
-                Text("Running...")
+                Text("Running…")
                     .foregroundColor(.secondary)
             }
 
@@ -389,7 +389,7 @@ struct ModelCheckInspector: View {
             HStack {
                 Image(systemName: "circle.dashed")
                     .foregroundColor(.secondary)
-                Text("Not Run")
+                Text("Not run")
                     .foregroundColor(.secondary)
             }
         }
@@ -530,7 +530,7 @@ struct ProofInspector: View {
             HStack {
                 ProgressView()
                     .controlSize(.small)
-                Text("Checking...")
+                Text("Checking…")
                     .foregroundColor(.secondary)
             }
 
@@ -563,7 +563,7 @@ struct ProofInspector: View {
             HStack {
                 Image(systemName: "seal")
                     .foregroundColor(.secondary)
-                Text("Not Checked")
+                Text("Not checked")
                     .foregroundColor(.secondary)
             }
         }
@@ -653,7 +653,7 @@ struct ProofInspector: View {
                 Divider()
 
                 Picker("Obligation", selection: $selectedObligationId) {
-                    Text("Select...").tag(nil as UUID?)
+                    Text("Select…").tag(nil as UUID?)
                     ForEach(session.obligations, id: \.id) { obligation in
                         Text("Line \(obligation.location.startLine)")
                             .tag(obligation.id as UUID?)

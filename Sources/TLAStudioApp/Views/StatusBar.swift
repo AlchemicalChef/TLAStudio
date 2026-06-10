@@ -74,6 +74,20 @@ struct StatusBar: View {
 
                 Divider()
                     .frame(height: 12)
+            } else if let session = document.proofSession, !session.obligations.isEmpty {
+                // Persistent proof health from the last run.
+                HStack(spacing: 4) {
+                    Image(systemName: session.hasFailed ? "xmark.shield.fill" : "checkmark.shield.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(session.hasFailed ? .red : .green)
+                    Text(proofHealthText(for: session))
+                        .font(.system(size: 11))
+                }
+                .padding(.horizontal, 8)
+                .help("Proof status from the last TLAPM run")
+
+                Divider()
+                    .frame(height: 12)
             }
 
             // File type
@@ -85,6 +99,14 @@ struct StatusBar: View {
         .background(Color(NSColor.controlBackgroundColor))
     }
 
+    private func proofHealthText(for session: ProofSession) -> String {
+        let stats = session.statistics
+        if stats.failed > 0 {
+            return "\(stats.proved)/\(stats.total) proved, \(stats.failed) failed"
+        }
+        return "\(stats.proved)/\(stats.total) proved"
+    }
+
     // MARK: - Parse Status
 
     @ViewBuilder
@@ -93,13 +115,13 @@ struct StatusBar: View {
         let warningCount = document.diagnostics.filter { $0.severity == .warning }.count
 
         if errorCount > 0 {
-            Image(systemName: "xmark.circle.fill")
+            Image(systemName: TLADiagnosticSeverity.error.iconName)
                 .font(.system(size: 10))
-                .foregroundColor(.red)
+                .foregroundColor(TLADiagnosticSeverity.error.color)
         } else if warningCount > 0 {
-            Image(systemName: "exclamationmark.triangle.fill")
+            Image(systemName: TLADiagnosticSeverity.warning.iconName)
                 .font(.system(size: 10))
-                .foregroundColor(.orange)
+                .foregroundColor(TLADiagnosticSeverity.warning.color)
         } else {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 10))
@@ -112,7 +134,7 @@ struct StatusBar: View {
         let warningCount = document.diagnostics.filter { $0.severity == .warning }.count
 
         if errorCount > 0 && warningCount > 0 {
-            return "\(errorCount) errors, \(warningCount) warnings"
+            return "\(errorCount) error\(errorCount == 1 ? "" : "s"), \(warningCount) warning\(warningCount == 1 ? "" : "s")"
         } else if errorCount > 0 {
             return "\(errorCount) error\(errorCount == 1 ? "" : "s")"
         } else if warningCount > 0 {

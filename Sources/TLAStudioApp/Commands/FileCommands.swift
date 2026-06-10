@@ -31,7 +31,7 @@ struct FileCommands: Commands {
 
             Divider()
 
-            Button("Open...") {
+            Button("Open…") {
                 NSDocumentController.shared.openDocument(nil)
             }
             .keyboardShortcut("o", modifiers: .command)
@@ -46,7 +46,7 @@ struct FileCommands: Commands {
             }
             .keyboardShortcut("s", modifiers: .command)
 
-            Button("Save As...") {
+            Button("Save As…") {
                 NSApp.sendAction(#selector(NSDocument.saveAs(_:)), to: nil, from: nil)
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
@@ -95,13 +95,13 @@ struct EditCommands: Commands {
         CommandGroup(after: .undoRedo) {
             Divider()
 
-            Button("Find...") {
+            Button("Find…") {
                 guard let document = activeTLADocument() else { return }
                 NotificationCenter.default.post(name: .showFindReplace, object: document, userInfo: ["showReplace": false])
             }
             .keyboardShortcut("f", modifiers: .command)
 
-            Button("Find and Replace...") {
+            Button("Find and Replace…") {
                 guard let document = activeTLADocument() else { return }
                 NotificationCenter.default.post(name: .showFindReplace, object: document, userInfo: ["showReplace": true])
             }
@@ -135,8 +135,11 @@ struct EditCommands: Commands {
 /// View menu commands for folding and display options
 struct ViewCommands: Commands {
     var body: some Commands {
-        CommandMenu("View") {
-            Button("Go to Line...") {
+        // "Navigate", not "View": a CommandMenu never merges with the system
+        // View menu, so naming it "View" produced two View menus in the menu
+        // bar (platform review).
+        CommandMenu("Navigate") {
+            Button("Go to Line…") {
                 guard let document = activeTLADocument() else { return }
                 NotificationCenter.default.post(name: .goToLine, object: document)
             }
@@ -207,6 +210,12 @@ struct TLACommands: Commands {
                 NotificationCenter.default.post(name: .findReferences, object: document)
             }
             .keyboardShortcut("r", modifiers: [.command, .shift])
+
+            Button("Rename Symbol…") {
+                guard let document = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .renameSymbol, object: document)
+            }
+            .keyboardShortcut("r", modifiers: [.command, .control])
         }
     }
 }
@@ -214,6 +223,8 @@ struct TLACommands: Commands {
 // MARK: - Model Check Commands
 
 struct ModelCheckCommands: Commands {
+    @ObservedObject private var commandState = AppCommandState.shared
+
     var body: some Commands {
         CommandMenu("Model") {
             Button("Run TLC") {
@@ -229,10 +240,11 @@ struct ModelCheckCommands: Commands {
                 }
             }
             .keyboardShortcut(".", modifiers: .command)
+            .disabled(!commandState.isTLCRunning)
 
             Divider()
 
-            Button("Edit Model Configuration...") {
+            Button("Edit Model Configuration…") {
                 guard let document = activeTLADocument() else { return }
                 NotificationCenter.default.post(name: .editModelConfig, object: document)
             }
@@ -244,6 +256,8 @@ struct ModelCheckCommands: Commands {
 // MARK: - Proof Commands
 
 struct ProofCommands: Commands {
+    @ObservedObject private var commandState = AppCommandState.shared
+
     var body: some Commands {
         CommandMenu("Proof") {
             Button("Check All Proofs") {
@@ -260,6 +274,12 @@ struct ProofCommands: Commands {
             }
             .keyboardShortcut("p", modifiers: .command)
 
+            Button("Decompose Proof") {
+                guard let doc = activeTLADocument() else { return }
+                NotificationCenter.default.post(name: .decomposeProof, object: doc)
+            }
+            .keyboardShortcut("d", modifiers: [.command, .shift])
+
             Divider()
 
             Button("Stop Proof Checking") {
@@ -267,6 +287,7 @@ struct ProofCommands: Commands {
                     doc.stopProofCheck()
                 }
             }
+            .disabled(!commandState.isProofRunning)
 
             Divider()
 
@@ -276,6 +297,7 @@ struct ProofCommands: Commands {
                 }
             }
             .keyboardShortcut("'", modifiers: .command)
+            .disabled(!commandState.hasFailedProofs)
 
             Divider()
 
@@ -311,7 +333,9 @@ struct HelpCommands: Commands {
             }
 
             Button("TLAPS Proof System") {
-                if let url = URL(string: "https://tla.msr-inria.inria.fr/tlaps/content/Home.html") {
+                // The historical tla.msr-inria.inria.fr host has been retired;
+                // proofs.tlapl.us is the current TLAPS home.
+                if let url = URL(string: "https://proofs.tlapl.us") {
                     NSWorkspace.shared.open(url)
                 }
             }

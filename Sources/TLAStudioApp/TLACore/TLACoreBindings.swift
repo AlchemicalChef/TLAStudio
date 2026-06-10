@@ -639,6 +639,14 @@ public protocol TlaCoreProtocol : AnyObject {
     func analyzeContext(result: ParseResult, position: Position)  -> CompletionContext
     
     /**
+     * All `identifier` / `identifier_ref` nodes whose text equals `name`,
+     * in document order. The grammar gives comments and strings their own
+     * node kinds, so identifier nodes cannot occur inside them — exclusion
+     * is structural, with exact whole-token boundaries. Capped at 5000.
+     */
+    func findIdentifierOccurrences(result: ParseResult, name: String)  -> [IdentifierOccurrence]
+    
+    /**
      * Get completions at a position.
      * Uses cached keyword completions for performance.
      */
@@ -752,6 +760,21 @@ open func analyzeContext(result: ParseResult, position: Position) -> CompletionC
     uniffi_tla_core_fn_method_tlacore_analyze_context(self.uniffiClonePointer(),
         FfiConverterTypeParseResult.lower(result),
         FfiConverterTypePosition.lower(position),$0
+    )
+})
+}
+    
+    /**
+     * All `identifier` / `identifier_ref` nodes whose text equals `name`,
+     * in document order. The grammar gives comments and strings their own
+     * node kinds, so identifier nodes cannot occur inside them — exclusion
+     * is structural, with exact whole-token boundaries. Capped at 5000.
+     */
+open func findIdentifierOccurrences(result: ParseResult, name: String) -> [IdentifierOccurrence] {
+    return try!  FfiConverterSequenceTypeIdentifierOccurrence.lift(try! rustCall() {
+    uniffi_tla_core_fn_method_tlacore_find_identifier_occurrences(self.uniffiClonePointer(),
+        FfiConverterTypeParseResult.lower(result),
+        FfiConverterString.lower(name),$0
     )
 })
 }
@@ -1409,6 +1432,76 @@ public func FfiConverterTypeHighlightToken_lift(_ buf: RustBuffer) throws -> Hig
 #endif
 public func FfiConverterTypeHighlightToken_lower(_ value: HighlightToken) -> RustBuffer {
     return FfiConverterTypeHighlightToken.lower(value)
+}
+
+
+/**
+ * One occurrence of an identifier in the parse tree (definitions and
+ * references; comments and strings excluded by grammar structure).
+ */
+public struct IdentifierOccurrence {
+    public var range: Range
+    public var role: OccurrenceRole
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(range: Range, role: OccurrenceRole) {
+        self.range = range
+        self.role = role
+    }
+}
+
+
+
+extension IdentifierOccurrence: Equatable, Hashable {
+    public static func ==(lhs: IdentifierOccurrence, rhs: IdentifierOccurrence) -> Bool {
+        if lhs.range != rhs.range {
+            return false
+        }
+        if lhs.role != rhs.role {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(range)
+        hasher.combine(role)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIdentifierOccurrence: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IdentifierOccurrence {
+        return
+            try IdentifierOccurrence(
+                range: FfiConverterTypeRange.read(from: &buf), 
+                role: FfiConverterTypeOccurrenceRole.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IdentifierOccurrence, into buf: inout [UInt8]) {
+        FfiConverterTypeRange.write(value.range, into: &buf)
+        FfiConverterTypeOccurrenceRole.write(value.role, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentifierOccurrence_lift(_ buf: RustBuffer) throws -> IdentifierOccurrence {
+    return try FfiConverterTypeIdentifierOccurrence.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIdentifierOccurrence_lower(_ value: IdentifierOccurrence) -> RustBuffer {
+    return FfiConverterTypeIdentifierOccurrence.lower(value)
 }
 
 
@@ -2267,6 +2360,73 @@ extension DiagnosticSeverity: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Role of an identifier occurrence found by `find_identifier_occurrences`.
+ */
+
+public enum OccurrenceRole {
+    
+    case definition
+    case reference
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOccurrenceRole: FfiConverterRustBuffer {
+    typealias SwiftType = OccurrenceRole
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OccurrenceRole {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .definition
+        
+        case 2: return .reference
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OccurrenceRole, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .definition:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .reference:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOccurrenceRole_lift(_ buf: RustBuffer) throws -> OccurrenceRole {
+    return try FfiConverterTypeOccurrenceRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOccurrenceRole_lower(_ value: OccurrenceRole) -> RustBuffer {
+    return FfiConverterTypeOccurrenceRole.lower(value)
+}
+
+
+
+extension OccurrenceRole: Equatable, Hashable {}
+
+
+
 
 public enum ParseError {
 
@@ -2647,6 +2807,31 @@ fileprivate struct FfiConverterSequenceTypeHighlightToken: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeIdentifierOccurrence: FfiConverterRustBuffer {
+    typealias SwiftType = [IdentifierOccurrence]
+
+    public static func write(_ value: [IdentifierOccurrence], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeIdentifierOccurrence.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [IdentifierOccurrence] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [IdentifierOccurrence]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeIdentifierOccurrence.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeParameterInfo: FfiConverterRustBuffer {
     typealias SwiftType = [ParameterInfo]
 
@@ -2741,6 +2926,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tla_core_checksum_method_tlacore_analyze_context() != 45035) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tla_core_checksum_method_tlacore_find_identifier_occurrences() != 50189) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tla_core_checksum_method_tlacore_get_completions() != 1608) {

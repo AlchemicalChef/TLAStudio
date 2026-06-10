@@ -43,7 +43,7 @@ struct NavigatorSidebar: View {
                     badge: nil,
                     action: { selectedTab = 2 }
                 )
-                .help("Search (⇧⌘F)")
+                .help("Search")
             }
             .padding(8)
 
@@ -61,8 +61,7 @@ struct NavigatorSidebar: View {
                 EmptyView()
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleSymbolOutline)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.toggleSymbolOutline, for: document) {
             selectedTab = 1
         }
     }

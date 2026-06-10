@@ -301,6 +301,49 @@ enum BinaryDiscovery {
         return nil
     }
 
+    /// On-disk directories that may contain TLA+ standard-library (or user-installed)
+    /// modules, for tools that take a module *search path* rather than a per-file lookup
+    /// (e.g. SANY's `TLA-Library` property).
+    ///
+    /// Mirrors the candidate roots `findModule` probes per file. Note the standard
+    /// library is also baked into `tla2tools.jar`, so `EXTENDS Naturals` resolves even
+    /// when this list is empty — these directories only add tooling parity for modules
+    /// installed outside the jar.
+    static func standardModulesDirectories() -> [URL] {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+
+        if let resourcePath = Bundle.main.resourcePath {
+            let root = URL(fileURLWithPath: resourcePath)
+            for directory in ["modules", "StandardModules", "lib/tlapm/stdlib"] {
+                candidates.append(root.appendingPathComponent(directory))
+            }
+        }
+
+        // Development checkout fallback for `swift run` / test builds.
+        if let root = developmentProjectRoot {
+            candidates.append(root.appendingPathComponent("Resources/StandardModules"))
+            candidates.append(root.appendingPathComponent("Scripts/tlapm/library"))
+        }
+
+        let home = fm.homeDirectoryForCurrentUser
+        candidates.append(home.appendingPathComponent(".tlaplus"))
+        candidates.append(home.appendingPathComponent(".tla"))
+        candidates.append(home.appendingPathComponent(".tlaplus/modules"))
+
+        candidates.append(contentsOf: [
+            "/usr/local/share/tla+",
+            "/usr/local/share/tla+/modules",
+            "/opt/homebrew/share/tla+",
+            "/opt/homebrew/share/tla+/modules"
+        ].map { URL(fileURLWithPath: $0) })
+
+        return candidates.filter { url in
+            var isDirectory: ObjCBool = false
+            return fm.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+        }
+    }
+
     /// Search for a TLA+ module file by name.
     ///
     /// Search order:

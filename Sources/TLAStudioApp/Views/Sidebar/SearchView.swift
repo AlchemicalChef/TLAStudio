@@ -25,7 +25,7 @@ struct SearchView: View {
             if searchManager.query.isEmpty {
                 emptySearchView
             } else if isSearching {
-                ProgressView("Searching...")
+                ProgressView("Searching…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if searchManager.results.isEmpty {
                 noResultsView
@@ -152,7 +152,7 @@ struct SearchView: View {
                 .font(.largeTitle)
                 .foregroundColor(.secondary)
 
-            Text("No Results")
+            Text("No results")
                 .font(.headline)
 
             Text("No matches found for '\(searchManager.query)'")
@@ -362,10 +362,10 @@ class DocumentSearchManager: ObservableObject {
                     contextAfter = contextAfter.replacingOccurrences(of: "\n", with: " ")
 
                     if contextStart > 0 {
-                        contextBefore = "..." + contextBefore.trimmingCharacters(in: .whitespaces)
+                        contextBefore = "…" + contextBefore.trimmingCharacters(in: .whitespaces)
                     }
                     if contextEnd < nsContent.length {
-                        contextAfter = contextAfter.trimmingCharacters(in: .whitespaces) + "..."
+                        contextAfter = contextAfter.trimmingCharacters(in: .whitespaces) + "…"
                     }
 
                     let result = SearchResult(

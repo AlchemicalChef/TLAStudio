@@ -42,6 +42,21 @@ pub struct Range {
     pub end: Position,
 }
 
+/// Role of an identifier occurrence found by `find_identifier_occurrences`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OccurrenceRole {
+    Definition,
+    Reference,
+}
+
+/// One occurrence of an identifier in the parse tree (definitions and
+/// references; comments and strings excluded by grammar structure).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct IdentifierOccurrence {
+    pub range: Range,
+    pub role: OccurrenceRole,
+}
+
 /// Symbol kinds in TLA+
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum SymbolKind {
@@ -1073,6 +1088,63 @@ impl TLACore {
         self.extract_symbols(tree.root_node(), &result.source, 0)
     }
 
+    /// All `identifier` / `identifier_ref` nodes whose text equals `name`,
+    /// in document order. The grammar gives comments and strings their own
+    /// node kinds, so identifier nodes cannot occur inside them — exclusion
+    /// is structural, with exact whole-token boundaries. Capped at 5000.
+    pub fn find_identifier_occurrences(
+        &self,
+        result: &ParseResult,
+        name: String,
+    ) -> Vec<IdentifierOccurrence> {
+        const MAX_OCCURRENCES: usize = 5000;
+
+        let tree_guard = result.tree.lock();
+        let Some(tree) = tree_guard.as_ref() else {
+            return vec![];
+        };
+        let source = &result.source;
+
+        let mut occurrences = Vec::new();
+        let mut cursor = tree.walk();
+
+        loop {
+            let node = cursor.node();
+            let kind = node.kind();
+
+            // Comments/strings can't contain identifier nodes; skipping their
+            // subtrees is a cheap traversal shortcut.
+            let skip_subtree = matches!(kind, "comment" | "block_comment" | "string");
+
+            if !skip_subtree
+                && matches!(kind, "identifier" | "identifier_ref")
+                && node
+                    .utf8_text(source.as_bytes())
+                    .map(|text| text == name)
+                    .unwrap_or(false)
+            {
+                if occurrences.len() >= MAX_OCCURRENCES {
+                    break;
+                }
+                occurrences.push(IdentifierOccurrence {
+                    range: self.node_range(&node),
+                    role: Self::occurrence_role(&node),
+                });
+            }
+
+            if !skip_subtree && cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return occurrences;
+                }
+            }
+        }
+
+        occurrences
+    }
+
     /// Get syntax highlights for a range.
     /// Uses pre-interned capture names for performance. A per-call `QueryCursor`
     /// avoids the contention and cross-call state risk of a shared `Mutex<QueryCursor>`.
@@ -1221,6 +1293,23 @@ impl TLACore {
             }
         }
 
+        // LET-scoped locals: definitions bound by `let_in` ancestors of the
+        // cursor, ranked above everything user-visible (priority 5 < stdlib 8
+        // < user symbols). Module-name contexts stay clean.
+        if !matches!(
+            context,
+            CompletionContext::AfterExtends | CompletionContext::AfterInstance
+        ) {
+            let let_symbols = self.collect_let_bound_symbols(result, position);
+            if !let_symbols.is_empty() {
+                let mut items = Self::symbols_to_completions(&let_symbols, 5);
+                for item in &mut items {
+                    item.detail = Some("LET-local".to_string());
+                }
+                completions.extend(items);
+            }
+        }
+
         // Sort by priority then alphabetically
         completions.sort_by(|a, b| {
             a.sort_priority.cmp(&b.sort_priority)
@@ -1267,6 +1356,144 @@ impl TLACore {
 
 // Private helper methods (not exported via FFI)
 impl TLACore {
+    /// Parameter names of an operator/function definition node (`parameter`
+    /// field children; higher-order params like `f(_, _)` contribute their
+    /// operator name).
+    fn operator_parameters(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut parameters = Vec::new();
+        let mut param_cursor = node.walk();
+        for param_node in node.children_by_field_name("parameter", &mut param_cursor) {
+            if !param_node.is_named() {
+                continue;
+            }
+            match param_node.kind() {
+                "identifier" => {
+                    if let Ok(text) = param_node.utf8_text(source.as_bytes()) {
+                        parameters.push(text.to_string());
+                    }
+                }
+                "operator_declaration" => {
+                    // Higher-order params like f(_,_)
+                    if let Some(op_name) = param_node.child_by_field_name("name") {
+                        if let Ok(text) = op_name.utf8_text(source.as_bytes()) {
+                            parameters.push(text.to_string());
+                        }
+                    }
+                }
+                _ => {
+                    if let Ok(text) = param_node.utf8_text(source.as_bytes()) {
+                        parameters.push(text.to_string());
+                    }
+                }
+            }
+        }
+        parameters
+    }
+
+    /// Bound names of a `function_definition` (`f[x \in S, y \in T] == …`):
+    /// the `intro` identifiers of its `quantifier_bound` children.
+    fn function_bound_names(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "quantifier_bound" {
+                continue;
+            }
+            let mut intro_cursor = child.walk();
+            for intro in child.children_by_field_name("intro", &mut intro_cursor) {
+                if intro.kind() == "identifier" {
+                    if let Ok(text) = intro.utf8_text(source.as_bytes()) {
+                        names.push(text.to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// Definitions bound by every `let_in` ancestor of the cursor position.
+    /// Scoping is inherent: only ancestors contribute, so LET-bound names
+    /// never appear outside their `LET … IN` extent.
+    fn collect_let_bound_symbols(&self, result: &ParseResult, position: Position) -> Vec<Symbol> {
+        let tree_guard = result.tree.lock();
+        let Some(tree) = tree_guard.as_ref() else {
+            return vec![];
+        };
+        let source = &result.source;
+        let point = tree_sitter::Point {
+            row: position.line as usize,
+            column: position.column as usize,
+        };
+        let Some(start) = tree.root_node().descendant_for_point_range(point, point) else {
+            return vec![];
+        };
+
+        let mut symbols = Vec::new();
+        let mut node = start;
+        loop {
+            if node.kind() == "let_in" {
+                let mut cursor = node.walk();
+                for definition in node.children_by_field_name("definitions", &mut cursor) {
+                    if !matches!(definition.kind(), "operator_definition" | "function_definition") {
+                        continue;
+                    }
+                    let Some(name_node) = definition.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    // function_definition keeps its bounds in quantifier_bound
+                    // children, not a `parameter` field.
+                    let parameters = if definition.kind() == "function_definition" {
+                        Self::function_bound_names(&definition, source)
+                    } else {
+                        Self::operator_parameters(&definition, source)
+                    };
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Operator,
+                        range: self.node_range(&definition),
+                        selection_range: Some(self.node_range(&name_node)),
+                        children: vec![],
+                        parameters,
+                    });
+                }
+            }
+            match node.parent() {
+                Some(parent) => node = parent,
+                None => break,
+            }
+        }
+        symbols
+    }
+
+    /// Classify an identifier node: the `name` of a definition/declaration
+    /// vs. a reference. Declarations list their identifiers as plain children,
+    /// so any identifier directly under one is a defined name.
+    fn occurrence_role(node: &tree_sitter::Node) -> OccurrenceRole {
+        let Some(parent) = node.parent() else {
+            return OccurrenceRole::Reference;
+        };
+        match parent.kind() {
+            "operator_definition" | "function_definition" | "module_definition" | "theorem"
+            | "operator_declaration" => {
+                let is_name = parent
+                    .child_by_field_name("name")
+                    .map(|name_node| name_node.id() == node.id())
+                    .unwrap_or(false);
+                if is_name {
+                    OccurrenceRole::Definition
+                } else {
+                    OccurrenceRole::Reference
+                }
+            }
+            "variable_declaration" | "constant_declaration" => OccurrenceRole::Definition,
+            _ => OccurrenceRole::Reference,
+        }
+    }
+
     fn extract_diagnostics(&self, tree: &Tree, _source: &str) -> Vec<Diagnostic> {
         // Cap the diagnostic count so pathological inputs (or tree-sitter error storms)
         // cannot grow the FFI-copied Vec unbounded per keystroke. The sibling
@@ -1368,46 +1595,26 @@ impl TLACore {
                 "operator_definition" => {
                     if let Some(name_node) = child.child_by_field_name("name") {
                         let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-                        // Extract parameters from operator definition
-                        let mut parameters = Vec::new();
-                        let mut param_cursor = child.walk();
-                        for param_node in child.children_by_field_name("parameter", &mut param_cursor) {
-                            if !param_node.is_named() {
-                                continue;
-                            }
-                            match param_node.kind() {
-                                "identifier" => {
-                                    if let Ok(text) = param_node.utf8_text(source.as_bytes()) {
-                                        parameters.push(text.to_string());
-                                    }
-                                }
-                                "operator_declaration" => {
-                                    // Higher-order params like f(_,_)
-                                    if let Some(op_name) = param_node.child_by_field_name("name") {
-                                        if let Ok(text) = op_name.utf8_text(source.as_bytes()) {
-                                            parameters.push(text.to_string());
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if let Ok(text) = param_node.utf8_text(source.as_bytes()) {
-                                        parameters.push(text.to_string());
-                                    }
-                                }
-                            }
-                        }
                         symbols.push(Symbol {
                             name,
                             kind: SymbolKind::Operator,
                             range: self.node_range(&child),
                             selection_range: Some(self.node_range(&name_node)),
                             children: vec![],
-                            parameters,
+                            parameters: Self::operator_parameters(&child, source),
                         });
                     }
                 }
+                // The grammar exposes declared names as plain `identifier`
+                // children — there is no "name" field on declarations (the
+                // previous `children_by_field_name("name", …)` matched nothing,
+                // so variables/constants were silently absent from symbols).
                 "variable_declaration" => {
-                    for var in child.children_by_field_name("name", &mut child.walk()) {
+                    let mut decl_cursor = child.walk();
+                    for var in child.named_children(&mut decl_cursor) {
+                        if var.kind() != "identifier" {
+                            continue;
+                        }
                         let name = var.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                         symbols.push(Symbol {
                             name,
@@ -1420,12 +1627,22 @@ impl TLACore {
                     }
                 }
                 "constant_declaration" => {
-                    for constant in child.children_by_field_name("name", &mut child.walk()) {
-                        let name = constant.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    let mut decl_cursor = child.walk();
+                    for constant in child.named_children(&mut decl_cursor) {
+                        // Plain `CONSTANT N` is an identifier; higher-order
+                        // `CONSTANT Op(_, _)` is an operator_declaration whose
+                        // name IS field-addressed.
+                        let name_node = match constant.kind() {
+                            "identifier" => Some(constant),
+                            "operator_declaration" => constant.child_by_field_name("name"),
+                            _ => None,
+                        };
+                        let Some(name_node) = name_node else { continue };
+                        let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                         symbols.push(Symbol {
                             name,
                             kind: SymbolKind::Constant,
-                            range: self.node_range(&constant),
+                            range: self.node_range(&name_node),
                             selection_range: None,
                             children: vec![],
                             parameters: vec![],
@@ -1882,3 +2099,135 @@ impl TLACore {
 
 // Note: Default impl removed to prevent panic on construction failure.
 // Use TLACore::new() which returns Result<Self, ParseError> instead.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn occurrences(source: &str, name: &str) -> Vec<IdentifierOccurrence> {
+        let core = TLACore::new().expect("core");
+        let result = core.parse(source.to_string()).expect("parse");
+        core.find_identifier_occurrences(&result, name.to_string())
+    }
+
+    #[test]
+    fn finds_definition_and_references() {
+        let source = "---- MODULE M ----\nFoo == 1\nUse == Foo + Foo\n====";
+        let found = occurrences(source, "Foo");
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].role, OccurrenceRole::Definition);
+        assert_eq!(found[1].role, OccurrenceRole::Reference);
+        assert_eq!(found[2].role, OccurrenceRole::Reference);
+        assert_eq!(found[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn excludes_comments_and_strings() {
+        let source = concat!(
+            "---- MODULE M ----\n",
+            "\\* Foo in a line comment\n",
+            "(* Foo in a block comment *)\n",
+            "Bar == \"Foo in a string\"\n",
+            "Foo == 1\n",
+            "====",
+        );
+        let found = occurrences(source, "Foo");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].role, OccurrenceRole::Definition);
+        assert_eq!(found[0].range.start.line, 4);
+    }
+
+    #[test]
+    fn matches_whole_tokens_only() {
+        let source = "---- MODULE M ----\nFoo == 1\nFooBar == Foo\n====";
+        let found = occurrences(source, "Foo");
+        assert_eq!(found.len(), 2, "FooBar must not match");
+    }
+
+    #[test]
+    fn variable_and_constant_declarations_are_definitions() {
+        let source = "---- MODULE M ----\nVARIABLE x, y\nCONSTANT N\nInit == x = N /\\ y = 0\n====";
+        let x = occurrences(source, "x");
+        assert_eq!(x[0].role, OccurrenceRole::Definition);
+        assert_eq!(x[1].role, OccurrenceRole::Reference);
+        let n = occurrences(source, "N");
+        assert_eq!(n[0].role, OccurrenceRole::Definition);
+    }
+
+    #[test]
+    fn multibyte_characters_keep_byte_columns() {
+        // tree-sitter reports byte columns; "é" is 2 UTF-8 bytes.
+        let source = "---- MODULE M ----\nFoo == \"é\" \\o Bar\nBar == \"x\"\n====";
+        let found = occurrences(source, "Bar");
+        assert_eq!(found.len(), 2);
+        // On line 1, `Bar` follows `Foo == "é" \o ` = 15 bytes (é is 2).
+        assert_eq!(found[0].range.start.column, 15);
+    }
+
+    #[test]
+    fn missing_name_returns_empty() {
+        let source = "---- MODULE M ----\nFoo == 1\n====";
+        assert!(occurrences(source, "Nope").is_empty());
+    }
+
+    #[test]
+    fn let_bound_symbols_complete_inside_in_body() {
+        let source = concat!(
+            "---- MODULE M ----\n",
+            "EXTENDS Naturals\n",
+            "Op == LET sum(a, b) == a + b\n",
+            "      IN sum(1, 2)\n",
+            "Other == 1\n",
+            "====",
+        );
+        let core = TLACore::new().expect("core");
+        let result = core.parse(source.to_string()).expect("parse");
+
+        // Cursor inside the IN body.
+        let inside = core.get_detailed_completions(&result, Position { line: 3, column: 12 });
+        let sum_item = inside
+            .iter()
+            .find(|c| c.label == "sum")
+            .expect("sum should complete inside the LET..IN body");
+        assert_eq!(sum_item.detail.as_deref(), Some("LET-local"));
+        assert_eq!(sum_item.signature.as_deref(), Some("sum(a, b)"));
+        assert_eq!(sum_item.sort_priority, 5);
+    }
+
+    #[test]
+    fn let_bound_symbols_do_not_leak_outside() {
+        let source = concat!(
+            "---- MODULE M ----\n",
+            "Op == LET hidden == 1\n",
+            "      IN hidden\n",
+            "Other == 2\n",
+            "====",
+        );
+        let core = TLACore::new().expect("core");
+        let result = core.parse(source.to_string()).expect("parse");
+
+        // Cursor on the next definition's body, outside the LET.
+        let outside = core.get_detailed_completions(&result, Position { line: 3, column: 9 });
+        assert!(
+            !outside.iter().any(|c| c.detail.as_deref() == Some("LET-local")),
+            "LET-bound names must not escape their IN body"
+        );
+    }
+
+    #[test]
+    fn nested_lets_expose_all_ancestor_levels() {
+        let source = concat!(
+            "---- MODULE M ----\n",
+            "Op == LET outer == 1\n",
+            "      IN LET inner == 2\n",
+            "         IN inner + outer\n",
+            "====",
+        );
+        let core = TLACore::new().expect("core");
+        let result = core.parse(source.to_string()).expect("parse");
+
+        let completions = core.get_detailed_completions(&result, Position { line: 3, column: 15 });
+        assert!(completions.iter().any(|c| c.label == "inner"));
+        assert!(completions.iter().any(|c| c.label == "outer"));
+    }
+}

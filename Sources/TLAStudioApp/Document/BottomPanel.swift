@@ -69,6 +69,42 @@ struct BottomPanel: View {
                 .background(selectedTab == 2 ? Color.accentColor.opacity(0.2) : Color.clear)
                 .cornerRadius(4)
 
+                // Simulator tab with live indicator
+                Button {
+                    selectedTab = 3
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("Simulator")
+                        if document.simulationSession != nil {
+                            Image(systemName: "circle.fill")
+                                .font(.system(size: 6))
+                                .foregroundColor(.green)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(selectedTab == 3 ? Color.accentColor.opacity(0.2) : Color.clear)
+                .cornerRadius(4)
+
+                // References tab with result count
+                Button {
+                    selectedTab = 4
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("References")
+                        if let results = document.referenceResults {
+                            BadgeView(count: results.hits.count, color: .blue)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(selectedTab == 4 ? Color.accentColor.opacity(0.2) : Color.clear)
+                .cornerRadius(4)
+
                 Spacer()
             }
             .padding(4)
@@ -79,14 +115,34 @@ struct BottomPanel: View {
             // Content
             switch selectedTab {
             case 0:
-                ProblemsPanelContent(diagnostics: document.diagnostics)
+                ProblemsPanelContent(diagnostics: document.diagnostics) { diagnostic in
+                    let offset = document.offset(
+                        forLine: Int(diagnostic.range.start.line),
+                        column: Int(diagnostic.range.start.column)
+                    )
+                    document.selectedRange = NSRange(location: offset, length: 0)
+                }
             case 1:
                 OutputPanelContent()
             case 2:
                 ModelCheckPanelContent(document: document)
+            case 3:
+                SimulatorPanelContent(document: document)
+            case 4:
+                ReferencesPanelContent(document: document)
             default:
                 EmptyView()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showReferencesPanel)) { notification in
+            guard (notification.object as? TLADocument) === document else { return }
+            selectedTab = 4
+        }
+        .onReceiveDocumentNotification(.showOutputPanel, for: document) {
+            selectedTab = 1
+        }
+        .onReceiveDocumentNotification(.showModelCheckPanel, for: document) {
+            selectedTab = 2
         }
     }
 }
@@ -95,40 +151,174 @@ struct BottomPanel: View {
 
 struct ProblemsPanelContent: View {
     let diagnostics: [TLADiagnostic]
+    /// Called when a row is clicked (navigates the editor to the diagnostic).
+    var onNavigate: ((TLADiagnostic) -> Void)?
+
+    private enum SourceFilter: String, CaseIterable, Identifiable {
+        case all = "All"
+        case syntax = "Syntax"
+        case semantic = "Semantic"
+
+        var id: String { rawValue }
+    }
+
+    @State private var sourceFilter: SourceFilter = .all
+
+    private var filteredDiagnostics: [TLADiagnostic] {
+        switch sourceFilter {
+        case .all: return diagnostics
+        case .syntax: return diagnostics.filter { !$0.isSemantic }
+        case .semantic: return diagnostics.filter { $0.isSemantic }
+        }
+    }
 
     var body: some View {
-        List {
-            if diagnostics.isEmpty {
-                Text("No problems")
-                    .foregroundColor(.secondary)
-            } else {
-                ForEach(diagnostics) { diagnostic in
-                    HStack {
-                        diagnosticIcon(for: diagnostic.severity)
-                        Text(diagnostic.message)
-                            .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
-                        Spacer()
-                        Text("Ln \(diagnostic.range.start.line + 1)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+        VStack(spacing: 0) {
+            HStack {
+                Picker("Source", selection: $sourceFilter) {
+                    ForEach(SourceFilter.allCases) { filter in
+                        Text(filter.rawValue).tag(filter)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 220)
+                .help("Filter problems by source: syntax (tree-sitter) or semantic (SANY)")
+
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color(NSColor.controlBackgroundColor))
+
+            Divider()
+
+            List {
+                if filteredDiagnostics.isEmpty {
+                    Text("No problems")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(filteredDiagnostics) { diagnostic in
+                        HStack {
+                            diagnosticIcon(for: diagnostic.severity)
+                            Text(diagnostic.message)
+                                .font(.system(.body, design: .monospaced))
+                                .textSelection(.enabled)
+                            if let code = diagnostic.code {
+                                Text(code)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(Color.secondary.opacity(0.2))
+                                    .cornerRadius(3)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Text("Ln \(diagnostic.range.start.line + 1)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            onNavigate?(diagnostic)
+                        }
                     }
                 }
             }
         }
     }
 
-    @ViewBuilder
     private func diagnosticIcon(for severity: TLADiagnosticSeverity) -> some View {
-        switch severity {
-        case .error:
-            Image(systemName: "xmark.circle.fill").foregroundColor(.red)
-        case .warning:
-            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.yellow)
-        case .information:
-            Image(systemName: "info.circle.fill").foregroundColor(.blue)
-        case .hint:
-            Image(systemName: "lightbulb.fill").foregroundColor(.green)
+        Image(systemName: severity.iconName).foregroundColor(severity.color)
+    }
+}
+
+// MARK: - References Panel
+
+/// Navigable results of Find All References (symbol-aware, comments/strings
+/// excluded; matches by name across the current + EXTENDS'd modules).
+struct ReferencesPanelContent: View {
+    @ObservedObject var document: TLADocument
+
+    var body: some View {
+        if let results = document.referenceResults {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 6) {
+                    Text("\(results.hits.count) reference\(results.hits.count == 1 ? "" : "s") to '\(results.symbolName)'")
+                        .font(.callout)
+                    Text("matches by name")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    if !results.searchedExtendedModules {
+                        Text("current module only")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
+                    if results.truncated {
+                        Text("truncated")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color(NSColor.controlBackgroundColor))
+
+                Divider()
+
+                if results.hits.isEmpty {
+                    VStack {
+                        Spacer()
+                        Text("No references found")
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity)
+                } else {
+                    List(results.hits) { hit in
+                        HStack(spacing: 6) {
+                            Image(systemName: hit.role == .definition
+                                  ? "equal.square.fill" : "arrow.turn.down.right")
+                                .foregroundColor(hit.role == .definition ? .indigo : .secondary)
+                                .font(.caption)
+                            Text(hit.lineText)
+                                .font(.system(.body, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer()
+                            Text("\(hit.moduleName) · Ln \(hit.tlaRange.start.line + 1)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            navigate(to: hit)
+                        }
+                    }
+                }
+            }
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.title2)
+                    .foregroundColor(.secondary)
+                Text("Place the cursor on a symbol and choose Find All References (⇧⌘R)")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func navigate(to hit: ReferenceHit) {
+        if let fileURL = hit.fileURL {
+            // Cross-file hit: open (or focus) the document, then select.
+            DocumentNavigator.open(fileURL: fileURL, andSelect: hit.tlaRange)
+        } else if let nsRange = hit.nsRange {
+            document.selectedRange = nsRange
         }
     }
 }
@@ -318,7 +508,10 @@ struct ModelCheckPanelContent: View {
     @ObservedObject var document: TLADocument
 
     var body: some View {
-        ModelCheckPanelCompact(document: document)
+        // The FULL panel: trace explorer, state graph, coverage, checkpoints,
+        // and the proof workbench. The compact summary previously mounted here
+        // left the counterexample trace unreachable (platform review C1).
+        ModelCheckPanel(document: document)
     }
 }
 

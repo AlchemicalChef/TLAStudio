@@ -57,6 +57,37 @@ struct TLASymbol: Identifiable, Equatable {
     }
 }
 
+// MARK: - Symbol Tree Walks
+
+extension Array where Element == TLASymbol {
+    /// First symbol (depth-first, pre-order) in the tree matching `predicate`,
+    /// searching each symbol's `children` recursively.
+    func firstInTree(where predicate: (TLASymbol) -> Bool) -> TLASymbol? {
+        for symbol in self {
+            if predicate(symbol) {
+                return symbol
+            }
+            if let found = symbol.children.firstInTree(where: predicate) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    /// All symbols in the tree, flattened depth-first (parent before children).
+    func flattened() -> [TLASymbol] {
+        var result: [TLASymbol] = []
+        func collect(_ symbols: [TLASymbol]) {
+            for symbol in symbols {
+                result.append(symbol)
+                collect(symbol.children)
+            }
+        }
+        collect(self)
+        return result
+    }
+}
+
 /// Diagnostic severity
 enum TLADiagnosticSeverity: Equatable {
     case error
@@ -76,6 +107,20 @@ struct TLADiagnostic: Identifiable, Equatable {
     static func == (lhs: TLADiagnostic, rhs: TLADiagnostic) -> Bool {
         lhs.range == rhs.range && lhs.severity == rhs.severity && lhs.message == rhs.message
     }
+}
+
+/// One occurrence of an identifier (definition or reference) found in the
+/// parse tree. Comments and strings are structurally excluded by the grammar.
+struct TLAIdentifierOccurrence: Equatable {
+    enum Role: Equatable {
+        case definition
+        case reference
+    }
+
+    /// tree-sitter coordinates: 0-based rows, **byte** columns — convert with
+    /// `TextCoordinateMapper.TreeSitterRangeConverter` before use in AppKit.
+    let range: TLARange
+    let role: Role
 }
 
 /// Syntax highlight token
@@ -246,11 +291,18 @@ protocol TLACoreProtocol: Sendable {
     func analyzeContext(from result: TLAParseResult, at position: TLAPosition) async -> TLACompletionContext
     func getDetailedCompletions(from result: TLAParseResult, at position: TLAPosition) async -> [TLADetailedCompletionItem]
     func getSignatureHelp(from result: TLAParseResult, at position: TLAPosition) async -> TLASignatureHelp?
+    func findIdentifierOccurrences(in result: TLAParseResult, name: String) async -> [TLAIdentifierOccurrence]
 }
 
 extension TLACoreProtocol {
     func parseIncremental(_ source: String, previous: TLAParseResult) async throws -> TLAParseResult {
         try await parse(source)
+    }
+
+    /// Default for cores without tree-sitter occurrence support (test mocks);
+    /// concrete cores override.
+    func findIdentifierOccurrences(in result: TLAParseResult, name: String) async -> [TLAIdentifierOccurrence] {
+        []
     }
 }
 
@@ -299,101 +351,6 @@ private final class CachedParseResult {
     }
 }
 
-// MARK: - Parse Result LRU Cache
-
-/// Doubly-linked list node for O(1) LRU cache operations
-private final class LRUNode<Key: Hashable, Value> {
-    let key: Key
-    var value: Value
-    var prev: LRUNode?
-    var next: LRUNode?
-
-    init(key: Key, value: Value) {
-        self.key = key
-        self.value = value
-    }
-}
-
-/// Thread-safe LRU cache for TLAParseResult with O(1) get/set operations using doubly-linked list
-private final class ParseResultLRUCache {
-    private let capacity: Int
-    private var cache: [Int: LRUNode<Int, TLAParseResult>] = [:]
-    private let lock = NSLock()
-
-    // Sentinel nodes for doubly-linked list (head = oldest, tail = newest)
-    private let head = LRUNode<Int, TLAParseResult>(key: -1, value: TLAParseResult(isValid: false, diagnostics: [], source: ""))
-    private let tail = LRUNode<Int, TLAParseResult>(key: -1, value: TLAParseResult(isValid: false, diagnostics: [], source: ""))
-
-    init(capacity: Int) {
-        self.capacity = capacity
-        head.next = tail
-        tail.prev = head
-    }
-
-    func get(_ key: Int) -> TLAParseResult? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let node = cache[key] else { return nil }
-        // Move to end (most recently used) - O(1) operation
-        moveToTail(node)
-        return node.value
-    }
-
-    func set(_ key: Int, value: TLAParseResult) {
-        lock.lock()
-        defer { lock.unlock() }
-        if let node = cache[key] {
-            // Update existing - O(1)
-            node.value = value
-            moveToTail(node)
-        } else {
-            // Evict oldest if at capacity - O(1)
-            while cache.count >= capacity {
-                if let oldest = head.next, oldest !== tail {
-                    removeNode(oldest)
-                    cache.removeValue(forKey: oldest.key)
-                } else {
-                    break
-                }
-            }
-
-            // Add new node - O(1)
-            let node = LRUNode(key: key, value: value)
-            cache[key] = node
-            addToTail(node)
-        }
-    }
-
-    func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        cache.removeAll()
-        head.next = tail
-        tail.prev = head
-    }
-
-    // MARK: - Doubly-Linked List Operations (all O(1), must be called with lock held)
-
-    private func removeNode(_ node: LRUNode<Int, TLAParseResult>) {
-        node.prev?.next = node.next
-        node.next?.prev = node.prev
-        node.prev = nil
-        node.next = nil
-    }
-
-    private func addToTail(_ node: LRUNode<Int, TLAParseResult>) {
-        node.prev = tail.prev
-        node.next = tail
-        tail.prev?.next = node
-        tail.prev = node
-    }
-
-    private func moveToTail(_ node: LRUNode<Int, TLAParseResult>) {
-        removeNode(node)
-        addToTail(node)
-    }
-}
-
 // MARK: - TLACore Wrapper (Main Interface)
 
 /// Thread-safe wrapper for TLA+ language services
@@ -410,7 +367,7 @@ final class TLACoreWrapper: ObservableObject {
     private let core: any TLACoreProtocol
 
     /// LRU cache for parse results - uses content hash as key to avoid storing large strings
-    private var parseCache: ParseResultLRUCache
+    private var parseCache: GenericLRUCache<Int, TLAParseResult>
 
     /// Reuses symbol extraction results for cached parse results.
     /// Keyed by `TLAParseResult.cacheKey` (UUID) + source-equality validation so
@@ -428,7 +385,7 @@ final class TLACoreWrapper: ObservableObject {
 
     init(core: any TLACoreProtocol, parseCacheCapacity: Int = 10) {
         self.core = core
-        self.parseCache = ParseResultLRUCache(capacity: parseCacheCapacity)
+        self.parseCache = GenericLRUCache(capacity: parseCacheCapacity)
         self.symbolCache = GenericLRUCache(capacity: max(1, parseCacheCapacity * 2))
     }
 
@@ -526,6 +483,12 @@ final class TLACoreWrapper: ObservableObject {
         await core.getCompletions(from: result, at: position)
     }
 
+    /// All identifier occurrences of `name` (definitions + references),
+    /// excluding comments and strings. Ranges are in tree-sitter coordinates.
+    func findIdentifierOccurrences(in result: TLAParseResult, name: String) async -> [TLAIdentifierOccurrence] {
+        await core.findIdentifierOccurrences(in: result, name: name)
+    }
+
     /// Analyze the completion context at a position
     func analyzeContext(from result: TLAParseResult, at position: TLAPosition) async -> TLACompletionContext {
         await core.analyzeContext(from: result, at: position)
@@ -572,20 +535,7 @@ final class TLACoreWrapper: ObservableObject {
     /// Find definition location for a symbol name
     /// Returns the range where the symbol is defined, or nil if not found
     func findDefinition(named name: String, in symbols: [TLASymbol]) -> TLARange? {
-        // Search through symbols recursively
-        func searchSymbols(_ symbols: [TLASymbol]) -> TLARange? {
-            for symbol in symbols {
-                if symbol.name == name {
-                    return symbol.selectionRange ?? symbol.range
-                }
-                // Search children
-                if let found = searchSymbols(symbol.children) {
-                    return found
-                }
-            }
-            return nil
-        }
-        return searchSymbols(symbols)
+        symbols.firstInTree { $0.name == name }.map { $0.selectionRange ?? $0.range }
     }
 
     /// Get the word at a given position in the source text
@@ -642,93 +592,13 @@ final class TLACoreWrapper: ObservableObject {
         char.isLetter || char.isNumber || char == "_"
     }
 
-    /// Get completions for current context
-    func getContextCompletions(at offset: Int, in source: String, symbols: [TLASymbol]) -> [String] {
-        // Get the partial word being typed
-        let prefix = getPartialWord(at: offset, in: source)
-
-        var completions: [String] = []
-
-        // Add matching keywords
-        let keywords = [
-            "EXTENDS", "INSTANCE", "LOCAL", "WITH",
-            "VARIABLE", "VARIABLES", "CONSTANT", "CONSTANTS",
-            "ASSUME", "ASSUMPTION", "AXIOM", "THEOREM", "LEMMA",
-            "PROOF", "BY", "DEF", "DEFS", "OBVIOUS", "OMITTED", "QED",
-            "PICK", "HAVE", "TAKE", "WITNESS", "SUFFICES", "USE", "HIDE", "DEFINE",
-            "NEW", "STATE", "ACTION", "TEMPORAL",
-            "IF", "THEN", "ELSE", "CASE", "OTHER", "LET", "IN",
-            "CHOOSE", "EXCEPT", "DOMAIN", "SUBSET", "UNION",
-            "ENABLED", "UNCHANGED",
-            "TRUE", "FALSE", "BOOLEAN"
-        ]
-
-        // Add standard modules
-        let standardModules = [
-            "Naturals", "Integers", "Reals", "Sequences", "FiniteSets", "Bags", "TLC", "TLAPS"
-        ]
-
-        // Add common standard library functions
-        let standardFunctions = [
-            "Nat", "Int", "Seq", "Len", "Head", "Tail", "Append", "SubSeq",
-            "IsFiniteSet", "Cardinality", "Print", "Assert"
-        ]
-
-        // Filter by prefix
-        let lowerPrefix = prefix.lowercased()
-
-        for kw in keywords {
-            if kw.lowercased().hasPrefix(lowerPrefix) {
-                completions.append(kw)
-            }
-        }
-
-        for mod in standardModules {
-            if mod.lowercased().hasPrefix(lowerPrefix) {
-                completions.append(mod)
-            }
-        }
-
-        for fn in standardFunctions {
-            if fn.lowercased().hasPrefix(lowerPrefix) {
-                completions.append(fn)
-            }
-        }
-
-        // Add matching user-defined symbols
-        func addSymbols(_ syms: [TLASymbol]) {
-            for symbol in syms {
-                if symbol.name.lowercased().hasPrefix(lowerPrefix) {
-                    completions.append(symbol.name)
-                }
-                addSymbols(symbol.children)
-            }
-        }
-        addSymbols(symbols)
-
-        // Remove duplicates and sort
-        return Array(Set(completions)).sorted()
-    }
-
-    private func getPartialWord(at offset: Int, in source: String) -> String {
-        guard offset > 0 else { return "" }
-
-        let chars = Array(source)
-        var start = offset - 1
-
-        // Move backwards to find start of word
-        while start >= 0 && isIdentifierChar(chars[start]) {
-            start -= 1
-        }
-
-        start += 1
-        guard start < offset else { return "" }
-
-        return String(chars[start..<offset])
-    }
-
     /// Get hover documentation for a word at a position
-    func getHoverDocumentation(at position: TLAPosition, in source: String, symbols: [TLASymbol]) -> HoverInfo? {
+    func getHoverDocumentation(
+        at position: TLAPosition,
+        in source: String,
+        symbols: [TLASymbol],
+        crossModuleSymbols: [ModuleSymbol] = []
+    ) -> HoverInfo? {
         guard let word = wordAt(position: position, in: source) else {
             return nil
         }
@@ -738,7 +608,7 @@ final class TLACoreWrapper: ObservableObject {
             return HoverInfo(title: word, description: builtin.description, signature: builtin.signature, kind: .keyword)
         }
 
-        // Check for user-defined symbol
+        // Check for user-defined symbol (local symbols always win)
         if let symbol = findSymbolByName(word, in: symbols) {
             let signature: String?
             if !symbol.parameters.isEmpty {
@@ -754,19 +624,26 @@ final class TLACoreWrapper: ObservableObject {
             )
         }
 
+        // Symbol defined in an EXTENDS'd module (nearest-depth match first).
+        if let moduleSymbol = crossModuleSymbols.first(where: { $0.symbol.name == word }) {
+            let symbol = moduleSymbol.symbol
+            let signature = symbol.parameters.isEmpty
+                ? nil
+                : "\(symbol.name)(\(symbol.parameters.joined(separator: ", ")))"
+            return HoverInfo(
+                title: symbol.name,
+                description: "User-defined \(symbolKindName(symbol.kind))",
+                signature: signature,
+                kind: hoverKind(from: symbol.kind),
+                sourceModule: moduleSymbol.moduleName
+            )
+        }
+
         return nil
     }
 
     private func findSymbolByName(_ name: String, in symbols: [TLASymbol]) -> TLASymbol? {
-        for symbol in symbols {
-            if symbol.name == name {
-                return symbol
-            }
-            if let found = findSymbolByName(name, in: symbol.children) {
-                return found
-            }
-        }
-        return nil
+        symbols.firstInTree { $0.name == name }
     }
 
     private func symbolKindName(_ kind: TLASymbolKind) -> String {
@@ -807,6 +684,20 @@ struct HoverInfo {
     let description: String
     let signature: String?
     let kind: Kind
+
+    /// Module the symbol comes from, when not defined in the current document
+    /// (cross-module hover shows a "From <Module>" caption).
+    var sourceModule: String?
+
+    /// Diagnostics whose range contains the hovered character — shown above
+    /// the symbol documentation in the popover.
+    var diagnostics: [TLADiagnostic] = []
+
+    /// A popover that shows only diagnostics (hovering a squiggle on a token
+    /// that has no symbol documentation).
+    static func diagnosticsOnly(_ diagnostics: [TLADiagnostic]) -> HoverInfo {
+        HoverInfo(title: "", description: "", signature: nil, kind: .definition, diagnostics: diagnostics)
+    }
 }
 
 // MARK: - TLA+ Documentation
@@ -962,6 +853,41 @@ final class FallbackTLACore: TLACoreProtocol, Sendable {
 
     func parseIncremental(_ source: String, previous: TLAParseResult) async throws -> TLAParseResult {
         try await parse(source)
+    }
+
+    /// Regex-based degraded path: whole-word matches, skipping `\*` comment
+    /// tails and (heuristically) double-quoted string spans. Columns are
+    /// UTF-16 units, not bytes — acceptable for the ASCII-dominant fallback.
+    func findIdentifierOccurrences(in result: TLAParseResult, name: String) async -> [TLAIdentifierOccurrence] {
+        guard name.range(of: #"^[A-Za-z0-9_]+$"#, options: .regularExpression) != nil,
+              let regex = try? NSRegularExpression(
+                  pattern: "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b"
+              ) else {
+            return []
+        }
+
+        var occurrences: [TLAIdentifierOccurrence] = []
+        for (lineIndex, lineText) in result.source.components(separatedBy: "\n").enumerated() {
+            let codeOnly = lineText.components(separatedBy: "\\*").first ?? lineText
+            let nsLine = codeOnly as NSString
+            regex.enumerateMatches(
+                in: codeOnly,
+                range: NSRange(location: 0, length: nsLine.length)
+            ) { match, _, _ in
+                guard let match else { return }
+                // Odd number of quotes before the match ⇒ inside a string.
+                let prefix = nsLine.substring(to: match.range.location)
+                guard prefix.filter({ $0 == "\"" }).count.isMultiple(of: 2) else { return }
+                occurrences.append(TLAIdentifierOccurrence(
+                    range: TLARange(
+                        start: TLAPosition(line: UInt32(lineIndex), column: UInt32(match.range.location)),
+                        end: TLAPosition(line: UInt32(lineIndex), column: UInt32(match.range.location + match.range.length))
+                    ),
+                    role: .reference
+                ))
+            }
+        }
+        return occurrences
     }
 
     func getSymbols(from result: TLAParseResult) async -> [TLASymbol] {
@@ -1440,6 +1366,23 @@ final class RustTLACore: TLACoreProtocol, @unchecked Sendable {
             return core.getSymbols(result: newResult).map { convertSymbol($0) }
         }
         return core.getSymbols(result: parseResult).map { convertSymbol($0) }
+    }
+
+    func findIdentifierOccurrences(in result: TLAParseResult, name: String) async -> [TLAIdentifierOccurrence] {
+        let rustResult: ParseResult
+        if let cached = getCachedParseResult(for: result) {
+            rustResult = cached
+        } else if let reparsed = try? core.parse(source: result.source) {
+            rustResult = reparsed
+        } else {
+            return []
+        }
+        return core.findIdentifierOccurrences(result: rustResult, name: name).map {
+            TLAIdentifierOccurrence(
+                range: convertRange($0.range),
+                role: $0.role == .definition ? .definition : .reference
+            )
+        }
     }
 
     func getHighlights(from result: TLAParseResult, in range: TLARange) async -> [TLAHighlightToken] {

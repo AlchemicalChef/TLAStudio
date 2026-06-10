@@ -222,7 +222,7 @@ struct ProverSettingsView: View {
                 if viewModel.isVerifying {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Verifying...")
+                    Text("Verifying…")
                         .foregroundColor(.secondary)
                         .font(.caption)
                 }
@@ -292,7 +292,7 @@ struct ToolPathRow: View {
                 TextField("Path", text: $path)
                     .textFieldStyle(.roundedBorder)
 
-                Button("Browse...") {
+                Button("Browse…") {
                     onBrowse()
                 }
                 .buttonStyle(.bordered)
@@ -345,7 +345,7 @@ struct ProverPathRow: View {
                 TextField("Path", text: $path)
                     .textFieldStyle(.roundedBorder)
 
-                Button("Browse...") {
+                Button("Browse…") {
                     onBrowse()
                 }
                 .buttonStyle(.bordered)
@@ -400,7 +400,7 @@ struct IsabelleProverRow: View {
                     HStack {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Checking...")
+                        Text("Checking…")
                             .foregroundColor(.secondary)
                     }
                     Spacer()
@@ -412,7 +412,7 @@ struct IsabelleProverRow: View {
                     HStack {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Extracting...")
+                        Text("Extracting…")
                             .foregroundColor(.secondary)
                     }
                     Spacer()
@@ -469,7 +469,7 @@ struct IsabelleProverRow: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
 
-            Button("Browse...") {
+            Button("Browse…") {
                 onBrowse()
             }
             .buttonStyle(.bordered)
@@ -515,7 +515,7 @@ struct IsabelleProverRow: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            Button("Browse...") {
+            Button("Browse…") {
                 onBrowse()
             }
             .buttonStyle(.bordered)
@@ -539,7 +539,7 @@ struct IsabelleProverRow: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            Button("Browse...") {
+            Button("Browse…") {
                 onBrowse()
             }
             .buttonStyle(.bordered)
@@ -657,7 +657,7 @@ enum ToolStatus: Equatable {
         case .unknown:
             return "Status unknown"
         case .checking:
-            return "Checking..."
+            return "Checking…"
         case .found:
             return "Tool found and executable"
         case .notFound:

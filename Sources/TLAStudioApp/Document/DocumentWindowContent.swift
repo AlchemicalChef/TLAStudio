@@ -48,20 +48,16 @@ struct DocumentWindowContent: View {
                 .help("Toggle Inspector")
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleNavigatorSidebar)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.toggleNavigatorSidebar, for: document) {
             showNavigator.toggle()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleSymbolOutline)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.toggleSymbolOutline, for: document) {
             showNavigator = true
         }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleInspectorSidebar)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.toggleInspectorSidebar, for: document) {
             showInspector.toggle()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .editModelConfig)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.editModelConfig, for: document) {
             editingConfig = document.resolvedModelConfig()
         }
         .sheet(item: $editingConfig) { seed in

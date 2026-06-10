@@ -76,7 +76,7 @@ struct CheckpointSettingsView: View {
 
                     Spacer()
 
-                    Button("Choose...") {
+                    Button("Choose…") {
                         chooseCheckpointDirectory()
                     }
                     .buttonStyle(.bordered)

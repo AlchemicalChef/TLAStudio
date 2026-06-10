@@ -88,8 +88,8 @@ final class TLAPMOutputParser: @unchecked Sendable {
         var latestProgress: ProofCheckProgress?
 
         for lineData in lines {
-            guard let line = String(data: lineData, encoding: .utf8)?
-                .trimmingCharacters(in: .carriageReturns) else {
+            // LineBuffer already strips a trailing \r from CRLF output.
+            guard let line = String(data: lineData, encoding: .utf8) else {
                 continue
             }
 
@@ -679,12 +679,6 @@ final class TLAPMOutputParser: @unchecked Sendable {
             obligationText: parsed.obligationText
         )
     }
-}
-
-// MARK: - Character Set Extension
-
-private extension CharacterSet {
-    static let carriageReturns = CharacterSet(charactersIn: "\r")
 }
 
 // MARK: - Proof Check Options

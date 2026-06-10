@@ -9,6 +9,7 @@ struct EditorArea: View {
     @State private var hoverPosition: NSPoint = .zero
     @State private var showHover = false
     @State private var showGoToLineSheet = false
+    @State private var renamePlan: RenameService.Plan?
     @State private var currentSymbol: TLASymbol?
     @State private var bottomPanelHeight: CGFloat = 150
 
@@ -42,6 +43,45 @@ struct EditorArea: View {
     }
 
     var body: some View {
+        // Split from `decoratedLayout` to keep each expression within the
+        // type-checker's budget — the single combined chain stopped compiling.
+        decoratedLayout
+            .onReceiveDocumentNotification(.translatePlusCal, for: document) {
+                document.translatePlusCal()
+            }
+            .onReceiveDocumentNotification(.goToPlusCalAlgorithm, for: document) {
+                _ = document.goToPlusCalAlgorithm()
+            }
+            .onReceiveDocumentNotification(.goToPlusCalTranslation, for: document) {
+                _ = document.goToPlusCalTranslation()
+            }
+            .onReceiveDocumentNotification(.goToDefinition, for: document) {
+                _ = document.goToDefinition(at: document.selectedRange.location)
+            }
+            .onReceiveDocumentNotification(.findReferences, for: document) {
+                findReferences()
+            }
+            .onReceiveDocumentNotification(.renameSymbol, for: document) {
+                startRename()
+            }
+            .onReceiveDocumentNotification(.decomposeProof, for: document) {
+                if !document.decomposeProof() {
+                    document.reportActionFeedback(
+                        "Couldn't generate a proof skeleton — place the cursor on a THEOREM without an existing proof. Supported goals: Spec => []Inv, conjunctions, and \\A bounds."
+                    )
+                }
+            }
+            .sheet(item: $renamePlan, content: renameSheet(for:))
+            .overlay(alignment: .top) {
+                if let feedback = document.actionFeedback {
+                    ActionFeedbackBanner(feedback: feedback)
+                        .id(feedback.id)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: document.actionFeedback)
+    }
+
+    private var decoratedLayout: some View {
         VStack(spacing: 0) {
             // Breadcrumb bar
             BreadcrumbBar(
@@ -87,12 +127,11 @@ struct EditorArea: View {
                         onHoverEnd: {
                             showHover = false
                         },
-                        completionProvider: { offset in
-                            TLACoreWrapper.shared.getContextCompletions(
-                                at: offset,
-                                in: document.content,
-                                symbols: document.symbols
-                            )
+                        crossModuleSymbols: {
+                            // Each query also kicks a throttled staleness probe
+                            // so the snapshot tracks on-disk module edits.
+                            document.crossModuleProvider.refreshIfStaleInBackground()
+                            return document.crossModuleProvider.symbols
                         }
                     )
                     .editorFont(resolvedFont)
@@ -167,34 +206,27 @@ struct EditorArea: View {
         .onChange(of: document.selectedRange) { _, newRange in
             updateCurrentSymbol(at: newRange.location)
         }
-        .onReceive(NotificationCenter.default.publisher(for: .goToLine)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.goToLine, for: document) {
             showGoToLineSheet = true
         }
-        .onReceive(NotificationCenter.default.publisher(for: .showFindReplace)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.showFindReplace, for: document) { notification in
             let showReplace = (notification.userInfo?["showReplace"] as? Bool) ?? false
             findReplaceManager.showReplace = showReplace
             findReplaceManager.isVisible = true
         }
-        .onReceive(NotificationCenter.default.publisher(for: .hideFindReplace)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.hideFindReplace, for: document) {
             findReplaceManager.isVisible = false
         }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleFindReplace)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.toggleFindReplace, for: document) {
             findReplaceManager.isVisible.toggle()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .findNext)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.findNext, for: document) {
             findReplaceManager.findNext()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .findPrevious)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.findPrevious, for: document) {
             findReplaceManager.findPrevious()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .useSelectionForFind)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
+        .onReceiveDocumentNotification(.useSelectionForFind, for: document) {
             // Get selected text from document and use it for find
             let content = document.content as NSString
             let range = document.selectedRange
@@ -204,29 +236,37 @@ struct EditorArea: View {
                 findReplaceManager.isVisible = true
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .translatePlusCal)) { notification in
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                document.translatePlusCal()
-            }
+    }
+
+    private func renameSheet(for plan: RenameService.Plan) -> RenameSymbolSheet {
+        RenameSymbolSheet(
+            plan: plan,
+            symbols: document.symbols,
+            moduleName: document.moduleName
+        ) { newName in
+            RenameService.apply(
+                plan,
+                newName: newName,
+                document: document,
+                textView: findReplaceManager.textView
+            )
         }
-        .onReceive(NotificationCenter.default.publisher(for: .goToPlusCalAlgorithm)) { notification in
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                _ = document.goToPlusCalAlgorithm()
-            }
+    }
+
+    private func startRename() {
+        let (line, column) = document.lineAndColumn(for: document.selectedRange.location)
+        let position = TLAPosition(line: UInt32(line), column: UInt32(column))
+        guard let word = TLACoreWrapper.shared.wordAt(position: position, in: document.content),
+              !word.isEmpty else {
+            document.reportActionFeedback("Place the cursor on a symbol to rename it.", style: .info)
+            return
         }
-        .onReceive(NotificationCenter.default.publisher(for: .goToPlusCalTranslation)) { notification in
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                _ = document.goToPlusCalTranslation()
+        Task { @MainActor in
+            if let plan = await RenameService.prepare(name: word, document: document) {
+                renamePlan = plan
+            } else {
+                document.reportActionFeedback("No occurrences of '\(word)' found to rename.")
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .goToDefinition)) { notification in
-            if notification.object == nil || (notification.object as? TLADocument) === document {
-                _ = document.goToDefinition(at: document.selectedRange.location)
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .findReferences)) { notification in
-            guard notification.object == nil || (notification.object as? TLADocument) === document else { return }
-            findReferences()
         }
     }
 
@@ -255,13 +295,26 @@ struct EditorArea: View {
         let (line, column) = document.lineAndColumn(for: characterOffset)
         let position = TLAPosition(line: UInt32(line), column: UInt32(column))
 
-        if let info = TLACoreWrapper.shared.getHoverDocumentation(
+        let hoveredDiagnostics = DiagnosticHighlighter.diagnostics(
+            at: characterOffset,
+            in: document.diagnostics,
+            text: document.content
+        )
+
+        if var info = TLACoreWrapper.shared.getHoverDocumentation(
             at: position,
             in: document.content,
-            symbols: document.symbols
+            symbols: document.symbols,
+            crossModuleSymbols: document.crossModuleProvider.symbols
         ) {
+            info.diagnostics = hoveredDiagnostics
             hoverInfo = info
             // Use the scroll-adjusted visible-area point passed from the text view
+            hoverPosition = screenPoint
+            showHover = true
+        } else if !hoveredDiagnostics.isEmpty {
+            // Squiggle hover over a token without symbol documentation.
+            hoverInfo = HoverInfo.diagnosticsOnly(hoveredDiagnostics)
             hoverPosition = screenPoint
             showHover = true
         } else {
@@ -275,14 +328,16 @@ struct EditorArea: View {
 
         guard let word = TLACoreWrapper.shared.wordAt(position: position, in: document.content),
               !word.isEmpty else {
+            document.reportActionFeedback("Place the cursor on a symbol to find its references.", style: .info)
             return
         }
 
-        findReplaceManager.searchQuery = word
-        findReplaceManager.isWholeWord = true
-        findReplaceManager.showReplace = false
-        findReplaceManager.isVisible = true
-        findReplaceManager.findAll()
+        // Symbol-aware references (identifiers only, current + extended
+        // modules) shown in the References bottom-panel tab.
+        Task { @MainActor in
+            await document.findAllReferences(to: word)
+            NotificationCenter.default.post(name: .showReferencesPanel, object: document)
+        }
     }
 }
 

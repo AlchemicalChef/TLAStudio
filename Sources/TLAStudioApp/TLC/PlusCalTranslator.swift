@@ -17,220 +17,15 @@ enum PlusCalTranslationResult {
 /// Translates PlusCal algorithms embedded in TLA+ specifications by running
 /// `java -cp tla2tools.jar pcal.trans <file>`, which modifies the file in-place
 /// between `\* BEGIN TRANSLATION` and `\* END TRANSLATION` markers.
+///
+/// Subprocess execution and java/jar discovery live in `JavaProcessRunner`,
+/// shared with the SANY semantic analyzer.
 actor PlusCalTranslator {
 
     private let logger = Log.logger(category: "PlusCalTranslator")
 
     /// Shared instance
     static let shared = PlusCalTranslator()
-
-    /// Cap on captured stdout/stderr per stream. `pcal.trans` is expected to emit at most
-    /// a few KB; anything past this is almost certainly a pathological loop and should not
-    /// be allowed to balloon memory. The remainder is dropped but the process continues so
-    /// we still observe its exit status.
-    private static let maxCapturedBytes = 10 * 1024 * 1024  // 10 MB
-
-    /// Drain a pipe into a bounded accumulator. Reading stops growing past `maxCapturedBytes`
-    /// but continues consuming so the writer isn't back-pressured into a deadlock.
-    private static func drain(
-        handle: FileHandle,
-        into accumulator: OutputAccumulator
-    ) {
-        handle.readabilityHandler = { [weak accumulator] h in
-            let data = h.availableData
-            if data.isEmpty {
-                h.readabilityHandler = nil
-                return
-            }
-            accumulator?.append(data)
-        }
-    }
-
-    /// Thread-safe bounded byte accumulator. Accepts data and stores up to `limit` bytes.
-    /// Additional data is dropped. Callers retrieve the accumulated buffer once the process
-    /// has exited and both pipe handlers have been cleared.
-    final class OutputAccumulator: @unchecked Sendable {
-        private let lock = NSLock()
-        private var buffer = Data()
-        private let limit: Int
-
-        init(limit: Int) { self.limit = limit }
-
-        func append(_ data: Data) {
-            lock.lock()
-            defer { lock.unlock() }
-            guard buffer.count < limit else { return }
-            let remaining = limit - buffer.count
-            buffer.append(data.prefix(remaining))
-        }
-
-        func snapshot() -> Data {
-            lock.lock()
-            defer { lock.unlock() }
-            return buffer
-        }
-    }
-
-    static func runProcess(
-        executableURL: URL,
-        arguments: [String],
-        currentDirectoryURL: URL? = nil,
-        timeout: TimeInterval? = nil
-    ) async throws -> (terminationStatus: Int32, stdout: Data, stderr: Data) {
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = arguments
-        process.currentDirectoryURL = currentDirectoryURL
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        let stdoutAccumulator = OutputAccumulator(limit: maxCapturedBytes)
-        let stderrAccumulator = OutputAccumulator(limit: maxCapturedBytes)
-        drain(handle: stdoutPipe.fileHandleForReading, into: stdoutAccumulator)
-        drain(handle: stderrPipe.fileHandleForReading, into: stderrAccumulator)
-
-        // Register the java subprocess with ProcessRegistry so app shutdown (Cmd-Q)
-        // can reap it via SIGTERM → SIGKILL escalation. Without this, an in-flight
-        // `pcal.trans` JVM survives the parent and gets launchd-reparented.
-        let registrySessionId = UUID()
-
-        // Holds the timeout Task so the termination handler can cancel it once the
-        // process exits normally, preventing the Task from running its full sleep
-        // duration after we no longer care. Captured by reference so the closure
-        // can mutate it on the outer continuation's thread.
-        let timeoutTaskBox = TimeoutTaskBox()
-
-        // Whether `register()` was reached. Used by the post-continuation cleanup so we
-        // only `unregister` what was actually registered (process.run() can throw).
-        var registered = false
-
-        // Cleanup that must run regardless of how the continuation resolved (normal exit,
-        // process.run failure, or timeout-throw). Without this, a thrown timeout error
-        // would skip the unregister/pipe-drain path below.
-        defer {
-            timeoutTaskBox.cancel()
-            process.terminationHandler = nil
-            if registered {
-                if process.isRunning {
-                    // Timeout fired but the process didn't honor SIGTERM (process.terminate);
-                    // delegate to ProcessRegistry for SIGKILL escalation.
-                    ProcessRegistry.shared.terminate(registrySessionId)
-                } else {
-                    ProcessRegistry.shared.unregister(registrySessionId)
-                }
-            }
-
-            // Drain any residual bytes still buffered in the pipes before clearing handlers.
-            // readabilityHandler may not fire for data already in the kernel pipe buffer
-            // after process exit — mirrors the TLC/TLAPM pattern.
-            let lastStdout = stdoutPipe.fileHandleForReading.availableData
-            if !lastStdout.isEmpty { stdoutAccumulator.append(lastStdout) }
-            let lastStderr = stderrPipe.fileHandleForReading.availableData
-            if !lastStderr.isEmpty { stderrAccumulator.append(lastStderr) }
-
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            try? stdoutPipe.fileHandleForReading.close()
-            try? stderrPipe.fileHandleForReading.close()
-        }
-
-        // Observe termination via the process's handler rather than polling. Resumption is
-        // gated by `Atomic` semantics on the continuation so a concurrent timeout can't
-        // resume twice.
-        let terminationStatus = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int32, Error>) in
-            let didResume = ResumeGuard()
-
-            process.terminationHandler = { finished in
-                // Cancel the pending timeout Task — the process is done, the sleep is moot.
-                timeoutTaskBox.cancel()
-                guard didResume.tryConsume() else { return }
-                cont.resume(returning: finished.terminationStatus)
-            }
-
-            do {
-                try process.run()
-                ProcessRegistry.shared.register(process, for: registrySessionId)
-                registered = true
-            } catch {
-                guard didResume.tryConsume() else { return }
-                cont.resume(throwing: error)
-                return
-            }
-
-            guard let timeout else { return }
-
-            // If the timeout fires first, terminate the process and report the error.
-            // The terminationHandler will still fire afterwards, but `didResume` prevents a
-            // double resume. Store the Task so the termination handler can cancel it on
-            // a fast exit, and distinguish CancellationError from a real timeout.
-            let timeoutTask = Task {
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                } catch is CancellationError {
-                    // Process exited fast; nothing to do. Termination handler already resumed.
-                    return
-                } catch {
-                    return
-                }
-                guard didResume.tryConsume() else { return }
-                process.terminate()
-                cont.resume(throwing: NSError(
-                    domain: "PlusCalTranslator",
-                    code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "Process timed out after \(Int(timeout)) seconds"]
-                ))
-            }
-            timeoutTaskBox.set(timeoutTask)
-        }
-
-        return (terminationStatus, stdoutAccumulator.snapshot(), stderrAccumulator.snapshot())
-    }
-
-    /// Thread-safe handle for the timeout Task so the termination handler can cancel it.
-    /// Lock-guarded because `set` is called on the continuation closure's thread while
-    /// `cancel` may fire from the process's termination thread.
-    private final class TimeoutTaskBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var task: Task<Void, Never>?
-        private var cancelled = false
-
-        func set(_ task: Task<Void, Never>) {
-            lock.lock()
-            defer { lock.unlock() }
-            if cancelled {
-                task.cancel()
-            } else {
-                self.task = task
-            }
-        }
-
-        func cancel() {
-            lock.lock()
-            let task = self.task
-            self.task = nil
-            cancelled = true
-            lock.unlock()
-            task?.cancel()
-        }
-    }
-
-    /// Single-shot resume token used to prevent CheckedContinuation from being resumed twice
-    /// when both the termination handler and the timeout path race to resume.
-    private final class ResumeGuard: @unchecked Sendable {
-        private let lock = NSLock()
-        private var consumed = false
-
-        func tryConsume() -> Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            guard !consumed else { return false }
-            consumed = true
-            return true
-        }
-    }
 
     // MARK: - Translation
 
@@ -254,12 +49,12 @@ actor PlusCalTranslator {
         }
 
         // Find tla2tools.jar
-        guard let toolsJar = findTLA2Tools() else {
+        guard let toolsJar = JavaProcessRunner.findTLA2Tools() else {
             return .error("Could not find tla2tools.jar. Please install TLA+ tools or configure the path in Settings.")
         }
 
         // Find java
-        guard let javaPath = findJava() else {
+        guard let javaPath = JavaProcessRunner.findJava() else {
             return .error("Java not found. Please install Java to use PlusCal translation.")
         }
 
@@ -288,7 +83,7 @@ actor PlusCalTranslator {
         }
 
         do {
-            let result = try await Self.runProcess(
+            let result = try await JavaProcessRunner.run(
                 executableURL: URL(fileURLWithPath: javaPath),
                 arguments: ["-cp", toolsJar.path, "pcal.trans", tempFile.path],
                 currentDirectoryURL: tempDir,
@@ -321,61 +116,5 @@ actor PlusCalTranslator {
         } catch {
             return .error("Failed to read translated file: \(error.localizedDescription)")
         }
-    }
-
-    // MARK: - Tool Discovery
-
-    private func findTLA2Tools() -> URL? {
-        // Check via BinaryDiscovery
-        if let url = BinaryDiscovery.find(named: "tla2tools", extension: "jar", options: .init(
-            bundleSubdirectories: ["Tools", "bin"],
-            homeRelativePaths: [".tlaplus", ".tla"]
-        )) {
-            return url
-        }
-
-        // Development checkout fallback.
-        if let url = BinaryDiscovery.findDevelopmentFile(relativePath: "Scripts/tla2tools.jar") {
-            return url
-        }
-
-        // Also check standard locations
-        let standardPaths = [
-            "/usr/local/share/tla+/tla2tools.jar",
-            "/opt/homebrew/share/tla+/tla2tools.jar"
-        ]
-
-        for path in standardPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                return URL(fileURLWithPath: path)
-            }
-        }
-
-        return nil
-    }
-
-    private func findJava() -> String? {
-        // Check JAVA_HOME first (user's preferred Java version)
-        if let javaHome = ProcessInfo.processInfo.environment["JAVA_HOME"] {
-            let javaPath = "\(javaHome)/bin/java"
-            if FileManager.default.isExecutableFile(atPath: javaPath) {
-                return javaPath
-            }
-        }
-
-        // Fall back to common system locations
-        let javaPaths = [
-            "/usr/bin/java",
-            "/usr/local/bin/java",
-            "/opt/homebrew/bin/java"
-        ]
-
-        for path in javaPaths {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
-        }
-
-        return nil
     }
 }

@@ -58,11 +58,11 @@ struct ModelCheckProgressView: View {
         if let progress = session.progress {
             switch progress.phase {
             case .parsing:
-                return "Parsing specification..."
+                return "Parsing specification…"
             case .computing:
-                return "Computing reachable states..."
+                return "Computing reachable states…"
             case .checkingLiveness:
-                return "Checking liveness properties..."
+                return "Checking liveness properties…"
             case .done:
                 return "Model checking complete"
             case .error:
@@ -71,7 +71,7 @@ struct ModelCheckProgressView: View {
         }
 
         if session.isRunning {
-            return "Starting TLC..."
+            return "Starting TLC…"
         }
 
         if session.result != nil {

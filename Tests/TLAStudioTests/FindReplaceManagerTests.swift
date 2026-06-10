@@ -508,6 +508,118 @@ final class FindReplaceManagerTests: XCTestCase {
         XCTAssertTrue(manager.matches.isEmpty)
     }
 
+    // MARK: - Regex Replacement Template Tests
+
+    /// Wires the manager to an in-memory buffer so replace operations mutate
+    /// real text. Returns a closure reading the current buffer.
+    private func makeReplaceHarness(_ initial: String) -> () -> String {
+        var content = initial
+        manager = makeManager(contentProvider: { content })
+        manager.textReplacer = { range, replacement in
+            let text = NSMutableString(string: content)
+            text.replaceCharacters(in: range, with: replacement)
+            content = text as String
+        }
+        return { content }
+    }
+
+    func testRegexReplaceAllExpandsBackreferences() {
+        let buffer = makeReplaceHarness("foo_bar baz_qux")
+        manager.isRegex = true
+        manager.searchQuery = #"(\w+)_(\w+)"#
+        manager.replaceQuery = "$2_$1"
+
+        let count = manager.replaceAll()
+
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(buffer(), "bar_foo qux_baz")
+    }
+
+    func testRegexReplaceCurrentExpandsBackreferences() {
+        let buffer = makeReplaceHarness("abc")
+        manager.isRegex = true
+        manager.searchQuery = "(a)(b)"
+        manager.replaceQuery = "$2$1"
+
+        manager.replaceCurrent()
+
+        XCTAssertEqual(buffer(), "bac")
+    }
+
+    func testRegexReplaceSupportsWholeMatchReference() {
+        let buffer = makeReplaceHarness("x = 1")
+        manager.isRegex = true
+        manager.searchQuery = #"\d+"#
+        manager.replaceQuery = "($0)"
+
+        manager.replaceAll()
+
+        XCTAssertEqual(buffer(), "x = (1)")
+    }
+
+    func testLiteralModeKeepsDollarSignsLiteral() {
+        let buffer = makeReplaceHarness("price: X")
+        manager.isRegex = false
+        manager.searchQuery = "X"
+        manager.replaceQuery = "$1"
+
+        manager.replaceAll()
+
+        XCTAssertEqual(buffer(), "price: $1")
+    }
+
+    func testRegexReplaceOutOfRangeGroupStaysLiteral() {
+        let buffer = makeReplaceHarness("aa")
+        manager.isRegex = true
+        manager.searchQuery = "(a)"
+        manager.replaceQuery = "$5"
+
+        manager.replaceAll()
+
+        XCTAssertEqual(buffer(), "$5$5")
+    }
+
+    func testRegexReplaceEscapedDollarStaysLiteral() {
+        let buffer = makeReplaceHarness("a")
+        manager.isRegex = true
+        manager.searchQuery = "(a)"
+        manager.replaceQuery = #"\$1"#
+
+        manager.replaceAll()
+
+        XCTAssertEqual(buffer(), "$1")
+    }
+
+    func testRegexReplaceAllWithLookaheadUsesOriginalText() {
+        // Lookahead must be evaluated against the pre-replacement buffer even
+        // though replacements are applied end-to-start.
+        let buffer = makeReplaceHarness("a1 a2 a9")
+        manager.isRegex = true
+        manager.searchQuery = #"a(?=\d)"#
+        manager.replaceQuery = "b"
+
+        let count = manager.replaceAll()
+
+        XCTAssertEqual(count, 3)
+        XCTAssertEqual(buffer(), "b1 b2 b9")
+    }
+
+    func testSanitizedTemplateEdgeCases() {
+        // Bare dollar → literal.
+        XCTAssertEqual(FindReplaceManager.sanitizedTemplate("cost $", captureGroupCount: 1), #"cost \$"#)
+        // Valid group preserved.
+        XCTAssertEqual(FindReplaceManager.sanitizedTemplate("$1", captureGroupCount: 1), "$1")
+        // Out-of-range group escaped.
+        XCTAssertEqual(FindReplaceManager.sanitizedTemplate("$3", captureGroupCount: 1), #"\$3"#)
+        // With < 10 groups only one digit is consumed (ICU behavior): "$12" is
+        // group 1 followed by literal "2".
+        XCTAssertEqual(FindReplaceManager.sanitizedTemplate("$12", captureGroupCount: 3), "$12")
+        // Existing escapes pass through untouched.
+        XCTAssertEqual(FindReplaceManager.sanitizedTemplate(#"\$1"#, captureGroupCount: 1), #"\$1"#)
+        // Lone trailing backslash escaped.
+        XCTAssertEqual(FindReplaceManager.sanitizedTemplate(#"x\"#, captureGroupCount: 0), #"x\\"#)
+    }
+
     // MARK: - Debounce Tests
 
     func testSearchDebounce() async throws {

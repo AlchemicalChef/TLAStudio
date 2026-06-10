@@ -30,6 +30,56 @@ final class ProofStatusGutterOverlay: NSView {
         }
     }
 
+    /// Context-menu action on an annotation dot (right-click).
+    enum ObligationContextAction {
+        case check
+        case retryStretched
+    }
+
+    /// Right-click handler; nil disables the context menu.
+    var onObligationAction: ((ProofAnnotation, ObligationContextAction) -> Void)?
+
+    private final class ObligationActionRequest: NSObject {
+        let annotation: ProofAnnotation
+        let action: ObligationContextAction
+        init(annotation: ProofAnnotation, action: ObligationContextAction) {
+            self.annotation = annotation
+            self.action = action
+        }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let line = lineAtPoint(point),
+              let annotation = annotationsByLine[line],
+              onObligationAction != nil else {
+            return super.menu(for: event)
+        }
+
+        let menu = NSMenu()
+        menu.addItem(contextItem("Check This Step", annotation: annotation, action: .check))
+        if annotation.obligation.status == .failed || annotation.obligation.status == .timeout {
+            menu.addItem(contextItem("Retry with 2× Timeout", annotation: annotation, action: .retryStretched))
+        }
+        return menu
+    }
+
+    private func contextItem(
+        _ title: String,
+        annotation: ProofAnnotation,
+        action: ObligationContextAction
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(performObligationAction(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = ObligationActionRequest(annotation: annotation, action: action)
+        return item
+    }
+
+    @objc private func performObligationAction(_ sender: NSMenuItem) {
+        guard let request = sender.representedObject as? ObligationActionRequest else { return }
+        onObligationAction?(request.annotation, request.action)
+    }
+
     private let dotSize: CGFloat = 8
 
     // MARK: - Initialization

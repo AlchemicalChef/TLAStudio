@@ -82,6 +82,25 @@ final class DiagnosticHighlighter {
         currentDiagnostics.filter { Int($0.range.start.line) == line }
     }
 
+    /// All diagnostics whose mapped range contains the UTF-16 character index.
+    /// Static so hover handling outside the editor coordinator (EditorArea)
+    /// can resolve diagnostics without the highlighter instance; the text is
+    /// analyzed once for the whole batch.
+    static func diagnostics(
+        at characterIndex: Int,
+        in diagnostics: [TLADiagnostic],
+        text: String
+    ) -> [TLADiagnostic] {
+        guard !diagnostics.isEmpty else { return [] }
+        let analysis = TextCoordinateMapper.analyze(text)
+        return diagnostics.filter { diagnostic in
+            guard let range = mappedRange(for: diagnostic, in: text, analysis: analysis) else {
+                return false
+            }
+            return NSLocationInRange(characterIndex, range)
+        }
+    }
+
     // MARK: - Private Methods
 
     static func mappedRange(for diagnostic: TLADiagnostic, in text: String) -> NSRange? {
@@ -215,7 +234,8 @@ final class DiagnosticHighlighter {
             textStorage.addAttribute(.underlineStyle, value: style.rawValue, range: mapped.range)
             textStorage.addAttribute(.underlineColor, value: color, range: mapped.range)
             textStorage.addAttribute(Self.diagnosticKey, value: mapped.diagnostic.id.uuidString, range: mapped.range)
-            textStorage.addAttribute(.toolTip, value: mapped.diagnostic.message, range: mapped.range)
+            // No .toolTip attribute: the hover popover shows diagnostics now,
+            // and the system tooltip would double-report on top of it.
         }
 
         textStorage.endEditing()

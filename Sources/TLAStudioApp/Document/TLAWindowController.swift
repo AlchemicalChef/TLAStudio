@@ -111,8 +111,10 @@ final class TLAWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func checkProof(_ sender: Any?) {
+        // Direct call — the .checkAllProofs notification this used to post had
+        // no observers, making the toolbar button a no-op (platform review C2).
         guard let doc = tlaDocument else { return }
-        NotificationCenter.default.post(name: .checkAllProofs, object: doc, userInfo: nil)
+        doc.runProofCheck()
     }
 
     @objc func translatePlusCal(_ sender: Any?) {
@@ -171,7 +173,7 @@ extension TLAWindowController: NSToolbarDelegate {
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.label = "Run TLC"
             item.paletteLabel = "Run Model Check"
-            item.toolTip = "Run TLC model checker (Cmd+R)"
+            item.toolTip = "Run TLC model checker (⌘R)"
             item.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Run")
             item.action = #selector(runModelCheck(_:))
             item.target = self
@@ -181,7 +183,7 @@ extension TLAWindowController: NSToolbarDelegate {
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.label = "Stop"
             item.paletteLabel = "Stop Model Check"
-            item.toolTip = "Stop model checking (Cmd+.)"
+            item.toolTip = "Stop model checking (⌘.)"
             item.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop")
             item.action = #selector(stopModelCheck(_:))
             item.target = self
@@ -191,7 +193,7 @@ extension TLAWindowController: NSToolbarDelegate {
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.label = "Prove"
             item.paletteLabel = "Check Proofs"
-            item.toolTip = "Check all proofs (Shift+Cmd+P)"
+            item.toolTip = "Check all proofs (⇧⌘P)"
             item.image = NSImage(systemSymbolName: "checkmark.seal", accessibilityDescription: "Prove")
             item.action = #selector(checkProof(_:))
             item.target = self
@@ -201,7 +203,7 @@ extension TLAWindowController: NSToolbarDelegate {
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.label = "Translate"
             item.paletteLabel = "Translate PlusCal"
-            item.toolTip = "Translate PlusCal to TLA+ (Shift+Cmd+T)"
+            item.toolTip = "Translate PlusCal to TLA+ (⇧⌘T)"
             item.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: "Translate")
             item.action = #selector(translatePlusCal(_:))
             item.target = self
@@ -226,9 +228,9 @@ extension NSToolbarItem.Identifier {
 // ModelConfigEditorSheet is defined in TLC/ModelConfigEditor.swift
 // NavigatorSidebar and NavigatorTabButton are defined in Views/Sidebar/NavigatorSidebar.swift
 
-// MARK: - TLAEditorView with FindReplace Integration
+// MARK: - Editor with FindReplace Integration
 
-/// Wrapper for TLAEditorView that integrates with FindReplaceManager
+/// NSViewRepresentable editor (GoToDefinitionTextView) that integrates with FindReplaceManager
 struct TLAEditorViewWithFindReplace: NSViewRepresentable {
 
     @Binding var text: String
@@ -244,7 +246,9 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
     var onGoToDefinition: ((Int) -> Bool)?
     var onHover: ((Int, NSPoint) -> Void)?
     var onHoverEnd: (() -> Void)?
-    var completionProvider: ((Int) -> [String])?
+    /// Warm cross-module symbol snapshot (from the document's
+    /// CrossModuleSymbolProvider); merged into completions/signature help.
+    var crossModuleSymbols: (() -> [ModuleSymbol])?
     var showFoldingGutter: Bool
 
     init(
@@ -260,7 +264,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         onGoToDefinition: ((Int) -> Bool)? = nil,
         onHover: ((Int, NSPoint) -> Void)? = nil,
         onHoverEnd: (() -> Void)? = nil,
-        completionProvider: ((Int) -> [String])? = nil,
+        crossModuleSymbols: (() -> [ModuleSymbol])? = nil,
         showFoldingGutter: Bool = true
     ) {
         self._text = text
@@ -275,7 +279,7 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         self.onGoToDefinition = onGoToDefinition
         self.onHover = onHover
         self.onHoverEnd = onHoverEnd
-        self.completionProvider = completionProvider
+        self.crossModuleSymbols = crossModuleSymbols
         self.showFoldingGutter = showFoldingGutter
     }
 
@@ -342,7 +346,6 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         textView.onGoToDefinition = onGoToDefinition
         textView.onHover = onHover
         textView.onHoverEnd = onHoverEnd
-        textView.completionProvider = completionProvider
         textView.setupIntelliSense()
         textView.detailedCompletionProvider = coordinator.getDetailedCompletions
         textView.signatureHelpProvider = coordinator.getSignatureHelp
@@ -545,11 +548,26 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
     }
 
     private func syncProofAnnotations(for containerView: EditorContainerView) {
-        guard let proofGutter = containerView.proofGutterView,
-              proofGutter.annotations != proofAnnotations else {
-            return
+        guard let proofGutter = containerView.proofGutterView else { return }
+
+        // Wire the gutter context-menu actions to the document's proof
+        // session (idempotent — the closure reads live state).
+        if proofGutter.onObligationAction == nil, let document = notificationTarget as? TLADocument {
+            proofGutter.onObligationAction = { [weak document] annotation, action in
+                guard let session = document?.proofSession, !session.isRunning else {
+                    NSSound.beep()
+                    return
+                }
+                switch action {
+                case .check:
+                    session.retryObligation(annotation.obligation)
+                case .retryStretched:
+                    session.retryObligation(annotation.obligation, timeoutMultiplier: 2)
+                }
+            }
         }
 
+        guard proofGutter.annotations != proofAnnotations else { return }
         proofGutter.annotations = proofAnnotations
         containerView.needsLayout = true
     }
@@ -800,93 +818,17 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
             _ tokens: [TLAHighlightToken],
             in text: String
         ) -> [(NSRange, String)] {
-            let utf8 = text.utf8
-            let nsText = text as NSString
-
-            var lineStartsUTF8: [Int] = [0]
-            var lineStartsUTF16: [Int] = [0]
-            var utf16Offset = 0
-
-            for (byteIndex, byte) in utf8.enumerated() {
-                if byte == 0x0A {
-                    utf16Offset += 1
-                    lineStartsUTF8.append(byteIndex + 1)
-                    lineStartsUTF16.append(utf16Offset)
-                } else if byte & 0xC0 != 0x80 {
-                    utf16Offset += byte < 0xF0 ? 1 : 2
-                }
-            }
-
-            func utf16OffsetForTreeSitterPoint(line: Int, byteColumn: Int) -> Int? {
-                guard line >= 0,
-                      line < lineStartsUTF8.count,
-                      line < lineStartsUTF16.count else {
-                    return nil
-                }
-
-                let lineByteStart = lineStartsUTF8[line]
-                let lineUTF16Start = lineStartsUTF16[line]
-                guard let startIndex = utf8.index(
-                    utf8.startIndex,
-                    offsetBy: lineByteStart,
-                    limitedBy: utf8.endIndex
-                ) else {
-                    return nil
-                }
-
-                var bytesConsumed = 0
-                var utf16Count = 0
-                var index = startIndex
-
-                while bytesConsumed < byteColumn && index < utf8.endIndex {
-                    let byte = utf8[index]
-                    if byte == 0x0A { break }
-
-                    let characterByteLength: Int
-                    let characterUTF16Length: Int
-                    if byte < 0x80 {
-                        characterByteLength = 1
-                        characterUTF16Length = 1
-                    } else if byte < 0xE0 {
-                        characterByteLength = 2
-                        characterUTF16Length = 1
-                    } else if byte < 0xF0 {
-                        characterByteLength = 3
-                        characterUTF16Length = 1
-                    } else {
-                        characterByteLength = 4
-                        characterUTF16Length = 2
-                    }
-
-                    bytesConsumed += characterByteLength
-                    utf16Count += characterUTF16Length
-                    index = utf8.index(index, offsetBy: characterByteLength, limitedBy: utf8.endIndex) ?? utf8.endIndex
-                }
-
-                return lineUTF16Start + utf16Count
-            }
+            let converter = TextCoordinateMapper.TreeSitterRangeConverter(text: text)
 
             var converted: [(NSRange, String)] = []
             converted.reserveCapacity(tokens.count)
 
             for token in tokens {
-                let startLine = Int(token.range.start.line)
-                let startColumn = Int(token.range.start.column)
-                let endLine = Int(token.range.end.line)
-                let endColumn = Int(token.range.end.column)
-
-                guard let start = utf16OffsetForTreeSitterPoint(line: startLine, byteColumn: startColumn),
-                      let end = utf16OffsetForTreeSitterPoint(line: endLine, byteColumn: endColumn),
-                      start <= nsText.length,
-                      end <= nsText.length,
-                      end > start else {
+                guard let range = converter.utf16Range(for: token.range),
+                      range.length > 0 else {
                     continue
                 }
-
-                converted.append((
-                    NSRange(location: start, length: end - start),
-                    token.tokenType
-                ))
+                converted.append((range, token.tokenType))
             }
 
             return converted
@@ -898,40 +840,22 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         @MainActor
         func getDetailedCompletions(at position: Int) async -> [TLADetailedCompletionItem] {
             guard let textView = textView else { return [] }
-            let text = textView.string
-            let tlaPosition = TextCoordinateMapper.position(forUTF16Offset: position, in: text)
-
-            // Get parse result and completions from TLACore
-            do {
-                let parseResult = try await TLACoreWrapper.shared.parse(text)
-                let completions = await TLACoreWrapper.shared.getDetailedCompletions(
-                    from: parseResult,
-                    at: tlaPosition
-                )
-                return completions
-            } catch {
-                return []
-            }
+            return await CrossModuleIntelliSense.detailedCompletions(
+                text: textView.string,
+                utf16Position: position,
+                crossModuleSymbols: parent.crossModuleSymbols?() ?? []
+            )
         }
 
         /// Provide signature help for operator calls
         @MainActor
         func getSignatureHelp(at position: Int) async -> TLASignatureHelp? {
             guard let textView = textView else { return nil }
-            let text = textView.string
-            let tlaPosition = TextCoordinateMapper.position(forUTF16Offset: position, in: text)
-
-            // Get parse result and signature help from TLACore
-            do {
-                let parseResult = try await TLACoreWrapper.shared.parse(text)
-                let signatureHelp = await TLACoreWrapper.shared.getSignatureHelp(
-                    from: parseResult,
-                    at: tlaPosition
-                )
-                return signatureHelp
-            } catch {
-                return nil
-            }
+            return await CrossModuleIntelliSense.signatureHelp(
+                text: textView.string,
+                utf16Position: position,
+                crossModuleSymbols: parent.crossModuleSymbols?() ?? []
+            )
         }
     }
 }

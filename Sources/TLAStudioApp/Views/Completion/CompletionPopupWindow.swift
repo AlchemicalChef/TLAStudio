@@ -14,6 +14,10 @@ class CompletionPopupWindow: NSPanel {
 
     private var completions: [TLADetailedCompletionItem] = []
     private var filteredCompletions: [TLADetailedCompletionItem] = []
+
+    /// Fuzzy label matches parallel to `filteredCompletions` (nil when the row
+    /// ranked via `filterText` or no filter is active) — drives bold highlights.
+    private var filteredMatches: [FuzzyMatch?] = []
     private var filterText: String = ""
 
     var onSelect: ((TLADetailedCompletionItem) -> Void)?
@@ -196,6 +200,7 @@ class CompletionPopupWindow: NSPanel {
         orderOut(nil)
         completions = []
         filteredCompletions = []
+        filteredMatches = []
         onDismiss?()
     }
 
@@ -272,31 +277,43 @@ class CompletionPopupWindow: NSPanel {
 
     private func applyFilter() {
         if filterText.isEmpty {
+            // Keep the provider's pre-sorted order.
             filteredCompletions = completions
-        } else {
-            let lowercaseFilter = filterText.lowercased()
-            filteredCompletions = completions.filter { item in
-                // Check label
-                if item.label.lowercased().contains(lowercaseFilter) {
-                    return true
-                }
-                // Check filter text if available
-                if let filterText = item.filterText, filterText.lowercased().contains(lowercaseFilter) {
-                    return true
-                }
-                return false
-            }
+            filteredMatches = Array(repeating: nil, count: completions.count)
+            return
+        }
 
-            // Sort by relevance (exact prefix match first)
-            filteredCompletions.sort { a, b in
-                let aPrefix = a.label.lowercased().hasPrefix(lowercaseFilter)
-                let bPrefix = b.label.lowercased().hasPrefix(lowercaseFilter)
-                if aPrefix != bPrefix {
-                    return aPrefix
-                }
-                return a.sortPriority < b.sortPriority
+        // Fuzzy match: label match preferred (its ranges drive the bold
+        // highlight); filterText is a ranking fallback for snippets whose
+        // visible label differs from what the user types.
+        var scored: [(item: TLADetailedCompletionItem, ranking: FuzzyMatch, labelMatch: FuzzyMatch?)] = []
+        scored.reserveCapacity(completions.count)
+
+        for item in completions {
+            let labelMatch = FuzzyCompletionScorer.match(query: filterText, candidate: item.label)
+            var ranking = labelMatch
+            if let filterTarget = item.filterText, filterTarget != item.label,
+               let filterMatch = FuzzyCompletionScorer.match(query: filterText, candidate: filterTarget),
+               filterMatch.score > (ranking?.score ?? Int.min) {
+                ranking = filterMatch
+            }
+            if let ranking {
+                scored.append((item, ranking, labelMatch))
             }
         }
+
+        scored.sort { a, b in
+            if a.ranking.score != b.ranking.score {
+                return a.ranking.score > b.ranking.score
+            }
+            if a.item.sortPriority != b.item.sortPriority {
+                return a.item.sortPriority < b.item.sortPriority
+            }
+            return a.item.label < b.item.label
+        }
+
+        filteredCompletions = scored.map(\.item)
+        filteredMatches = scored.map(\.labelMatch)
     }
 
     private func updateDocumentation() {
@@ -363,7 +380,8 @@ extension CompletionPopupWindow: NSTableViewDelegate {
             cell.identifier = cellId
         }
 
-        cell.configure(with: item, filterText: filterText)
+        let match = row < filteredMatches.count ? filteredMatches[row] : nil
+        cell.configure(with: item, match: match)
         return cell
     }
 
@@ -435,7 +453,7 @@ class CompletionItemCell: NSTableCellView {
         )
     }
 
-    func configure(with item: TLADetailedCompletionItem, filterText: String) {
+    func configure(with item: TLADetailedCompletionItem, match: FuzzyMatch?) {
         // Set icon
         let iconName = item.iconName
         if let image = NSImage(systemSymbolName: iconName, accessibilityDescription: nil) {
@@ -443,14 +461,12 @@ class CompletionItemCell: NSTableCellView {
             iconView.contentTintColor = colorForKind(item.kind)
         }
 
-        // Set label with highlight
-        if filterText.isEmpty {
-            labelField.stringValue = item.label
+        // Set label, bolding the fuzzy-matched character runs (which may be
+        // non-contiguous, e.g. "tinv" matching TypeInvariant)
+        if let match, !match.matchedRanges.isEmpty {
+            labelField.attributedStringValue = highlightedString(item.label, matchedRanges: match.matchedRanges)
         } else {
-            labelField.attributedStringValue = highlightedString(
-                item.label,
-                highlight: filterText
-            )
+            labelField.stringValue = item.label
         }
 
         // Set detail
@@ -477,7 +493,7 @@ class CompletionItemCell: NSTableCellView {
         }
     }
 
-    private func highlightedString(_ text: String, highlight: String) -> NSAttributedString {
+    private func highlightedString(_ text: String, matchedRanges: [Swift.Range<Int>]) -> NSAttributedString {
         let attributed = NSMutableAttributedString(
             string: text,
             attributes: [
@@ -486,16 +502,16 @@ class CompletionItemCell: NSTableCellView {
             ]
         )
 
-        // Find and highlight matching ranges
-        let lowercaseText = text.lowercased()
-        let lowercaseHighlight = highlight.lowercased()
-        var searchRange = lowercaseText.startIndex..<lowercaseText.endIndex
-
-        while let range = lowercaseText.range(of: lowercaseHighlight, range: searchRange) {
-            let nsRange = NSRange(range, in: text)
+        // matchedRanges are Character indices from the fuzzy scorer; convert
+        // each run to a UTF-16 NSRange for the attributed string.
+        let characters = Array(text)
+        for range in matchedRanges {
+            guard range.lowerBound >= 0, range.upperBound <= characters.count else { continue }
+            let location = String(characters[0..<range.lowerBound]).utf16.count
+            let length = String(characters[range.lowerBound..<range.upperBound]).utf16.count
+            let nsRange = NSRange(location: location, length: length)
             attributed.addAttribute(.backgroundColor, value: NSColor.systemYellow.withAlphaComponent(0.3), range: nsRange)
             attributed.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: 12), range: nsRange)
-            searchRange = range.upperBound..<lowercaseText.endIndex
         }
 
         return attributed

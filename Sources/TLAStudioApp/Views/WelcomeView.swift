@@ -296,6 +296,9 @@ final class WelcomeWindowController: NSWindowController {
         )
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
+        // Title is hidden visually but read by accessibility/Window menu —
+        // without it the welcome panel reports as "Untitled".
+        window.title = "Welcome to TLA+ Studio"
         window.isMovableByWindowBackground = true
         window.center()
 

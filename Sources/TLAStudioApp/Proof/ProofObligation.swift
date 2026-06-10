@@ -231,7 +231,7 @@ public enum ProofStatus: String, Codable, CaseIterable, Sendable {
     public var symbolName: String {
         switch self {
         case .unknown: return "questionmark.circle"
-        case .pending: return "clock"
+        case .pending: return "ellipsis.circle"
         case .proved: return "checkmark.circle.fill"
         case .failed: return "xmark.circle.fill"
         case .timeout: return "clock.badge.exclamationmark"
@@ -537,7 +537,7 @@ public struct ProofProgress: Identifiable, Codable, Sendable {
     public var statusMessage: String {
         switch phase {
         case .parsing:
-            return "Parsing specification..."
+            return "Parsing specification…"
         case .checking:
             // Include trivial in completed count
             let completed = totalObligations - pendingCount
