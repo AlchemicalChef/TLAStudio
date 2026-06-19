@@ -149,7 +149,13 @@ final class SimulationSession: ObservableObject {
     func stepBack() {
         guard trace.count > 1 else { return }
         generation += 1
+        // Invalidate in-flight evaluation too (mirror reset()): an eval launched
+        // against the state we're leaving captured a stateIndex into the old
+        // trace; without bumping the epoch and cancelling, it lands after the
+        // trace is trimmed and inserts a mislabeled entry (e2e M5).
+        evaluationEpoch += 1
         expansionTask?.cancel()
+        evaluationTask?.cancel()
         trace.removeLast()
         // Drop evaluations tagged to the abandoned suffix — after a different
         // re-step, their "S<n>" labels would point at a different state.
@@ -230,7 +236,15 @@ final class SimulationSession: ObservableObject {
         evaluationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let result = await self.runner.evaluate(trimmed, in: state, context: self.context)
+            // Cancellation is cooperative and the runner doesn't throw on cancel,
+            // so a superseded evaluate() whose await already returned would still
+            // resume and insert a stale expression/result the user replaced. Drop
+            // it (same epoch, so the epoch guard alone can't catch this).
+            guard !Task.isCancelled else { return }
             guard self.evaluationEpoch == epoch else { return }
+            // Defensive bound: never tag an evaluation to a state index the trace
+            // no longer contains (e2e M5).
+            guard stateIndex < self.trace.count else { return }
 
             self.evaluations.insert(EvaluationEntry(
                 id: self.nextEvaluationID,

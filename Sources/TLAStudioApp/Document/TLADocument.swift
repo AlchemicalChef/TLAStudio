@@ -93,6 +93,12 @@ final class TLADocument: NSDocument, ObservableObject {
     /// Line ending style
     var lineEnding: LineEnding = .lf
 
+    /// True when the user explicitly created this document (File > New, or a
+    /// template). The launch path's implicit untitled leaves this false so the
+    /// controller's pristine-untitled sweep may reclaim it without destroying
+    /// documents the user asked for (e2e review H1/M1).
+    var wasUserCreated: Bool = false
+
     /// Module name extracted from the content or document filename
     var moduleName: String {
         // Try to extract module name from content
@@ -119,6 +125,12 @@ final class TLADocument: NSDocument, ObservableObject {
     private var parseTask: Task<Void, Never>?
     private var tlcWatchTask: Task<Void, Never>?
     private var proofWatchTask: Task<Void, Never>?
+
+    /// Combine subscriptions to the active ProofSession's @Published obligations
+    /// and result, forwarding them to the editor gutter / document summary for the
+    /// session's WHOLE lifetime — so panel/inspector retries that run after the
+    /// full run's poll loop has exited still refresh the gutter (e2e M6).
+    private var proofSessionCancellables = Set<AnyCancellable>()
 
     /// Backing storage for `diagnostics`: syntax (tree-sitter) and semantic (SANY)
     /// findings update independently and are merged by `publishDiagnostics()`,
@@ -308,9 +320,16 @@ final class TLADocument: NSDocument, ObservableObject {
     override func read(from url: URL, ofType typeName: String) throws {
         let data = try Data(contentsOf: url)
 
-        // Encoding detection: Try UTF-8 first, fall back to Windows-1252
+        // Encoding detection: UTF-8 first; then UTF-16 IF it carries a BOM (so a
+        // genuinely UTF-16 spec decodes correctly instead of being mojibake'd by
+        // the Latin-1 fallback, which never fails for any byte sequence — e2e Low);
+        // finally Windows-1252 as the permissive last resort.
         if let text = String(data: data, encoding: .utf8) {
             encoding = .utf8
+            setContentWithoutTriggeringChange(text)
+        } else if (data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF])),
+                  let text = String(data: data, encoding: .utf16) {
+            encoding = .utf16
             setContentWithoutTriggeringChange(text)
         } else if let text = String(data: data, encoding: .windowsCP1252) {
             encoding = .windowsCP1252
@@ -325,6 +344,14 @@ final class TLADocument: NSDocument, ObservableObject {
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         setContentWithoutTriggeringChange(normalizedContent)
+
+        // A freshly read document is, by definition, clean — but init() set the
+        // template as `content` (bumping the change count to 1) and
+        // setContentWithoutTriggeringChange only clears when the prior value was
+        // empty, which it never is on the open/revert path. Clear explicitly so an
+        // unedited opened file isn't shown dirty (and so specURLForTooling can use
+        // the real fileURL instead of forcing a temp copy on every tool run).
+        updateChangeCount(.changeCleared)
 
         // Parse immediately
         scheduleParseContent()
@@ -363,10 +390,21 @@ final class TLADocument: NSDocument, ObservableObject {
             break
         }
 
-        guard let data = outputContent.data(using: encoding) else {
-            throw CocoaError(.fileWriteUnknown)
+        if let data = outputContent.data(using: encoding) {
+            return data
         }
-        return data
+
+        // The originally-detected encoding (e.g. Windows-1252) can't represent
+        // the current content — TLA+ specs routinely gain Unicode math operators
+        // (∈ → ≤ ∧ ⟨⟩ …) that Latin-1 cannot encode. Refusing the save here would
+        // lose the user's work behind an opaque error. Transparently upgrade to
+        // UTF-8, a universal superset that every consumer (TLC/SANY/TLAPM) reads,
+        // and pin the document to it so subsequent saves stay consistent.
+        encoding = .utf8
+        if let data = outputContent.data(using: .utf8) {
+            return data
+        }
+        throw CocoaError(.fileWriteUnknown)
     }
 
     override func write(
@@ -470,6 +508,7 @@ final class TLADocument: NSDocument, ObservableObject {
 
         // Clear all Combine subscriptions before clearing state
         cancellables.removeAll()
+        proofSessionCancellables.removeAll()
 
         // Clear state (reuse the existing annotation manager instead of instantiating a new one
         // mid-teardown, which would churn SwiftUI observers bound to the old value).
@@ -494,6 +533,7 @@ final class TLADocument: NSDocument, ObservableObject {
     /// Show a transient banner explaining why an action didn't happen.
     @MainActor
     func reportActionFeedback(_ message: String, style: ActionFeedback.Style = .warning) {
+        guard !isClosed else { return }
         actionFeedback = ActionFeedback(message: message, style: style)
         actionFeedbackDismissTask?.cancel()
         actionFeedbackDismissTask = Task { @MainActor [weak self] in
@@ -531,12 +571,19 @@ final class TLADocument: NSDocument, ObservableObject {
     private func parseContent() async {
         do {
             let result = try await TLACoreWrapper.shared.parse(content, previous: parseResult)
+            // A newer edit may have superseded this parse while it ran. Without
+            // this guard a just-cancelled older task can resume after the newer
+            // one committed and overwrite parseResult/symbols with stale results
+            // (mirrors updateTreeSitterHighlights / the SANY generation guard).
+            guard !Task.isCancelled, !isClosed else { return }
             self.parseResult = result
             self.syntaxDiagnostics = result.diagnostics
             publishDiagnostics()
 
             // Extract symbols
-            self.symbols = await TLACoreWrapper.shared.getSymbols(from: result)
+            let extractedSymbols = await TLACoreWrapper.shared.getSymbols(from: result)
+            guard !Task.isCancelled, !isClosed else { return }
+            self.symbols = extractedSymbols
 
             delegate?.documentDidParse(self)
 
@@ -1001,7 +1048,9 @@ final class TLADocument: NSDocument, ObservableObject {
         var options = currentProofCheckOptions()
         options.additionalLibraryPaths = originalDirectoryLibraryPaths(forToolingSpecURL: specURL)
         session.options = options
-        lastProofResult = nil
+        // Don't clear lastProofResult here — a focused single-step check must not
+        // drop the prior full-run summary (e2e Low). The $result subscription
+        // updates the summary only on a real (non-nil) result.
 
         session.checkStep(line: line + 1, column: column + 1) // Convert to 1-based
         watchProofSession(session)
@@ -1188,6 +1237,26 @@ final class TLADocument: NSDocument, ObservableObject {
         proofSession = session
         proofToolingSpecURL = nil
 
+        // Keep the editor gutter and the document's proof summary current for the
+        // session's whole lifetime (full run AND subsequent retries), not just the
+        // window watchProofSession polls. Without this, "Re-check Failed" / inspector
+        // retries update the panel but leave the gutter showing stale glyphs (e2e M6).
+        proofSessionCancellables.removeAll()
+        session.$obligations
+            .sink { [weak self, weak session] obligations in
+                guard let self, let session, self.proofSession === session else { return }
+                self.proofAnnotationManager.updateAnnotations(for: obligations)
+            }
+            .store(in: &proofSessionCancellables)
+        session.$result
+            .sink { [weak self, weak session] result in
+                guard let self, let session, self.proofSession === session else { return }
+                // Only a real result updates the summary; single-step checks set
+                // result=nil transiently and must not drop the prior summary (e2e Low).
+                if let result { self.lastProofResult = result }
+            }
+            .store(in: &proofSessionCancellables)
+
         if proofSessionToStop != nil {
             Task.detached {
                 await proofSessionToStop?.stopAsync()
@@ -1223,17 +1292,27 @@ final class TLADocument: NSDocument, ObservableObject {
     private func watchProofSession(_ session: ProofSession) {
         proofWatchTask?.cancel()
         proofWatchTask = Task { @MainActor [weak self] in
+            // The gutter is now driven for the session's whole lifetime by the
+            // $obligations Combine sink (replaceProofSession), which fires on every
+            // mutation. So this poll need only detect isRunning -> false, commit
+            // the final result, and clean up the tooling spec — no per-tick
+            // updateAnnotations, which was a redundant O(N log N) rebuild ~10x/sec
+            // on the MainActor on top of the sink.
             while session.isRunning {
                 try? await Task.sleep(nanoseconds: 100_000_000)
                 if Task.isCancelled { return }
-                guard let self, self.proofSession === session else { return }
-                self.proofAnnotationManager.updateAnnotations(for: session.obligations)
+                guard self != nil else { return }
             }
             guard !Task.isCancelled,
                   let self,
                   self.proofSession === session else { return }
-            self.lastProofResult = session.result
-            self.proofAnnotationManager.updateAnnotations(for: session.obligations)
+            // Only a real (non-nil) result updates the summary. A single-step
+            // check (checkSelectionProofStep also ends by calling this watcher)
+            // leaves session.result == nil, so an unconditional assignment here
+            // would wipe the prior full-run summary — matching the guard the
+            // $result Combine sink already uses (e2e Low; the poll was left
+            // half-fixed).
+            if let result = session.result { self.lastProofResult = result }
             SecureTempFile.cleanupContainer(for: self.proofToolingSpecURL)
             self.proofToolingSpecURL = nil
         }

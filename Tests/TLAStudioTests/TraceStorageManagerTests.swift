@@ -821,4 +821,36 @@ final class LargeTraceIntegrationTests: XCTestCase {
         // Clean up
         await manager.cleanup(sessionId: sessionId)
     }
+
+    func testLoadStatesAcrossPageBoundaries() async throws {
+        // The page-batched loadStates must return the correct contiguous slice
+        // (ids in order) even when the range spans several 100-state pages.
+        let manager = TraceStorageManager.shared
+        let sessionId = UUID()
+
+        let writer = try await manager.beginTrace(sessionId: sessionId)
+        let total = 250
+        for i in 0..<total {
+            try await writer.append(TraceState(id: i, action: "Step", variables: ["i": .int(i)]))
+        }
+        let lazyTrace = try await manager.finalizeTrace(
+            sessionId: sessionId, type: .invariantViolation, message: "T", loopStart: nil, violatedProperty: nil
+        )
+        XCTAssertTrue(lazyTrace.isStoredOnDisk)
+
+        // Range crossing pages 0,1,2 (90..209).
+        let slice = try await lazyTrace.loadStates(range: 90..<210)
+        XCTAssertEqual(slice.map { $0.id }, Array(90..<210))
+
+        // Full materialization preserves order and count.
+        let all = try await lazyTrace.toErrorTrace()
+        XCTAssertEqual(all.states.count, total)
+        XCTAssertEqual(all.states.map { $0.id }, Array(0..<total))
+
+        // Over-wide range clamps to the stored count.
+        let tail = try await lazyTrace.loadStates(range: 240..<5000)
+        XCTAssertEqual(tail.map { $0.id }, Array(240..<total))
+
+        await manager.cleanup(sessionId: sessionId)
+    }
 }

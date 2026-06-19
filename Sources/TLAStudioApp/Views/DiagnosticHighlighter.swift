@@ -35,10 +35,11 @@ final class DiagnosticHighlighter {
     func updateDiagnostics(_ diagnostics: [TLADiagnostic], in text: String) {
         currentDiagnostics = diagnostics
         let textAnalysis = TextCoordinateMapper.analyze(text)
+        let converter = TextCoordinateMapper.TreeSitterRangeConverter(text: text)
 
         // Map diagnostics to text ranges
         mappedDiagnostics = diagnostics.compactMap { diagnostic in
-            if let range = Self.mappedRange(for: diagnostic, in: text, analysis: textAnalysis) {
+            if let range = Self.mappedRange(for: diagnostic, in: text, analysis: textAnalysis, converter: converter) {
                 return MappedDiagnostic(diagnostic: diagnostic, range: range)
             }
             return nil
@@ -93,8 +94,9 @@ final class DiagnosticHighlighter {
     ) -> [TLADiagnostic] {
         guard !diagnostics.isEmpty else { return [] }
         let analysis = TextCoordinateMapper.analyze(text)
+        let converter = TextCoordinateMapper.TreeSitterRangeConverter(text: text)
         return diagnostics.filter { diagnostic in
-            guard let range = mappedRange(for: diagnostic, in: text, analysis: analysis) else {
+            guard let range = mappedRange(for: diagnostic, in: text, analysis: analysis, converter: converter) else {
                 return false
             }
             return NSLocationInRange(characterIndex, range)
@@ -104,13 +106,19 @@ final class DiagnosticHighlighter {
     // MARK: - Private Methods
 
     static func mappedRange(for diagnostic: TLADiagnostic, in text: String) -> NSRange? {
-        mappedRange(for: diagnostic, in: text, analysis: TextCoordinateMapper.analyze(text))
+        mappedRange(
+            for: diagnostic,
+            in: text,
+            analysis: TextCoordinateMapper.analyze(text),
+            converter: TextCoordinateMapper.TreeSitterRangeConverter(text: text)
+        )
     }
 
     private static func mappedRange(
         for diagnostic: TLADiagnostic,
         in text: String,
-        analysis: TextCoordinateMapper.TextAnalysis
+        analysis: TextCoordinateMapper.TextAnalysis,
+        converter: TextCoordinateMapper.TreeSitterRangeConverter
     ) -> NSRange? {
         let startLine = Int(diagnostic.range.start.line)
         let startColumn = Int(diagnostic.range.start.column)
@@ -120,6 +128,16 @@ final class DiagnosticHighlighter {
 
         guard startLine >= 0, startLine < lineCount else { return nil }
         guard analysis.utf16Length >= 0 else { return nil }
+
+        // Tree-sitter (syntax) diagnostics carry UTF-8 BYTE columns; SANY
+        // (semantic) diagnostics carry Swift-Character columns. Routing both
+        // through the character-based mapper below shifts a byte-column underline
+        // right by (bytes − chars) on any line with a multi-byte char before the
+        // error. Convert syntax diagnostics via the byte-aware converter instead
+        // (same path the token highlighter already uses).
+        if !diagnostic.isSemantic {
+            return treeSitterMappedRange(for: diagnostic, in: text, analysis: analysis, converter: converter)
+        }
 
         let startOffset = TextCoordinateMapper.utf16Offset(
             forLine: startLine,
@@ -150,6 +168,43 @@ final class DiagnosticHighlighter {
         guard length > 0 else { return nil }
 
         return NSRange(location: startOffset, length: length)
+    }
+
+    /// Map a tree-sitter (byte-column) diagnostic to a UTF-16 NSRange. Zero-width
+    /// ranges (tree-sitter MISSING nodes) widen to the word at the start, matching
+    /// the character-column path's behavior.
+    private static func treeSitterMappedRange(
+        for diagnostic: TLADiagnostic,
+        in text: String,
+        analysis: TextCoordinateMapper.TextAnalysis,
+        converter: TextCoordinateMapper.TreeSitterRangeConverter
+    ) -> NSRange? {
+        guard let tsRange = converter.utf16Range(for: diagnostic.range) else { return nil }
+
+        if tsRange.length > 0 {
+            let maxLength = max(0, analysis.utf16Length - tsRange.location)
+            let length = min(tsRange.length, maxLength)
+            return length > 0 ? NSRange(location: tsRange.location, length: length) : nil
+        }
+
+        // Zero-width MISSING node: widen to the word at the start offset, in
+        // character units consistent with fallbackEndOffset.
+        let startOffset = tsRange.location
+        let (charLine, charColumn) = TextCoordinateMapper.lineAndColumn(
+            forUTF16Offset: startOffset,
+            in: text,
+            lineStartOffsets: analysis.lineStartOffsets
+        )
+        let endOffset = fallbackEndOffset(
+            from: startOffset,
+            line: charLine,
+            column: charColumn,
+            in: text,
+            analysis: analysis
+        )
+        let maxLength = max(0, analysis.utf16Length - startOffset)
+        let length = min(endOffset - startOffset, maxLength)
+        return length > 0 ? NSRange(location: startOffset, length: length) : nil
     }
 
     private static func fallbackEndOffset(

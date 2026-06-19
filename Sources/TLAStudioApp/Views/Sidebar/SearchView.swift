@@ -7,7 +7,6 @@ import os
 struct SearchView: View {
     @ObservedObject var document: TLADocument
     @StateObject private var searchManager = DocumentSearchManager()
-    @State private var isSearching = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,7 +23,7 @@ struct SearchView: View {
             // Results
             if searchManager.query.isEmpty {
                 emptySearchView
-            } else if isSearching {
+            } else if searchManager.isSearching {
                 ProgressView("Searching…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if searchManager.results.isEmpty {
@@ -34,10 +33,10 @@ struct SearchView: View {
             }
         }
         .onChange(of: document.content) { _, _ in
-            // Re-search when document changes (if we have an active query)
-            if !searchManager.query.isEmpty {
-                performSearch()
-            }
+            // Editor edits arrive one @Published character at a time; re-search
+            // through the manager's debounce so a typing burst triggers at most
+            // one scan instead of one per keystroke.
+            searchManager.requestSearch(in: document.content)
         }
     }
 
@@ -204,20 +203,9 @@ struct SearchView: View {
     // MARK: - Actions
 
     private func performSearch() {
-        guard !searchManager.query.isEmpty else {
-            searchManager.results = []
-            return
-        }
-
-        isSearching = true
-
-        Task {
-            let results = await searchManager.search(in: document.content)
-            await MainActor.run {
-                searchManager.results = results
-                isSearching = false
-            }
-        }
+        // Explicit user action (Enter / refresh / suggestion / option toggle):
+        // run without the typing-debounce.
+        searchManager.requestSearch(in: document.content, immediate: true)
     }
 }
 
@@ -306,9 +294,42 @@ class DocumentSearchManager: ObservableObject {
     @Published var wholeWord = false
     @Published var useRegex = false
     @Published var results: [SearchResult] = []
+    @Published var isSearching = false
 
     private let logger = Log.logger(category: "Search")
     private let contextLength = 30
+
+    /// Debounce window for re-searching driven by live document edits.
+    private static let debounceNanoseconds: UInt64 = 150_000_000  // 150ms
+    private var searchTask: Task<Void, Never>?
+
+    /// Coalesced entry point for all searches. Cancels any in-flight/scheduled
+    /// search so a burst of document edits runs at most one scan, and a stale
+    /// scan can never clobber a newer query's results. `immediate` skips the
+    /// debounce for deliberate user actions (Enter, refresh, option toggles).
+    func requestSearch(in content: String, immediate: Bool = false) {
+        searchTask?.cancel()
+
+        guard !query.isEmpty else {
+            results = []
+            isSearching = false
+            return
+        }
+
+        isSearching = true
+        searchTask = Task { [weak self] in
+            if !immediate {
+                try? await Task.sleep(nanoseconds: Self.debounceNanoseconds)
+            }
+            guard !Task.isCancelled, let self else { return }
+
+            let found = await self.search(in: content)
+            guard !Task.isCancelled else { return }
+
+            self.results = found
+            self.isSearching = false
+        }
+    }
 
     func search(in content: String) async -> [SearchResult] {
         guard !query.isEmpty else { return [] }
@@ -334,14 +355,21 @@ class DocumentSearchManager: ObservableObject {
 
                 let matches = regex.matches(in: content, options: [], range: range)
 
+                // Compute line-start offsets ONCE per scan; each match then binary-
+                // searches its (line, column) instead of re-walking the whole prefix
+                // (was O(N) per match → O(N·M); now O(N + M·logL)).
+                let lineStarts = TextCoordinateMapper.lineStartOffsets(in: content)
+
                 for match in matches {
                     let matchRange = match.range
 
-                    // Calculate line and column
-                    let textBefore = nsContent.substring(with: NSRange(location: 0, length: matchRange.location))
-                    let lines = textBefore.components(separatedBy: "\n")
-                    let line = lines.count - 1
-                    let column = lines.last?.count ?? 0
+                    // Calculate line and column (grapheme column, matching the
+                    // app's coordinate convention) from the precomputed table.
+                    let (line, column) = TextCoordinateMapper.lineAndColumn(
+                        forUTF16Offset: matchRange.location,
+                        in: content,
+                        lineStartOffsets: lineStarts
+                    )
 
                     // Get match text
                     let matchText = nsContent.substring(with: matchRange)

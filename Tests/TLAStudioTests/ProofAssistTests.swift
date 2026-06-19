@@ -139,6 +139,33 @@ final class ProofAssistTests: XCTestCase {
         XCTAssertNil(ProofAssist.planByDefInsertion(names: ["Inv"], for: failing, content: content))
     }
 
+    func testInsertionRefusesWrappedDefList() {
+        // The DEF list itself ends with a comma (it continues onto the next
+        // physical line). We can only edit one line, so inserting here would
+        // orphan the `Helper` continuation (`Inv, TypeOK` / `Helper` with no comma
+        // between TypeOK and Helper) — refuse rather than emit invalid TLA+ (e2e M4).
+        let content = "<1>1. Inv /\\ TypeOK\n  BY Z3 DEF Inv,\n     Helper\n"
+        let failing = obligation(startLine: 1, goal: "Inv /\\ TypeOK")
+        XCTAssertNil(ProofAssist.planByDefInsertion(names: ["TypeOK"], for: failing, content: content))
+    }
+
+    func testInsertionExtendsSelfContainedDefList() throws {
+        // A DEF list fully on one line (no trailing comma) is safely extended.
+        let content = "<1>1. Inv /\\ TypeOK\n  BY Z3 DEF Inv\n"
+        let failing = obligation(startLine: 1, goal: "Inv /\\ TypeOK")
+        let plan = try XCTUnwrap(ProofAssist.planByDefInsertion(names: ["TypeOK"], for: failing, content: content))
+        XCTAssertEqual(plan.updatedLine, "  BY Z3 DEF Inv, TypeOK")
+    }
+
+    func testInsertionDoesNotBorrowSiblingStepLeaf() {
+        // This step (<1>1.) has no proof leaf of its own; the next sibling
+        // <1>2. has a BY within the +2 look-ahead. The window must clamp at the
+        // sibling's step marker, so no insertion is offered (e2e Low #7).
+        let content = "<1>1. Foo\n<1>2. Bar\n  BY Z3\n"
+        let failing = obligation(startLine: 1, goal: "Foo")
+        XCTAssertNil(ProofAssist.planByDefInsertion(names: ["Foo"], for: failing, content: content))
+    }
+
     // MARK: - Invariant candidates
 
     func testInvariantCandidatesRankAndFilter() {

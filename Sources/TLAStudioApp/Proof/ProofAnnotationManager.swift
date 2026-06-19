@@ -68,7 +68,13 @@ public struct ProofAnnotation: Identifiable, Equatable {
     public init(obligation: ProofObligation) {
         self.id = obligation.id
         self.obligation = obligation
-        self.lineRange = obligation.location.startLine..<(obligation.location.endLine + 1)
+        // startLine/endLine come straight from TLAPM's `@!!loc` output with no
+        // ordering guarantee (TLAPMOutputParser.parseLocation doesn't normalize).
+        // A half-open Swift Range requires lowerBound <= upperBound, so an emitted
+        // location with endLine < startLine would abort the app on the MainActor.
+        // Clamp the upper bound to never precede the lower bound.
+        let upper = max(obligation.location.startLine, obligation.location.endLine) + 1
+        self.lineRange = obligation.location.startLine..<upper
         self.gutterIcon = obligation.status.gutterIcon
         self.iconColor = obligation.status.iconColor
         self.tooltipText = Self.buildTooltip(for: obligation)

@@ -246,16 +246,22 @@ actor ModuleSymbolIndex {
         let path = Self.canonicalPath(of: url)
 
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              // Regular files only: a FIFO/socket named `<Module>.tla` would
+              // otherwise wedge this actor on the blocking String(contentsOf:)
+              // read below (e2e Low / security hardening).
+              (attributes[.type] as? FileAttributeType) == .typeRegular,
               let mtime = attributes[.modificationDate] as? Date,
               let size = (attributes[.size] as? NSNumber)?.intValue else {
             return nil
         }
-        lastStat[path] = Date()
-
         guard size <= Self.maxFileSize else {
             logger.debug("Skipping oversized module \(name) (\(size) bytes)")
             return nil
         }
+        // Record the stat timestamp only for paths we'll actually cache: an
+        // oversized/skipped path never enters the cache, so removeFromCache would
+        // never evict its lastStat entry — recording it here would leak (e2e Low).
+        lastStat[path] = Date()
 
         if let cached = cache[path], cached.mtime == mtime, cached.fileSize == size {
             touch(path)
@@ -291,7 +297,10 @@ actor ModuleSymbolIndex {
         let withoutLocals = exports.filter { symbol in
             let line = Int(symbol.range.start.line)
             guard line < lines.count else { return true }
-            return !lines[line].trimmingCharacters(in: .whitespaces).hasPrefix("LOCAL ")
+            // Match a leading `LOCAL` keyword regardless of the following
+            // whitespace (space OR tab), so `LOCAL\tFoo` is filtered too (e2e Low).
+            let trimmed = lines[line].trimmingCharacters(in: .whitespaces)
+            return trimmed.prefix { !$0.isWhitespace } != "LOCAL"
         }
         return Array(withoutLocals.prefix(Self.maxSymbolsPerModule))
     }
@@ -318,6 +327,7 @@ actor ModuleSymbolIndex {
 
     private func removeFromCache(_ path: String) {
         cache.removeValue(forKey: path)
+        lastStat.removeValue(forKey: path)
         if let index = cacheOrder.firstIndex(of: path) {
             cacheOrder.remove(at: index)
         }

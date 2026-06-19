@@ -568,6 +568,35 @@ final class FindReplaceManagerTests: XCTestCase {
         XCTAssertEqual(buffer(), "price: $1")
     }
 
+    func testLiteralReplaceAllSkipsStaleRanges() {
+        // The find panel computes `matches` once, then the user edits the buffer
+        // directly (the panel does NOT re-search on in-editor edits). Replace All's
+        // literal path must validate each stored range against the live buffer and
+        // skip stale ones rather than splice at the wrong offset (or pass an
+        // out-of-bounds range to the replacer).
+        var content = "alpha beta alpha"
+        manager = makeManager(contentProvider: { content })
+        manager.textReplacer = { range, replacement in
+            let text = NSMutableString(string: content)
+            text.replaceCharacters(in: range, with: replacement)
+            content = text as String
+        }
+        manager.isRegex = false
+        manager.searchQuery = "alpha"
+        manager.replaceQuery = "X"
+        XCTAssertEqual(manager.totalMatches, 2)   // [0,5) and [11,16)
+
+        // In-editor edit shrinks the buffer to 10 chars; manager.matches still
+        // holds the old offsets: [0,5) now spans "beta " (substring mismatch) and
+        // [11,16) is out of bounds. Both must be dropped.
+        content = "beta alpha"
+
+        let count = manager.replaceAll()
+
+        XCTAssertEqual(count, 0)               // no stale splice applied
+        XCTAssertEqual(content, "beta alpha")  // buffer untouched (no corruption/crash)
+    }
+
     func testRegexReplaceOutOfRangeGroupStaysLiteral() {
         let buffer = makeReplaceHarness("aa")
         manager.isRegex = true

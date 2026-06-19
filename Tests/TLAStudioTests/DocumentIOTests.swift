@@ -67,6 +67,22 @@ final class DocumentIOTests: TempDirectoryTestCase {
         XCTAssertThrowsError(try document.read(from: fileURL, ofType: "com.tlaplus.specification"))
     }
 
+    // MARK: - Dirty-State Tests
+
+    func testOpenedDocumentIsNotDirty() throws {
+        // init() seeds `content` with the template, bumping the change count to 1;
+        // read() must clear it so an unedited opened file isn't shown dirty (and so
+        // specURLForTooling can use the real fileURL instead of forcing a temp copy).
+        let fileURL = tempDirectory.appendingPathComponent("clean.tla")
+        let content = "---- MODULE Clean ----\nVARIABLES x\n===="
+        try content.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let document = TLADocument()
+        try document.read(from: fileURL, ofType: "com.tlaplus.specification")
+
+        XCTAssertFalse(document.isDocumentEdited)
+    }
+
     // MARK: - Line Ending Tests
 
     func testDetectLFLineEndings() throws {
@@ -148,6 +164,21 @@ final class DocumentIOTests: TempDirectoryTestCase {
         let data = try document.data(ofType: "com.tlaplus.specification")
 
         XCTAssertTrue(data.isEmpty)
+    }
+
+    func testSaveUpgradesToUTF8WhenLegacyEncodingCannotRepresentContent() throws {
+        // A file detected as Windows-1252 that later contains a Unicode math
+        // operator (∈, U+2208) cannot be re-serialized as CP1252. Rather than
+        // refusing the save behind an opaque error (data loss), data(ofType:)
+        // must transparently upgrade to UTF-8 — a universal superset.
+        let document = TLADocument()
+        document.encoding = .windowsCP1252
+        document.content = "---- MODULE Test ----\nFoo == x \u{2208} S\n===="
+
+        let data = try document.data(ofType: "com.tlaplus.specification")
+
+        XCTAssertEqual(document.encoding, .utf8)   // pinned so later saves stay consistent
+        XCTAssertEqual(String(data: data, encoding: .utf8), document.content)
     }
 
     // MARK: - Module Name Extraction Tests

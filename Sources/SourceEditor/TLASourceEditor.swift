@@ -390,17 +390,28 @@ public class LineNumberRulerView: NSRulerView {
 
     /// Get cached line offsets, computing if needed.
     /// Invalidation is driven by `textDidChange`; we never re-compare text here.
+    ///
+    /// Offsets are in UTF-16 code units to match `charRange.location` (which comes
+    /// from `characterRange(forGlyphRange:)`). A grapheme-distance table would be
+    /// mis-indexed by the UTF-16 lookup whenever an earlier line holds an astral
+    /// character (emoji, etc.), numbering the gutter wrong while scrolled.
     private func getLineOffsets(for text: String) -> [Int] {
         if let cached = cachedLineOffsets {
             return cached
         }
 
-        // Compute line offsets
+        let nsText = text as NSString
         var offsets: [Int] = [0]
-        var index = text.startIndex
-        while let newlineRange = text.range(of: "\n", range: index..<text.endIndex) {
-            offsets.append(text.distance(from: text.startIndex, to: newlineRange.upperBound))
-            index = newlineRange.upperBound
+        var searchStart = 0
+        while searchStart < nsText.length {
+            let newlineRange = nsText.range(
+                of: "\n",
+                range: NSRange(location: searchStart, length: nsText.length - searchStart)
+            )
+            guard newlineRange.location != NSNotFound else { break }
+            let lineStart = newlineRange.location + newlineRange.length
+            offsets.append(lineStart)
+            searchStart = lineStart
         }
 
         cachedLineOffsets = offsets

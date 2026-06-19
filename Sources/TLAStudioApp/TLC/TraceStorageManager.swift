@@ -139,6 +139,34 @@ actor TraceStorageManager {
         return states
     }
 
+    /// Load a contiguous range of states, batching by page. Iterating page-by-page
+    /// inside the actor collapses what would otherwise be one cross-actor hop +
+    /// dictionary lookup per state (O(N)) into one call with O(N/pageSize) page
+    /// reads, reusing the page cache. Indices are clamped to the stored range.
+    func loadStates(sessionId: UUID, range: Swift.Range<Int>) async throws -> [TraceState] {
+        guard let handle = traceFiles[sessionId] else {
+            throw TraceStorageError.sessionNotFound(sessionId)
+        }
+        let lower = max(0, range.lowerBound)
+        let upper = min(max(lower, range.upperBound), handle.stateCount)
+        guard upper > lower else { return [] }
+
+        var result: [TraceState] = []
+        result.reserveCapacity(upper - lower)
+        let firstPage = lower / pageSize
+        let lastPage = (upper - 1) / pageSize
+        for pageIndex in firstPage...lastPage {
+            let page = try await loadPage(sessionId: sessionId, pageIndex: pageIndex)
+            let pageStart = pageIndex * pageSize
+            let sliceLower = max(lower, pageStart) - pageStart
+            let sliceUpper = min(upper, pageStart + page.count) - pageStart
+            if sliceLower < sliceUpper {
+                result.append(contentsOf: page[sliceLower..<sliceUpper])
+            }
+        }
+        return result
+    }
+
     /// Load a single state by index
     func loadState(sessionId: UUID, index: Int) async throws -> TraceState {
         guard index >= 0 else {
@@ -326,13 +354,9 @@ final class LazyErrorTrace: @unchecked Sendable {
             throw TraceStorageError.managerDeallocated
         }
 
-        var result: [TraceState] = []
-        for index in safeRange {
-            if index >= stateCount { break }
-            let state = try await manager.loadState(sessionId: sessionId, index: index)
-            result.append(state)
-        }
-        return result
+        // Page-batch inside the actor (one cross-actor hop) instead of one hop per
+        // state; the actor reuses its page cache.
+        return try await manager.loadStates(sessionId: sessionId, range: safeRange)
     }
 
     /// Convert to standard ErrorTrace (loads all states into memory - use with caution for large traces)

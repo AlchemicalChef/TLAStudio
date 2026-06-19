@@ -438,6 +438,12 @@ actor TLCProcessManager {
         // Use a thread-safe wrapper to prevent yielding after finish
         let streamState = StreamState<ModelCheckProgress>(throttle: .fps30)
 
+        // Signalled when each readability handler reads EOF, so the handlers are
+        // the sole readers; teardown waits for these instead of a racy synchronous
+        // availableData read (e2e M2).
+        let stdoutEOF = DispatchSemaphore(value: 0)
+        let stderrEOF = DispatchSemaphore(value: 0)
+
         let progressStream = AsyncStream<ModelCheckProgress> { continuation in
             // Store continuation reference for the handlers
             streamState.setContinuation(continuation)
@@ -448,6 +454,7 @@ actor TLCProcessManager {
                     // EOF reached. Self-clear the handler so we don't keep getting scheduled
                     // on a dead pipe if `continuation.onTermination` didn't fire for any reason.
                     handle.readabilityHandler = nil
+                    stdoutEOF.signal()
                     return
                 }
                 guard let parser = parser, let state = streamState else { return }
@@ -469,6 +476,7 @@ actor TLCProcessManager {
                 let data = handle.availableData
                 if data.isEmpty {
                     handle.readabilityHandler = nil
+                    stderrEOF.signal()
                     return
                 }
                 if let str = String(data: data, encoding: .utf8) {
@@ -486,6 +494,11 @@ actor TLCProcessManager {
             continuation.onTermination = { _ in
                 stdoutHandle.readabilityHandler = nil
                 stderrHandle.readabilityHandler = nil
+                // Unblock the teardown's bounded EOF wait if the stream is finished
+                // externally (Stop / close) before the handlers observed EOF —
+                // otherwise it parks for the full timeout (e2e Low).
+                stdoutEOF.signal()
+                stderrEOF.signal()
             }
         }
 
@@ -520,42 +533,41 @@ actor TLCProcessManager {
         let exitStatus = await exitObserver.wait(for: process)
         process.terminationHandler = nil
 
-        // Drain any remaining buffered data before clearing handlers.
-        // readabilityHandler may not fire for data already in the pipe buffer
-        // after process exit, so we must read it synchronously.
-        let lastStdout = stdoutHandle.availableData
-        if !lastStdout.isEmpty {
-            if let str = String(data: lastStdout, encoding: .utf8) {
-                OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlc)
-            }
-            if let update = parser.parseThreadSafe(lastStdout) {
-                streamState.yield(update)
-            }
-        }
-        let lastStderr = stderrHandle.availableData
-        if !lastStderr.isEmpty {
-            if let str = String(data: lastStderr, encoding: .utf8) {
-                let lines = str.nonEmptyOutputLines
-                for line in lines {
-                    parser.parseStderr(line)
-                }
-                OutputManager.shared.logLines(lines, source: .tlc, isError: true)
+        // Single-reader invariant (e2e M2): the readability handlers are the sole
+        // readers of the pipes; wait (off the cooperative pool, bounded) for them
+        // to reach EOF so the streamed tail is fully parsed/logged before teardown.
+        // Replaces a synchronous availableData read that raced a still-live handler
+        // and could reorder/duplicate the final chunk.
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let deadline = DispatchTime.now() + 3
+                _ = stdoutEOF.wait(timeout: deadline)
+                _ = stderrEOF.wait(timeout: deadline)
+                cont.resume()
             }
         }
 
-        // Now safe to clear handlers and close
+        // Handlers self-cleared on EOF; clear again (idempotent) and close.
         stdoutHandle.readabilityHandler = nil
         stderrHandle.readabilityHandler = nil
         try? stdoutHandle.close()
         try? stderrHandle.close()
 
-        // Mark stream as finished and clean up
-        streamStates.removeValue(forKey: sessionId)?.finish()
-
-        progressTasks.removeValue(forKey: sessionId)?.cancel()
-
-        ProcessRegistry.shared.unregister(sessionId)
-        activeProcesses.removeValue(forKey: sessionId)
+        // Identity-gated teardown for symmetry with TLAPM (defense-in-depth):
+        // TLCSession ids are fresh per run today, so this is currently always true,
+        // but TLCSession.id is reused across start()/resume() on one instance — a
+        // future caller re-driving a session would otherwise hit the M3 clobber.
+        // Always finish OUR OWN stream/progress task; reclaim shared slots only if
+        // we still own them.
+        let weStillOwnSlot = activeProcesses[sessionId] === process
+        streamState.finish()
+        progressTask.cancel()
+        if weStillOwnSlot {
+            streamStates.removeValue(forKey: sessionId)
+            progressTasks.removeValue(forKey: sessionId)
+            ProcessRegistry.shared.unregister(sessionId)
+            activeProcesses.removeValue(forKey: sessionId)
+        }
 
         parser.finalizeErrorTrace()
 
@@ -564,7 +576,9 @@ actor TLCProcessManager {
         // Use async result method for large trace support
         let result = await parser.finalResultWithStorage(exitCode: exitStatus, duration: duration)
 
-        parsers.removeValue(forKey: sessionId)
+        if weStillOwnSlot {
+            parsers.removeValue(forKey: sessionId)
+        }
 
         progress(ModelCheckProgress(
             sessionId: sessionId,

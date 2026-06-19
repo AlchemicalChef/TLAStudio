@@ -60,7 +60,12 @@ struct ProofObligationsPanel: View {
                 ObligationInspectorView(
                     obligation: selected,
                     session: session,
-                    assist: assistProvider?(selected) ?? ProofObligationAssist(),
+                    // Compute assist (two flattened symbol-tree walks + regex) only
+                    // for obligations that need it; a proved/pending selection would
+                    // otherwise pay that cost on every progress-publish render (e2e Low).
+                    assist: (selected.status == .failed || selected.status == .timeout)
+                        ? (assistProvider?(selected) ?? ProofObligationAssist())
+                        : ProofObligationAssist(),
                     onApplyByDef: onApplyByDef,
                     onModelCheckInvariant: onModelCheckInvariant,
                     onJumpToSource: onJumpToSource

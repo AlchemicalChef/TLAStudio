@@ -75,7 +75,8 @@ enum ProofAssist {
         let stepStart = max(0, obligation.location.startLine - 1)   // TLAPM is 1-based
         guard stepStart < lines.count else { return nil }
 
-        let windowEnd = min(lines.count - 1, max(stepStart, obligation.location.endLine - 1) + 2)
+        let rawEnd = min(lines.count - 1, max(stepStart, obligation.location.endLine - 1) + 2)
+        let windowEnd = clampedWindowEnd(stepStart: stepStart, rawEnd: rawEnd, lines: lines)
         let joined = names.joined(separator: ", ")
 
         // A BY clause can span lines (`BY Z3,` … `DEF Inv` on a continuation).
@@ -85,10 +86,18 @@ enum ProofAssist {
             let line = lines[lineIndex]
             let (code, comment) = splitLineComment(line)
             if code.range(of: #"\bDEF\b"#, options: .regularExpression) != nil {
+                let trimmedCode = trimmingTrailingWhitespace(code)
+                // A DEF list ending in a comma continues onto the next physical
+                // line. We can only rewrite ONE line, so appending here would
+                // orphan that continuation (`…Inv, New` on this line; the old tail
+                // token with no separating comma on the next) — itself a parse
+                // error. Refuse, like the BY branch below, and leave placement to
+                // the user (suggestions stay copyable) (e2e M4).
+                guard !trimmedCode.hasSuffix(",") else { return nil }
                 return ByDefInsertion(
                     lineIndex: lineIndex,
                     originalLine: line,
-                    updatedLine: trimmingTrailingWhitespace(code) + ", \(joined)" + comment
+                    updatedLine: trimmedCode + ", \(joined)" + comment
                 )
             }
         }
@@ -173,7 +182,12 @@ enum ProofAssist {
         let lines = content.components(separatedBy: "\n")
         let stepStart = max(0, obligation.location.startLine - 1)
         guard stepStart < lines.count else { return [] }
-        let windowEnd = min(lines.count - 1, max(stepStart, obligation.location.endLine - 1) + 2)
+        let rawEnd = min(lines.count - 1, max(stepStart, obligation.location.endLine - 1) + 2)
+        // Share the planner's step-boundary clamp so "already expanded" detection
+        // and the insertion planner agree on this step's region — otherwise a
+        // `BY … DEF Foo` in the NEXT step (within the +2 spill) could wrongly
+        // suppress a valid suggestion for THIS step (e2e Low).
+        let windowEnd = clampedWindowEnd(stepStart: stepStart, rawEnd: rawEnd, lines: lines)
 
         var names = Set<String>()
         for line in lines[stepStart...windowEnd] {
@@ -184,6 +198,21 @@ enum ProofAssist {
             }
         }
         return names
+    }
+
+    /// Clamp a look-ahead window so it never spills into the NEXT proof step: a
+    /// line that begins with a `<level>` step marker (number or `*`/`+`, NOT a
+    /// `<<…>>` tuple literal) ends this step's region. Returns the last line index
+    /// that still belongs to the step starting at `stepStart`.
+    private static func clampedWindowEnd(stepStart: Int, rawEnd: Int, lines: [String]) -> Int {
+        guard stepStart + 1 <= rawEnd else { return rawEnd }
+        for lineIndex in (stepStart + 1)...rawEnd {
+            let trimmed = lines[lineIndex].trimmingCharacters(in: .whitespaces)
+            if trimmed.range(of: #"^<[0-9*+]"#, options: .regularExpression) != nil {
+                return lineIndex - 1
+            }
+        }
+        return rawEnd
     }
 
     private static func splitLineComment(_ line: String) -> (code: String, comment: String) {

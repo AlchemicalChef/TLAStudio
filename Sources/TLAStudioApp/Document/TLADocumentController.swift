@@ -64,7 +64,22 @@ final class TLADocumentController: NSDocumentController {
     // MARK: - New Document
 
     override func newDocument(_ sender: Any?) {
+        presentNewDocument(content: nil, userCreated: true)
+    }
+
+    /// The implicit untitled created by the launch path. NOT user-created, so
+    /// the pristine sweep may reclaim it if a real document opens alongside
+    /// (the launch-race / window-restoration cleanup). Explicit user actions go
+    /// through newDocument(_:) / newDocument(from:), which tag the document and
+    /// are therefore never swept (e2e review H1/M1).
+    func newLaunchDocument() {
+        presentNewDocument(content: nil, userCreated: false)
+    }
+
+    private func presentNewDocument(content: String?, userCreated: Bool) {
         let document = TLADocument()
+        if let content { document.content = content }
+        document.wasUserCreated = userCreated
         document.makeWindowControllers()
         document.showWindows()
         addDocument(document)
@@ -77,9 +92,10 @@ final class TLADocumentController: NSDocumentController {
         // opens (odoc) and window restoration can interleave with the
         // launch-created Untitled in either order, so sweep on EVERY add.
         // Whenever a file-backed document coexists with a pristine
-        // (template-content, never-saved) Untitled, close the Untitled —
-        // TextEdit-style behavior (platform review 2026-06-10). Deferred a
-        // runloop hop so a document still being added isn't closed mid-flight.
+        // (template-content, never-saved) Untitled that the user did NOT
+        // explicitly create, close the Untitled — TextEdit-style behavior.
+        // Deferred a runloop hop so a document still being added isn't closed
+        // mid-flight.
         DispatchQueue.main.async { [weak self] in
             self?.closePristineUntitledsIfFileBackedDocumentExists()
         }
@@ -90,6 +106,7 @@ final class TLADocumentController: NSDocumentController {
         let pristineTemplate = TLADocument.newDocumentTemplate()
         for candidate in documents {
             guard let untouched = candidate as? TLADocument,
+                  !untouched.wasUserCreated,
                   untouched.fileURL == nil,
                   untouched.content == pristineTemplate else { continue }
             untouched.close()
@@ -110,11 +127,7 @@ final class TLADocumentController: NSDocumentController {
 
     /// Create new document from template
     func newDocument(from template: DocumentTemplate) {
-        let document = TLADocument()
-        document.content = template.content
-        document.makeWindowControllers()
-        document.showWindows()
-        addDocument(document)
+        presentNewDocument(content: template.content, userCreated: true)
     }
 
     // MARK: - Open Document

@@ -238,7 +238,10 @@ final class ProofSession: ObservableObject {
                     break
                 }
             }
-            self?.isRunning = false
+            // Don't clear isRunning if this task was cancelled — a newer run on the
+            // same session now owns the flag and must not be stomped (e2e Low).
+            guard !Task.isCancelled, let self else { return }
+            self.isRunning = false
         }
     }
 

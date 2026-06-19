@@ -234,8 +234,10 @@ enum SecureTempFile {
     /// Cleans up a secure temp file.
     /// - Parameter url: URL of the file to remove
     static func cleanup(_ url: URL) {
-        // Only clean up files in our secure temp directory
-        guard url.path.hasPrefix(secureTempDirectory.path) else {
+        // Only clean up files in our secure temp directory. Use the robust
+        // membership check (standardized path + trailing slash) so a sibling
+        // directory like `<secure>-evil/…` can't satisfy a bare prefix (e2e Low).
+        guard isManagedTemporaryFile(url) else {
             logger.warning("Refusing to clean up file outside secure temp directory: \(url.path)")
             return
         }

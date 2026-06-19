@@ -25,6 +25,12 @@ enum SubprocessRunner {
     /// exit status.
     static let maxCapturedBytes = 10 * 1024 * 1024  // 10 MB
 
+    /// Bounded wait for the pipe drain handlers to reach EOF after the process
+    /// exits, so the final buffered chunk is captured in order before we
+    /// snapshot. A wedged pipe (rare: a grandchild inherited the write end)
+    /// can't hang the pool thread longer than this.
+    private static let residualDrainTimeout: TimeInterval = 3
+
     /// Thrown when the subprocess exceeds `timeout`. The process is SIGTERM'd (with
     /// ProcessRegistry SIGKILL escalation if it doesn't comply).
     struct TimeoutError: Error, LocalizedError {
@@ -41,12 +47,17 @@ enum SubprocessRunner {
     private static func drain(
         handle: FileHandle,
         into accumulator: BoundedOutputAccumulator,
+        reachedEOF: DispatchSemaphore,
         tap: (@Sendable (Data) -> Void)? = nil
     ) {
         handle.readabilityHandler = { [weak accumulator] h in
             let data = h.availableData
             if data.isEmpty {
+                // EOF: this handler is the SOLE reader of the pipe, so clearing
+                // it here and signalling lets the run() flow snapshot only after
+                // the tail is captured — no second reader to race (e2e M2).
                 h.readabilityHandler = nil
+                reachedEOF.signal()
                 return
             }
             accumulator?.append(data)
@@ -62,7 +73,12 @@ enum SubprocessRunner {
     ///   - currentDirectoryURL: Working directory (nil = inherit).
     ///   - timeout: Wall-clock limit; on expiry the process is terminated and
     ///     `TimeoutError` is thrown. nil = no limit.
-    ///   - environment: Exact environment for the child (nil = inherit the parent's).
+    ///   - environment: Exact environment for the child. Defaults to a sanitized
+    ///     `ProcessEnvironment.minimal()` so children never inherit the parent's
+    ///     secrets or dangerous loader/runtime vars (DYLD_*, _JAVA_OPTIONS,
+    ///     CLASSPATH, …) — defense-in-depth across every spawn path. Pass an
+    ///     explicit dictionary to override, or `nil` to deliberately inherit the
+    ///     full parent environment.
     ///   - stdinData: Bytes written to the child's stdin, after which stdin is closed
     ///     to signal EOF (nil = no stdin pipe).
     ///   - registryId: ProcessRegistry session id to register the child under, so an
@@ -76,7 +92,7 @@ enum SubprocessRunner {
         arguments: [String],
         currentDirectoryURL: URL? = nil,
         timeout: TimeInterval? = nil,
-        environment: [String: String]? = nil,
+        environment: [String: String]? = ProcessEnvironment.minimal(),
         stdinData: Data? = nil,
         registryId: UUID? = nil,
         stdoutPolicy: BoundedOutputAccumulator.TruncationPolicy = .keepHead(limit: maxCapturedBytes),
@@ -110,8 +126,12 @@ enum SubprocessRunner {
 
         let stdoutAccumulator = BoundedOutputAccumulator(policy: stdoutPolicy)
         let stderrAccumulator = BoundedOutputAccumulator(policy: stderrPolicy)
-        drain(handle: stdoutPipe.fileHandleForReading, into: stdoutAccumulator)
-        drain(handle: stderrPipe.fileHandleForReading, into: stderrAccumulator, tap: onStderrData)
+        // Signalled when each pipe handler reads EOF, making the drain handler
+        // the single reader of each pipe (no second availableData read racing it).
+        let stdoutEOF = DispatchSemaphore(value: 0)
+        let stderrEOF = DispatchSemaphore(value: 0)
+        drain(handle: stdoutPipe.fileHandleForReading, into: stdoutAccumulator, reachedEOF: stdoutEOF)
+        drain(handle: stderrPipe.fileHandleForReading, into: stderrAccumulator, reachedEOF: stderrEOF, tap: onStderrData)
 
         // Register the subprocess with ProcessRegistry so app shutdown (Cmd-Q)
         // can reap it via SIGTERM → SIGKILL escalation. Without this, an in-flight
@@ -138,26 +158,28 @@ enum SubprocessRunner {
             if registered {
                 if process.isRunning {
                     // Timeout fired but the process didn't honor SIGTERM (process.terminate);
-                    // delegate to ProcessRegistry for SIGKILL escalation.
-                    ProcessRegistry.shared.terminate(registrySessionId)
+                    // delegate to ProcessRegistry for SIGKILL escalation — off this
+                    // cooperative-pool thread so the SIGTERM→sleep→SIGKILL escalation
+                    // doesn't block it for up to ~1s (e2e Low).
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        ProcessRegistry.shared.terminate(registrySessionId)
+                    }
                 } else {
                     ProcessRegistry.shared.unregister(registrySessionId)
                 }
+            } else {
+                // process.run() threw, so the background stdin writer (which
+                // otherwise owns the close) never ran — close the handle here.
+                try? stdinPipe?.fileHandleForWriting.close()
             }
 
-            // Drain any residual bytes still buffered in the pipes before clearing handlers.
-            // readabilityHandler may not fire for data already in the kernel pipe buffer
-            // after process exit — mirrors the TLC/TLAPM pattern.
-            let lastStdout = stdoutPipe.fileHandleForReading.availableData
-            if !lastStdout.isEmpty { stdoutAccumulator.append(lastStdout) }
-            let lastStderr = stderrPipe.fileHandleForReading.availableData
-            if !lastStderr.isEmpty { stderrAccumulator.append(lastStderr) }
-
+            // The drain handlers self-clear on EOF; clear again (idempotent) in
+            // case we exit before EOF (timeout/throw), then close. The success
+            // path has already awaited EOF below, so the handler is quiescent.
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             try? stdoutPipe.fileHandleForReading.close()
             try? stderrPipe.fileHandleForReading.close()
-            try? stdinPipe?.fileHandleForWriting.close()
         }
 
         // Propagate Swift task cancellation to the subprocess: without this, a
@@ -229,6 +251,25 @@ enum SubprocessRunner {
         }, onCancel: {
             cancellationBox.cancel()
         })
+
+        // Single-reader invariant (e2e M2): the drain handler is the SOLE reader
+        // of each pipe. Wait for it to reach EOF so the buffered tail is captured
+        // in order before we snapshot — no second availableData read racing the
+        // handler. The wait runs on a GCD thread (not the cooperative pool) and
+        // is bounded so a wedged pipe can't hang us. Only the normal-exit path
+        // reaches here; the throw paths discard output anyway.
+        if registered {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    // Shared deadline so the two sequential waits together can't
+                    // exceed the bound (the second inherits the absolute deadline).
+                    let deadline = DispatchTime.now() + residualDrainTimeout
+                    _ = stdoutEOF.wait(timeout: deadline)
+                    _ = stderrEOF.wait(timeout: deadline)
+                    cont.resume()
+                }
+            }
+        }
 
         return (terminationStatus, stdoutAccumulator.snapshot(), stderrAccumulator.snapshot())
     }

@@ -366,10 +366,14 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         coordinator.highlighter = TLASyntaxHighlighter(textView: textView, theme: theme)
         coordinator.highlighter?.treeSitterHighlightProvider = { [weak coordinator] source in
             guard let coordinator,
-                  source == coordinator.cachedHighlightText else {
-                return []
+                  source == coordinator.cachedHighlightText,
+                  !coordinator.cachedHighlightTokens.isEmpty else {
+                return nil
             }
-            return coordinator.cachedHighlightTokens
+            return TLASyntaxHighlighter.TreeSitterTokens(
+                tokens: coordinator.cachedHighlightTokens,
+                maxTokenLength: coordinator.cachedHighlightTokensMaxLength
+            )
         }
         coordinator.updateTreeSitterHighlights(for: textView.string)
         coordinator.highlighter?.highlightImmediately()
@@ -624,8 +628,13 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
         private var foldingTask: Task<Void, Never>?
         private var highlightTask: Task<Void, Never>?
 
-        /// Cached tree-sitter highlight tokens as absolute NSRange values.
+        /// Cached tree-sitter highlight tokens as absolute NSRange values, sorted
+        /// ascending by `range.location` so the highlighter can binary-search the
+        /// visible slice on scroll.
         var cachedHighlightTokens: [(NSRange, String)] = []
+        /// Longest token length in `cachedHighlightTokens`, supplied to the
+        /// highlighter to bound that binary search's lower edge.
+        var cachedHighlightTokensMaxLength: Int = 0
         var cachedHighlightText: String = ""
         var cachedParseResult: TLAParseResult?
 
@@ -804,34 +813,56 @@ struct TLAEditorViewWithFindReplace: NSViewRepresentable {
                     guard !Task.isCancelled else { return }
 
                     self.cachedParseResult = parseResult
-                    self.cachedHighlightTokens = Self.convertHighlightTokens(tokens, in: text)
+                    let (converted, maxLength) = Self.convertHighlightTokens(tokens, in: text)
+                    self.cachedHighlightTokens = converted
+                    self.cachedHighlightTokensMaxLength = maxLength
                     self.cachedHighlightText = text
                     self.highlighter?.highlightImmediately()
                 } catch {
                     self.cachedHighlightTokens = []
+                    self.cachedHighlightTokensMaxLength = 0
                     self.cachedHighlightText = ""
                 }
             }
         }
 
+        /// Convert tree-sitter tokens to absolute UTF-16 NSRanges, sorted by
+        /// location, and report the longest token length. Sorting once here (the
+        /// audit notes tree-sitter does NOT guarantee sorted output) lets the
+        /// highlighter binary-search the visible slice per scroll frame instead of
+        /// scanning all tokens; the max length bounds that search's lower edge.
         private static func convertHighlightTokens(
             _ tokens: [TLAHighlightToken],
             in text: String
-        ) -> [(NSRange, String)] {
+        ) -> (tokens: [(NSRange, String)], maxTokenLength: Int) {
             let converter = TextCoordinateMapper.TreeSitterRangeConverter(text: text)
 
             var converted: [(NSRange, String)] = []
             converted.reserveCapacity(tokens.count)
 
+            var maxTokenLength = 0
             for token in tokens {
                 guard let range = converter.utf16Range(for: token.range),
                       range.length > 0 else {
                     continue
                 }
                 converted.append((range, token.tokenType))
+                if range.length > maxTokenLength { maxTokenLength = range.length }
             }
 
-            return converted
+            // Stable sort by location (ties keep emission order) so overlapping
+            // captures resolve consistently with the rest of the highlighter
+            // ("later items override earlier" — see sortAndDeduplicateHighlights).
+            converted = converted
+                .enumerated()
+                .sorted { lhs, rhs in
+                    lhs.element.0.location != rhs.element.0.location
+                        ? lhs.element.0.location < rhs.element.0.location
+                        : lhs.offset < rhs.offset
+                }
+                .map { $0.element }
+
+            return (converted, maxTokenLength)
         }
 
         // MARK: - IntelliSense Support

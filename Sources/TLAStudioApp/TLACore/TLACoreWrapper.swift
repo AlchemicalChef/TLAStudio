@@ -466,13 +466,14 @@ final class TLACoreWrapper: ObservableObject {
 
     /// Get all highlights for a document
     func getAllHighlights(from result: TLAParseResult) async -> [TLAHighlightToken] {
-        let lineArray = result.lines
-        let endLine = UInt32(max(0, lineArray.count - 1))
-        let endColumn = UInt32(lineArray.last?.count ?? 0)
-
+        // Use an unbounded end point rather than computing it from `result.lines`:
+        // each keystroke builds a fresh TLAParseResult, so that lazy split never
+        // amortizes and re-scans the whole document every time. tree-sitter's
+        // `set_point_range` clamps the end to the tree extent, so an out-of-range
+        // end is equivalent to the true document end — same tokens, no split.
         let fullRange = TLARange(
             start: TLAPosition(line: 0, column: 0),
-            end: TLAPosition(line: endLine, column: endColumn)
+            end: TLAPosition(line: .max, column: .max)
         )
 
         return await core.getHighlights(from: result, in: fullRange)

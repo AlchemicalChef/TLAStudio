@@ -51,6 +51,25 @@ final class ProofAnnotationManagerTests: XCTestCase {
         XCTAssertEqual(lines, [1, 5, 15, 20])
     }
 
+    // MARK: - Untrusted Location Robustness
+
+    func testInvertedLocationDoesNotCrash() {
+        // TLAPM's `@!!loc:bl:bc:el:ec` output carries no ordering guarantee, so a
+        // location with endLine < startLine can reach ProofAnnotation.init. A
+        // half-open Swift Range requires lowerBound <= upperBound, so before the
+        // clamp this aborted the app on the MainActor. The upper bound must be
+        // clamped to never precede the lower bound.
+        let manager = ProofAnnotationManager()
+        let inverted = TestFactories.makeProofObligation(startLine: 12, endLine: 9, status: .failed)
+
+        manager.updateAnnotations(for: [inverted])   // previously trapped here
+
+        XCTAssertEqual(manager.totalCount, 1)
+        let lineRange = try? XCTUnwrap(manager.annotations.first).lineRange
+        XCTAssertEqual(lineRange?.lowerBound, 12)
+        XCTAssertEqual(lineRange?.upperBound, 13)   // max(12, 9) + 1
+    }
+
     // MARK: - Line-Range Indexing
 
     func testAnnotationAtLine() {

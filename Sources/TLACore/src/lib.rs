@@ -1340,11 +1340,13 @@ impl TLACore {
         // Find the function call from source text
         let (operator_name, active_param) = self.find_enclosing_call_from_source(source, point)?;
 
-        // Get user-defined symbols for signature lookup
-        let user_symbols = self.get_symbols(result);
-
-        // Look up the signature (checks stdlib then user-defined)
-        let signature = self.find_signature(&operator_name, &user_symbols)?;
+        // Check the standard library first; only on a miss do the full symbol
+        // extraction (a whole-document tree walk + allocations) for the user-symbol
+        // fallback. Signature help fires on every '(' / ',' keystroke, and the
+        // common case is a stdlib operator — so the walk was usually wasted.
+        let signature = self
+            .find_stdlib_signature(&operator_name)
+            .or_else(|| Self::find_user_signature(&operator_name, &self.get_symbols(result)))?;
 
         Some(SignatureHelp {
             signatures: vec![signature],
@@ -2041,9 +2043,10 @@ impl TLACore {
         None
     }
 
-    /// Find signature information for an operator/function
-    fn find_signature(&self, name: &str, user_symbols: &[Symbol]) -> Option<SignatureInfo> {
-        // Check standard library first
+    /// Find signature information for an operator/function in the standard library.
+    /// Pure stdlib lookup (no user symbols) so callers can defer the expensive
+    /// `get_symbols` walk until this misses.
+    fn find_stdlib_signature(&self, name: &str) -> Option<SignatureInfo> {
         for module in STANDARD_MODULES.iter() {
             for sym in &module.symbols {
                 if sym.name == name && !sym.parameters.is_empty() {
@@ -2067,8 +2070,7 @@ impl TLACore {
             }
         }
 
-        // Check user-defined symbols
-        Self::find_user_signature(name, user_symbols)
+        None
     }
 
     /// Search user-defined symbols for signature info
@@ -2108,6 +2110,33 @@ mod tests {
         let core = TLACore::new().expect("core");
         let result = core.parse(source.to_string()).expect("parse");
         core.find_identifier_occurrences(&result, name.to_string())
+    }
+
+    #[test]
+    fn signature_help_resolves_stdlib_then_user_operators() {
+        // Exercises both branches of the now-lazy lookup: a stdlib operator
+        // (Append) resolves without the user-symbol walk, and a user operator
+        // (Foo) resolves via the on-miss get_symbols fallback.
+        let core = TLACore::new().expect("core");
+        let source = concat!(
+            "---- MODULE M ----\n",
+            "EXTENDS Sequences\n",
+            "Foo(a, b) == a + b\n",
+            "Bar == Append(<<1>>, Foo(1, 2))\n",
+            "====",
+        );
+        let result = core.parse(source.to_string()).expect("parse");
+
+        // Scan the call line so the assertions don't depend on exact column units.
+        let mut labels = std::collections::HashSet::new();
+        for col in 0..40u32 {
+            if let Some(help) = core.get_signature_help(&result, Position { line: 3, column: col }) {
+                labels.insert(help.signatures[0].label.clone());
+            }
+        }
+
+        assert!(labels.contains("Append(seq, elem)"), "stdlib signature missing; got {:?}", labels);
+        assert!(labels.contains("Foo(a, b)"), "user signature missing; got {:?}", labels);
     }
 
     #[test]

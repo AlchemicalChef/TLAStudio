@@ -85,6 +85,45 @@ final class DiagnosticHighlighterTests: XCTestCase {
         XCTAssertEqual(range, NSRange(location: 2, length: 3))
     }
 
+    func testTreeSitterDiagnosticUsesByteColumns() {
+        // "café = bad": é (U+00E9) is 2 UTF-8 bytes but 1 UTF-16 unit. A
+        // tree-sitter (syntax) diagnostic carries BYTE columns, so "bad" is bytes
+        // 8..11. The mapper must convert via bytes → UTF-16 7..10 ("bad"), not
+        // shift the underline right by the byte/char delta. code:nil ⇒ syntax.
+        let text = "caf\u{E9} = bad"
+        let diagnostic = TLADiagnostic(
+            range: TLARange(
+                start: TLAPosition(line: 0, column: 8),
+                end: TLAPosition(line: 0, column: 11)
+            ),
+            severity: .error,
+            message: "bad",
+            code: nil
+        )
+
+        let range = try? XCTUnwrap(DiagnosticHighlighter.mappedRange(for: diagnostic, in: text))
+        XCTAssertEqual(range, NSRange(location: 7, length: 3))
+        XCTAssertEqual((text as NSString).substring(with: range!), "bad")
+    }
+
+    func testSemanticDiagnosticUsesCharacterColumns() {
+        // A SANY (semantic) diagnostic carries Swift-Character columns. On the
+        // same line "bad" is characters 7..10. code "SANY…" ⇒ semantic path.
+        let text = "caf\u{E9} = bad"
+        let diagnostic = TLADiagnostic(
+            range: TLARange(
+                start: TLAPosition(line: 0, column: 7),
+                end: TLAPosition(line: 0, column: 10)
+            ),
+            severity: .error,
+            message: "bad",
+            code: "SANY1000"
+        )
+
+        let range = try? XCTUnwrap(DiagnosticHighlighter.mappedRange(for: diagnostic, in: text))
+        XCTAssertEqual((text as NSString).substring(with: range!), "bad")
+    }
+
     // MARK: - Severity Tests
 
     func testDiagnosticSeverities() {

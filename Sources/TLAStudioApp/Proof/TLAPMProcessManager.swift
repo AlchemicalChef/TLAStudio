@@ -233,8 +233,30 @@ actor TLAPMProcessManager {
     /// Discovered paths to backend provers
     private var proverPaths: [ProverBackend: URL] = [:]
 
-    /// Discover paths to backend provers
+    /// Signature of the prover-path settings the cached `proverPaths` was built
+    /// from; nil until the first scan. Re-scan only when it changes — the full
+    /// ~6-backend filesystem sweep otherwise ran on every proof / single-step
+    /// check (via buildTLAPMEnvironment) even though the prover set is static
+    /// unless the user reconfigures a path.
+    private var proverCacheSignature: String?
+
+    /// The only mid-session-mutable inputs to discovery are the three configurable
+    /// prover-path settings; everything else (bundle/system/home layout) is fixed
+    /// for the app session. Keying the cache on their raw values never serves a
+    /// stale path after the user reconfigures one.
+    private func proverConfigSignature() -> String {
+        let defaults = UserDefaults.standard
+        return [UserSettings.Keys.zenonPath, UserSettings.Keys.z3Path, UserSettings.Keys.isabellePath]
+            .map { defaults.string(forKey: $0) ?? "" }
+            .joined(separator: "\u{1F}")
+    }
+
+    /// Discover paths to backend provers (cached; re-scans only when a configured
+    /// prover path changes).
     private func discoverProvers() {
+        let signature = proverConfigSignature()
+        if proverCacheSignature == signature { return }
+
         proverPaths.removeAll()
 
         let provers: [(ProverBackend, String)] = [
@@ -251,6 +273,8 @@ actor TLAPMProcessManager {
                 proverPaths[backend] = path
             }
         }
+
+        proverCacheSignature = signature
     }
 
     private func findProverBinary(named name: String) -> URL? {
@@ -378,6 +402,12 @@ actor TLAPMProcessManager {
         // Store state immediately (before AsyncStream to avoid race)
         streamStates[sessionId] = streamState
 
+        // Signalled when each readability handler reads EOF, so the handlers are
+        // the sole readers; teardown waits for these instead of a racy synchronous
+        // availableData read (e2e M2).
+        let stdoutEOF = DispatchSemaphore(value: 0)
+        let stderrEOF = DispatchSemaphore(value: 0)
+
         // Create async stream for progress updates with proper termination
         let progressStream = AsyncStream<ProofCheckProgress> { continuation in
             // Store continuation in the thread-safe wrapper
@@ -388,6 +418,7 @@ actor TLAPMProcessManager {
                 if data.isEmpty {
                     // EOF reached. Self-clear the handler so a closed pipe can't keep firing.
                     handle.readabilityHandler = nil
+                    stdoutEOF.signal()
                     return
                 }
                 guard let parser = parser, let state = streamState else { return }
@@ -409,6 +440,7 @@ actor TLAPMProcessManager {
                 let data = handle.availableData
                 if data.isEmpty {
                     handle.readabilityHandler = nil
+                    stderrEOF.signal()
                     return
                 }
 
@@ -431,6 +463,11 @@ actor TLAPMProcessManager {
             continuation.onTermination = { _ in
                 stdoutHandle.readabilityHandler = nil
                 stderrHandle.readabilityHandler = nil
+                // Unblock the teardown's bounded EOF wait if the stream is finished
+                // externally (Stop / close) before the handlers observed EOF —
+                // otherwise it parks for the full timeout (e2e Low).
+                stdoutEOF.signal()
+                stderrEOF.signal()
             }
         }
 
@@ -476,43 +513,40 @@ actor TLAPMProcessManager {
         let exitStatus = await exitObserver.wait(for: process)
         process.terminationHandler = nil
 
-        // Drain any remaining buffered data before clearing handlers.
-        // readabilityHandler may not fire for data already in the pipe buffer
-        // after process exit, so we must read it synchronously.
-        let lastStdout = stdoutHandle.availableData
-        if !lastStdout.isEmpty {
-            if let str = String(data: lastStdout, encoding: .utf8) {
-                OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
-            }
-            if let update = parser.parse(lastStdout) {
-                streamState.yield(update)
-            }
-        }
-        let lastStderr = stderrHandle.availableData
-        if !lastStderr.isEmpty {
-            if let str = String(data: lastStderr, encoding: .utf8) {
-                OutputManager.shared.logLines(str.nonEmptyOutputLines, source: .tlapm)
-            }
-            if let update = parser.parse(lastStderr) {
-                streamState.yield(update)
+        // Single-reader invariant (e2e M2): the readability handlers are the sole
+        // readers; wait (off the cooperative pool, bounded) for them to reach EOF
+        // so the streamed tail is fully parsed/logged before teardown. Replaces a
+        // synchronous availableData read that raced a still-live handler.
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let deadline = DispatchTime.now() + 3
+                _ = stdoutEOF.wait(timeout: deadline)
+                _ = stderrEOF.wait(timeout: deadline)
+                cont.resume()
             }
         }
 
-        // Now safe to clear handlers and close
+        // Handlers self-cleared on EOF; clear again (idempotent) and close.
         stdoutHandle.readabilityHandler = nil
         stderrHandle.readabilityHandler = nil
         try? stdoutHandle.close()
         try? stderrHandle.close()
 
-        // Mark stream as finished and clean up
-        streamStates.removeValue(forKey: sessionId)?.finish()
-
-        // Cancel progress task
-        progressTasks.removeValue(forKey: sessionId)?.cancel()
-
-        // Unregister process and clean up
-        ProcessRegistry.shared.unregister(sessionId)
-        activeProcesses.removeValue(forKey: sessionId)
+        // Identity-gated teardown (e2e M3): unlike TLC (fresh id per run), a
+        // ProofSession reuses its fixed id, so a Stop → Run-again can register a
+        // new process under this sessionId while this stale tail is parked in the
+        // await above. Always finish OUR OWN stream/progress task, but reclaim the
+        // shared registry/dicts only if we still own the slot — otherwise we'd
+        // unregister (orphan) the newer run's process.
+        let weStillOwnSlot = activeProcesses[sessionId] === process
+        streamState.finish()
+        progressTask.cancel()
+        if weStillOwnSlot {
+            streamStates.removeValue(forKey: sessionId)
+            progressTasks.removeValue(forKey: sessionId)
+            ProcessRegistry.shared.unregister(sessionId)
+            activeProcesses.removeValue(forKey: sessionId)
+        }
 
         let duration = Date().timeIntervalSince(startTime)
         let trivialCount = parser.getTrivialCount()  // Get before finalResult
@@ -527,7 +561,9 @@ actor TLAPMProcessManager {
             obligations: result.obligations
         )
 
-        parsers.removeValue(forKey: sessionId)
+        if weStillOwnSlot {
+            parsers.removeValue(forKey: sessionId)
+        }
 
         // Send final progress with actual trivial count
         progress(ProofCheckProgress(

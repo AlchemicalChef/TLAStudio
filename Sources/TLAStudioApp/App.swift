@@ -55,6 +55,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if UserSettings.shared.showWelcomeOnLaunch {
             WelcomeWindowController.shared.show()
+        } else if let controller = NSDocumentController.shared as? TLADocumentController {
+            controller.newLaunchDocument()
         } else {
             NSDocumentController.shared.newDocument(nil)
         }

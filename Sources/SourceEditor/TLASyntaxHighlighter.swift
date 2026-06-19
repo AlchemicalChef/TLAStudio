@@ -147,10 +147,28 @@ public final class TLASyntaxHighlighter {
     /// Track content hash of the last highlighted range to detect text changes
     private var lastHighlightedContentHash: Int = 0
 
-    /// Optional closure that provides tree-sitter highlight tokens.
-    /// Called with the source text, returns array of (NSRange, captureName) tuples.
-    /// When set, tree-sitter highlighting is preferred over regex.
-    public var treeSitterHighlightProvider: ((String) -> [(NSRange, String)])?
+    /// Pre-sorted tree-sitter tokens plus the longest token length, supplied by
+    /// the provider so the highlighter can binary-search the visible slice on
+    /// scroll instead of scanning the whole document's token array each frame.
+    public struct TreeSitterTokens {
+        /// Tokens (range, captureName) sorted ascending by `range.location`.
+        public let tokens: [(NSRange, String)]
+        /// Longest `range.length` among `tokens` (0 when empty). Bounds the lower
+        /// edge of the binary search so a long token (e.g. a block comment) that
+        /// starts before the visible window is still found.
+        public let maxTokenLength: Int
+
+        public init(tokens: [(NSRange, String)], maxTokenLength: Int) {
+            self.tokens = tokens
+            self.maxTokenLength = maxTokenLength
+        }
+    }
+
+    /// Optional closure that provides tree-sitter highlight tokens (sorted by
+    /// location). Called with the source text; returns nil when no tokens are
+    /// available for that text. When set, tree-sitter highlighting is preferred
+    /// over regex.
+    public var treeSitterHighlightProvider: ((String) -> TreeSitterTokens?)?
 
     // Highlight token to color mapping (covers both regex and tree-sitter capture names)
     private let tokenColorMap: [String: KeyPath<SyntaxTheme, NSColor>] = [
@@ -214,6 +232,13 @@ public final class TLASyntaxHighlighter {
     public func highlightImmediately() {
         debounceWorkItem?.cancel()
         needsFullReset = true
+        // The large-file visible-range path gates on its own range/hash cache and
+        // does NOT consult needsFullReset, so a forced re-highlight whose text and
+        // viewport are unchanged (theme switch, fold/unfold-all) would early-return
+        // and leave the viewport in the old colors. Reset that cache too, mirroring
+        // scrollPositionChanged().
+        lastHighlightedVisibleRange = NSRange(location: 0, length: 0)
+        lastHighlightedContentHash = 0
         performHighlighting()
     }
 
@@ -380,28 +405,79 @@ public final class TLASyntaxHighlighter {
     /// Returns nil if no provider is set or it returns empty results.
     private func highlightWithTreeSitter(_ text: String, restrictingTo visibleRange: NSRange? = nil) -> [HighlightRange]? {
         guard let provider = treeSitterHighlightProvider else { return nil }
-        let tokens = provider(text)
-        guard !tokens.isEmpty else { return nil }
+        guard let bundle = provider(text), !bundle.tokens.isEmpty else { return nil }
+        let tokens = bundle.tokens
 
         var highlights: [HighlightRange] = []
-        for (range, captureName) in tokens {
-            // Look up the capture name in our token color map
-            if let colorKeyPath = tokenColorMap[captureName] {
-                let effectiveRange: NSRange
-                if let visibleRange {
-                    let intersection = NSIntersectionRange(range, visibleRange)
-                    guard intersection.length > 0 else { continue }
-                    effectiveRange = intersection
-                } else {
-                    effectiveRange = range
-                }
 
+        if let visibleRange {
+            // Large-file scroll/keystroke path: the token array is whole-document
+            // and sorted by location, so only a small window can intersect the
+            // viewport. Binary-search that slice instead of scanning every token.
+            let slice = Self.visibleTokenIndexRange(
+                in: tokens,
+                visibleRange: visibleRange,
+                maxTokenLength: bundle.maxTokenLength
+            )
+            for index in slice {
+                let (range, captureName) = tokens[index]
+                guard let colorKeyPath = tokenColorMap[captureName] else { continue }
+                let intersection = NSIntersectionRange(range, visibleRange)
+                guard intersection.length > 0 else { continue }
                 let color = theme[keyPath: colorKeyPath]
                 let style: HighlightRange.Style = captureName.hasPrefix("keyword") ? .bold : .plain
-                highlights.append(HighlightRange(range: effectiveRange, color: color, style: style))
+                highlights.append(HighlightRange(range: intersection, color: color, style: style))
+            }
+        } else {
+            // Small-file full-highlight path: apply every token.
+            for (range, captureName) in tokens {
+                guard let colorKeyPath = tokenColorMap[captureName] else { continue }
+                let color = theme[keyPath: colorKeyPath]
+                let style: HighlightRange.Style = captureName.hasPrefix("keyword") ? .bold : .plain
+                highlights.append(HighlightRange(range: range, color: color, style: style))
             }
         }
+
         return highlights.isEmpty ? nil : highlights
+    }
+
+    /// The half-open index range `[lo, hi)` into `tokens` (which MUST be sorted
+    /// ascending by `range.location`) whose entries can possibly intersect
+    /// `visibleRange`, given `maxTokenLength` = the longest token length in the
+    /// array. A token starting before `visibleRange.location - maxTokenLength`
+    /// provably ends before the window; one starting at/after the window's end
+    /// provably starts after it — so only this slice need be examined. Callers
+    /// still intersection-test each entry in the slice. Exposed for unit testing.
+    static func visibleTokenIndexRange(
+        in tokens: [(NSRange, String)],
+        visibleRange: NSRange,
+        maxTokenLength: Int
+    ) -> Range<Int> {
+        guard !tokens.isEmpty else { return 0..<0 }
+        let lowerLocation = max(0, visibleRange.location - max(0, maxTokenLength))
+        let visibleEnd = NSMaxRange(visibleRange)
+        let lo = firstTokenIndex(in: tokens, withLocationAtLeast: lowerLocation)
+        let hi = firstTokenIndex(in: tokens, withLocationAtLeast: visibleEnd)
+        return lo..<max(lo, hi)
+    }
+
+    /// First index whose token `range.location` is >= `target` (lower_bound),
+    /// or `tokens.count` if none. `tokens` MUST be sorted by `range.location`.
+    private static func firstTokenIndex(
+        in tokens: [(NSRange, String)],
+        withLocationAtLeast target: Int
+    ) -> Int {
+        var low = 0
+        var high = tokens.count
+        while low < high {
+            let mid = (low + high) / 2
+            if tokens[mid].0.location < target {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
     }
 
     // MARK: - Regex-Based Highlighting

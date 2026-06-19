@@ -330,6 +330,13 @@ public final class FindReplaceManager: ObservableObject {
             replacements = results.map {
                 ($0.range, regex.replacementString(for: $0, in: text, offset: 0, template: template))
             }
+        } else if let text = currentText() {
+            // Drop any stored literal range that the buffer no longer matches
+            // (edited while the panel was open) so Replace All can't splice at a
+            // stale offset; surviving ranges stay valid under end-to-start apply.
+            replacements = matches.compactMap { range in
+                literalRangeStillMatches(range, in: text) ? (range: range, replacement: replaceQuery) : nil
+            }
         } else {
             replacements = matches.map { ($0, replaceQuery) }
         }
@@ -359,7 +366,16 @@ public final class FindReplaceManager: ObservableObject {
     /// regex mode. Returns nil when the stored range no longer corresponds to a
     /// regex match in the current buffer (stale state).
     private func replacementText(forMatchAt range: NSRange) -> String? {
-        guard isRegex else { return replaceQuery }
+        guard isRegex else {
+            // `matches` is only recomputed when the query or an option toggles —
+            // NOT when the user edits the buffer directly with the panel open.
+            // A stored literal/whole-word range can therefore drift, and (unlike
+            // the regex branch) nothing else re-derives it, so splicing would
+            // corrupt the spec at a stale offset. Confirm the range still spans
+            // the search term before returning; nil makes the caller re-search.
+            guard let text = currentText() else { return replaceQuery }
+            return literalRangeStillMatches(range, in: text) ? replaceQuery : nil
+        }
 
         guard let (text, regex, results) = currentRegexResults(),
               let match = results.first(where: { $0.range == range }) else {
@@ -371,6 +387,27 @@ public final class FindReplaceManager: ObservableObject {
             captureGroupCount: regex.numberOfCaptureGroups
         )
         return regex.replacementString(for: match, in: text, offset: 0, template: template)
+    }
+
+    /// The live editor buffer, preferring the injected provider then the text
+    /// view. nil when no text source is wired (validation is then skipped).
+    private func currentText() -> String? {
+        if let provider = textProvider { return provider() }
+        if let textView = textView { return textView.string }
+        return nil
+    }
+
+    /// Whether `range` in `text` still spans the literal search term under the
+    /// active case option. Whole-word matches the query verbatim too, so an
+    /// equality check covers it (it does not re-validate word boundaries, but it
+    /// does prevent the wrong-offset splice that is the actual defect).
+    private func literalRangeStillMatches(_ range: NSRange, in text: String) -> Bool {
+        let nsText = text as NSString
+        guard range.location >= 0, range.location + range.length <= nsText.length else {
+            return false
+        }
+        let options: NSString.CompareOptions = isCaseSensitive ? [] : [.caseInsensitive]
+        return nsText.substring(with: range).compare(searchQuery, options: options) == .orderedSame
     }
 
     /// Re-run the current regex over the current text, returning the full

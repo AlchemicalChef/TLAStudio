@@ -40,6 +40,35 @@ final class EditorFunctionalityTests: XCTestCase {
     }
 
     @MainActor
+    func testGetAllHighlightsUnboundedEndMatchesExplicitFullRange() async throws {
+        // getAllHighlights now passes an unbounded end point instead of splitting
+        // result.lines each keystroke; tree-sitter's set_point_range clamps it to
+        // the tree extent, so it must return exactly the same tokens as an
+        // explicit whole-document range.
+        let content = """
+        ---- MODULE Test ----
+        VARIABLES x
+        Init == x = 0
+        Next == x' = x + 1
+        ====
+        """
+        let result = try await TLACoreWrapper.shared.parse(content)
+
+        let all = await TLACoreWrapper.shared.getAllHighlights(from: result)
+        XCTAssertFalse(all.isEmpty, "unbounded-end highlight query should return tokens")
+
+        let lineCount = content.components(separatedBy: "\n").count
+        let explicit = await TLACoreWrapper.shared.getHighlights(
+            from: result,
+            in: TLARange(
+                start: TLAPosition(line: 0, column: 0),
+                end: TLAPosition(line: UInt32(lineCount), column: 0)
+            )
+        )
+        XCTAssertEqual(all.count, explicit.count)
+    }
+
+    @MainActor
     func testParseContentWithSyntaxError() async throws {
         let content = """
         ---- MODULE Test ----

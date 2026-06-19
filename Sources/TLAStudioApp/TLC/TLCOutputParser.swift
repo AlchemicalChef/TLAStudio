@@ -47,8 +47,14 @@ class TLCOutputParser {
     private var startTime: Date?
     private var currentTraceStates: [TraceState] = []
     private var pendingTraceState: TraceState?
-    private var traceWriterStartTask: Task<TraceWriter, Error>?
-    private var traceWriteTask: Task<Void, Error>?
+    /// Single-consumer streaming writer. Replaces the former per-state chained
+    /// Task pattern, which built an O(N) retain chain of un-started Tasks
+    /// synchronously under the parse lock (each Task captured its predecessor +
+    /// a TraceState). The producer now yields to `traceWriteContinuation` (O(1),
+    /// no allocation, no lock-held burst); one `traceConsumerTask` opens the
+    /// writer once and drains the stream serially to disk.
+    private var traceWriteContinuation: AsyncStream<TraceState>.Continuation?
+    private var traceConsumerTask: Task<Void, Error>?
     private var streamingFallbackStates: [TraceState] = []
     private var streamedTraceCount = 0
     private var isParsingTrace = false
@@ -196,7 +202,7 @@ class TLCOutputParser {
     func finalResultWithStorage(exitCode: Int32, duration: TimeInterval) async -> ModelCheckResult {
         let (traceCount, capturedStates, capturedSessionId, capturedErrorType, capturedErrorMessage,
              capturedLoopStart, capturedViolatedProperty, capturedStatesFound, capturedDistinct,
-             capturedCoverage, capturedOOM, capturedWarnings, writerStartTask, writeTask) = lock.withLock {
+             capturedCoverage, capturedOOM, capturedWarnings, writeContinuation, consumerTask) = lock.withLock {
             flushPendingTraceStateLocked()
             return (
                 currentTraceStates.count + streamedTraceCount,
@@ -211,17 +217,19 @@ class TLCOutputParser {
                 coverage,
                 detectedOOM,
                 collectedWarnings,
-                traceWriterStartTask,
-                traceWriteTask
+                traceWriteContinuation,
+                traceConsumerTask
             )
         }
 
-        if let writerStartTask {
+        if let consumerTask {
             logger.info("Finalizing streamed trace with \(traceCount) states")
 
             do {
-                _ = try await writerStartTask.value
-                try await writeTask?.value
+                // Close the stream so the consumer's for-await loop ends, then wait
+                // for it to drain every queued append (rethrows on writer failure).
+                writeContinuation?.finish()
+                try await consumerTask.value
 
                 let lazyTrace = try await TraceStorageManager.shared.finalizeTrace(
                     sessionId: capturedSessionId,
@@ -307,7 +315,7 @@ class TLCOutputParser {
     }
 
     private func appendCompletedTraceStateLocked(_ state: TraceState) {
-        if traceWriterStartTask != nil {
+        if traceWriteContinuation != nil {
             // Once streaming-to-disk is active, post-bootstrap states go to disk only.
             // `streamingFallbackStates` retains only the pre-threshold snapshot seeded
             // by `startTraceStreamingLocked` so the synchronous-fallback path can still
@@ -332,7 +340,7 @@ class TLCOutputParser {
     }
 
     private func startTraceStreamingLocked() {
-        guard traceWriterStartTask == nil else {
+        guard traceWriteContinuation == nil else {
             return
         }
 
@@ -341,10 +349,19 @@ class TLCOutputParser {
         streamingFallbackStates = statesToStream
         currentTraceStates.removeAll(keepingCapacity: false)
 
-        let startTask = Task<TraceWriter, Error> {
-            try await TraceStorageManager.shared.beginTrace(sessionId: capturedSessionId)
+        // One consumer opens the writer once and drains the stream serially. The
+        // stream buffers states the producer yields before/faster-than the writer
+        // (unbounded, matching the prior chain's behaviour, but without a Task or
+        // retain link per state).
+        let (stream, continuation) = AsyncStream<TraceState>.makeStream()
+        traceWriteContinuation = continuation
+        traceConsumerTask = Task<Void, Error> {
+            let writer = try await TraceStorageManager.shared.beginTrace(sessionId: capturedSessionId)
+            for await state in stream {
+                try Task.checkCancellation()
+                try await writer.append(state)
+            }
         }
-        traceWriterStartTask = startTask
 
         for state in statesToStream {
             enqueueTraceWriteLocked(state, retainForFallback: false)
@@ -352,7 +369,7 @@ class TLCOutputParser {
     }
 
     private func enqueueTraceWriteLocked(_ state: TraceState, retainForFallback: Bool = true) {
-        guard let startTask = traceWriterStartTask else {
+        guard let continuation = traceWriteContinuation else {
             currentTraceStates.append(state)
             return
         }
@@ -361,15 +378,7 @@ class TLCOutputParser {
             streamingFallbackStates.append(state)
         }
 
-        let previousTask = traceWriteTask
-        traceWriteTask = Task<Void, Error> {
-            if let previousTask {
-                try await previousTask.value
-            }
-
-            let writer = try await startTask.value
-            try await writer.append(state)
-        }
+        continuation.yield(state)
         streamedTraceCount += 1
     }
 
@@ -394,8 +403,8 @@ class TLCOutputParser {
     func reset() {
         lock.lock()
         defer { lock.unlock() }
-        traceWriterStartTask?.cancel()
-        traceWriteTask?.cancel()
+        traceWriteContinuation?.finish()
+        traceConsumerTask?.cancel()
         lineBuffer.reset()
         states = 0
         distinct = 0
@@ -409,8 +418,8 @@ class TLCOutputParser {
         currentTraceStates = []
         pendingTraceState = nil
         streamingFallbackStates = []
-        traceWriterStartTask = nil
-        traceWriteTask = nil
+        traceWriteContinuation = nil
+        traceConsumerTask = nil
         streamedTraceCount = 0
         isParsingTrace = false
         errorMessage = nil
@@ -536,7 +545,7 @@ class TLCOutputParser {
         traceViolatedProperty = json["property"] as? String
 
         if let traceData = json["trace"] as? [[String: Any]] {
-            if traceWriterStartTask == nil && streamedTraceCount == 0 {
+            if traceWriteContinuation == nil && streamedTraceCount == 0 {
                 pendingTraceState = nil
                 currentTraceStates.removeAll(keepingCapacity: true)
             }
@@ -570,7 +579,7 @@ class TLCOutputParser {
                 ))
             }
 
-            if traceWriterStartTask == nil {
+            if traceWriteContinuation == nil {
                 errorTrace = ErrorTrace(
                     type: type,
                     message: message,
@@ -1044,7 +1053,7 @@ class TLCOutputParser {
         lock.lock()
         defer { lock.unlock() }
         flushPendingTraceStateLocked()
-        if traceWriterStartTask == nil, !currentTraceStates.isEmpty, let type = errorType {
+        if traceWriteContinuation == nil, !currentTraceStates.isEmpty, let type = errorType {
             errorTrace = ErrorTrace(
                 type: type,
                 message: errorMessage ?? "Error found",

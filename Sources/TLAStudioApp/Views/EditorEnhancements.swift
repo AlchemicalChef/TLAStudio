@@ -161,11 +161,14 @@ final class BracketMatcher {
     private var highlightedBrackets: [HighlightedBracket] = []
     private var selectionObserver: NSObjectProtocol?
 
+    // No `<`/`>` pair: in TLA+ those are pervasive comparison operators (x < y,
+    // =<, >=) and the tuple/sequence delimiters are the DOUBLE `<<`/`>>`, so a
+    // single-angle pair flagged a "match" next to almost every operator. Matching
+    // real `<<`/`>>` needs a two-char scanner (see SourceEditor/BracketMatcher).
     private let bracketPairs: [BracketPair] = [
         BracketPair(open: "(", close: ")"),
         BracketPair(open: "[", close: "]"),
         BracketPair(open: "{", close: "}"),
-        BracketPair(open: "<", close: ">"),
     ]
 
     // MARK: - Initialization

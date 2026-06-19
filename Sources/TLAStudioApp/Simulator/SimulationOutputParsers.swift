@@ -227,12 +227,4 @@ enum SimulationTLCErrorExtractor {
 
         return collected.isEmpty ? nil : collected.joined(separator: "\n")
     }
-
-    /// Whether the output indicates the *generated* module failed to parse —
-    /// the signal to retry an expansion without action decomposition.
-    static func looksLikeGeneratedModuleParseFailure(_ output: String) -> Bool {
-        output.contains("***Parse Error***")
-            || output.contains("Fatal errors while parsing")
-            || output.contains("Semantic errors")
-    }
 }
